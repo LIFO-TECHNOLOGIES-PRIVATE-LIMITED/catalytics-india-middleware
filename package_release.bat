@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set ROOT=%~dp0..
+set ROOT=%~dp0
 set DIST=%ROOT%\dist
 set RELEASE=%~dp0release
 set PACKAGE=%RELEASE%\package

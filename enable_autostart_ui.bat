@@ -1,14 +1,14 @@
 @echo off
 setlocal
 
-set ROOT=%~dp0..
+set ROOT=%~dp0
 set EXE=%ROOT%\dist\tally_ui.exe
 set ENV=%~dp0.env
 set TASKNAME=TallyMiddlewareUI
 
 if not exist "%EXE%" (
   echo Executable not found: %EXE%
-  echo Build it first with: .\tally_middleware\build_exe.bat
+  echo Build it first with: .\build_exe.bat
   exit /b 1
 )
 

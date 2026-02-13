@@ -5,15 +5,15 @@ from typing import Any, Dict, List, Optional
 import os
 import sys
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import requests
 
-from tally_middleware import config as cfg
-from tally_middleware import db
-from tally_middleware.logging_utils import setup_logging
+import config as cfg
+import db
+from logging_utils import setup_logging
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
 

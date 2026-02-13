@@ -1,8 +1,8 @@
 import sqlite3
 import unittest
 
-from tally_middleware import db
-from tally_middleware import sync_catalytics as syncer
+import db
+import sync_catalytics as syncer
 
 
 class TestSyncHelpers(unittest.TestCase):

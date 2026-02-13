@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from tally_middleware import db
+import db
 
 
 class TestDBHelpers(unittest.TestCase):
