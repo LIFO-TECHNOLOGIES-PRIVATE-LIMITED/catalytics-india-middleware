@@ -46,6 +46,8 @@ def _normalize_source_doc(value: Optional[str]) -> str:
 
 
 class RunnerState:
+    MAX_ACTIVITY = 50
+
     def __init__(self):
         self.lock = threading.Lock()
         self.busy_lock = threading.Lock()
@@ -54,9 +56,13 @@ class RunnerState:
         self.running = False
         self.busy = False
         self.status = "idle"
+        self.current_step: Optional[str] = None
+        self.step_index: int = 0
+        self.step_total: int = 0
         self.last_fetch_at: Optional[str] = None
         self.last_sync_at: Optional[str] = None
         self.last_error: Optional[str] = None
+        self.errors: List[str] = []
         self.fetch_stats: Dict[str, int] = {}
         self.sync_stats: Dict[str, int] = {}
         self.last_customer_fetch_at: Optional[str] = None
@@ -71,16 +77,38 @@ class RunnerState:
         self.customer_interval_sec: Optional[int] = None
         self.product_interval_sec: Optional[int] = None
         self.source_doc = _normalize_source_doc(cfg.get_env("TALLY_SOURCE_DOC", "delivery_note"))
-        self.invoice_dc_prefix = (cfg.get_env("TALLY_INVOICE_DC_PREFIX", "INV-") or "INV-").strip() or "INV-"
+        self.activity: List[Dict[str, Any]] = []
+
+    def add_activity(self, action: str, result: str, detail: Optional[str] = None):
+        entry = {"time": _now_iso(), "action": action, "result": result}
+        if detail:
+            entry["detail"] = detail
+        self.activity.insert(0, entry)
+        if len(self.activity) > self.MAX_ACTIVITY:
+            self.activity = self.activity[: self.MAX_ACTIVITY]
+
+    def set_step(self, label: str, index: int, total: int):
+        self.current_step = label
+        self.step_index = index
+        self.step_total = total
+
+    def clear_step(self):
+        self.current_step = None
+        self.step_index = 0
+        self.step_total = 0
 
     def to_dict(self):
         return {
             "running": self.running,
             "busy": self.busy,
             "status": self.status,
+            "current_step": self.current_step,
+            "step_index": self.step_index,
+            "step_total": self.step_total,
             "last_fetch_at": self.last_fetch_at,
             "last_sync_at": self.last_sync_at,
             "last_error": self.last_error,
+            "errors": self.errors[:5],
             "fetch_stats": self.fetch_stats,
             "sync_stats": self.sync_stats,
             "last_customer_fetch_at": self.last_customer_fetch_at,
@@ -95,7 +123,7 @@ class RunnerState:
             "customer_interval_sec": self.customer_interval_sec,
             "product_interval_sec": self.product_interval_sec,
             "source_doc": self.source_doc,
-            "invoice_dc_prefix": self.invoice_dc_prefix,
+            "activity": self.activity[:20],
         }
 
 
@@ -137,7 +165,6 @@ def _env_namespace() -> SimpleNamespace:
         limit=None,
         max_attempts=None,
         allow_tally_fetch=False,
-        dc_prefix=None,
     )
 
 
@@ -153,10 +180,8 @@ def _run_fetch():
     args = _env_namespace()
     with STATE.lock:
         source_doc = STATE.source_doc
-        invoice_dc_prefix = STATE.invoice_dc_prefix
 
     if source_doc == "sales_invoice":
-        args.dc_prefix = invoice_dc_prefix
         fetch_config = build_fetch_invoice_config(args)
         if not fetch_config.log_file:
             fetch_config.log_file = _log_file_path()
@@ -222,94 +247,138 @@ def _loop_worker():
         if not acquired:
             time.sleep(1)
             continue
+
+        do_customers = cfg.get_env_bool("AUTO_SYNC_CUSTOMERS", False)
+        do_products = cfg.get_env_bool("AUTO_SYNC_PRODUCTS", False)
+        total_steps = 2  # fetch DC + sync DC
+        if do_customers and time.time() >= next_customer_ts:
+            total_steps += 2
+        if do_products and time.time() >= next_product_ts:
+            total_steps += 2
+        step_num = 0
+        cycle_errors: List[str] = []
+
         with STATE.lock:
             STATE.busy = True
             STATE.status = "running"
+            STATE.errors = []
+
         try:
+            # --- DC Fetch ---
+            step_num += 1
+            with STATE.lock:
+                STATE.set_step("Fetching DCs from Tally", step_num, total_steps)
             try:
                 stats = _run_fetch()
                 with STATE.lock:
                     STATE.fetch_stats = stats
                     STATE.last_fetch_at = _now_iso()
-                    STATE.last_error = None
+                    STATE.add_activity("Fetch DCs", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
             except Exception as exc:
+                cycle_errors.append(f"DC Fetch: {exc}")
                 with STATE.lock:
-                    STATE.last_error = str(exc)
-                    STATE.status = "error"
+                    STATE.add_activity("Fetch DCs", "error", str(exc))
 
+            # --- DC Sync ---
+            step_num += 1
+            with STATE.lock:
+                STATE.set_step("Syncing DCs to Catalytics", step_num, total_steps)
             try:
                 stats = _run_sync()
                 with STATE.lock:
                     STATE.sync_stats = stats
                     STATE.last_sync_at = _now_iso()
-                    STATE.last_error = None
-                    STATE.status = "idle"
+                    STATE.add_activity("Sync DCs", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
             except Exception as exc:
+                cycle_errors.append(f"DC Sync: {exc}")
                 with STATE.lock:
-                    STATE.last_error = str(exc)
-                    STATE.status = "error"
+                    STATE.add_activity("Sync DCs", "error", str(exc))
 
-            # Optional master sync
-            if cfg.get_env_bool("AUTO_SYNC_CUSTOMERS", False):
+            # --- Customer Fetch + Sync ---
+            if do_customers:
                 customer_interval = _get_interval("AUTO_SYNC_CUSTOMERS_INTERVAL_SEC", STATE.interval_sec)
                 with STATE.lock:
                     STATE.customer_interval_sec = customer_interval
                 if time.time() >= next_customer_ts:
+                    step_num += 1
+                    with STATE.lock:
+                        STATE.set_step("Fetching Customers from Tally", step_num, total_steps)
                     try:
                         stats = _run_fetch_customers()
                         with STATE.lock:
                             STATE.customer_fetch_stats = stats
                             STATE.last_customer_fetch_at = _now_iso()
-                            STATE.last_error = None
+                            STATE.add_activity("Fetch Customers", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
                     except Exception as exc:
+                        cycle_errors.append(f"Customer Fetch: {exc}")
                         with STATE.lock:
-                            STATE.last_error = str(exc)
-                            STATE.status = "error"
+                            STATE.add_activity("Fetch Customers", "error", str(exc))
 
+                    step_num += 1
+                    with STATE.lock:
+                        STATE.set_step("Syncing Customers to Catalytics", step_num, total_steps)
                     try:
                         stats = _run_sync_customers()
                         with STATE.lock:
                             STATE.customer_sync_stats = stats
                             STATE.last_customer_sync_at = _now_iso()
-                            STATE.last_error = None
-                            STATE.status = "idle"
+                            STATE.add_activity("Sync Customers", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
                     except Exception as exc:
+                        cycle_errors.append(f"Customer Sync: {exc}")
                         with STATE.lock:
-                            STATE.last_error = str(exc)
-                            STATE.status = "error"
+                            STATE.add_activity("Sync Customers", "error", str(exc))
                     next_customer_ts = time.time() + customer_interval
 
-            if cfg.get_env_bool("AUTO_SYNC_PRODUCTS", False):
+            # --- Product Fetch + Sync ---
+            if do_products:
                 product_interval = _get_interval("AUTO_SYNC_PRODUCTS_INTERVAL_SEC", STATE.interval_sec)
                 with STATE.lock:
                     STATE.product_interval_sec = product_interval
                 if time.time() >= next_product_ts:
+                    step_num += 1
+                    with STATE.lock:
+                        STATE.set_step("Fetching Products from Tally", step_num, total_steps)
                     try:
                         stats = _run_fetch_products()
                         with STATE.lock:
                             STATE.product_fetch_stats = stats
                             STATE.last_product_fetch_at = _now_iso()
-                            STATE.last_error = None
+                            STATE.add_activity("Fetch Products", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
                     except Exception as exc:
+                        cycle_errors.append(f"Product Fetch: {exc}")
                         with STATE.lock:
-                            STATE.last_error = str(exc)
-                            STATE.status = "error"
+                            STATE.add_activity("Fetch Products", "error", str(exc))
 
+                    step_num += 1
+                    with STATE.lock:
+                        STATE.set_step("Syncing Products to Catalytics", step_num, total_steps)
                     try:
                         stats = _run_sync_products()
                         with STATE.lock:
                             STATE.product_sync_stats = stats
                             STATE.last_product_sync_at = _now_iso()
-                            STATE.last_error = None
-                            STATE.status = "idle"
+                            STATE.add_activity("Sync Products", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
                     except Exception as exc:
+                        cycle_errors.append(f"Product Sync: {exc}")
                         with STATE.lock:
-                            STATE.last_error = str(exc)
-                            STATE.status = "error"
+                            STATE.add_activity("Sync Products", "error", str(exc))
                     next_product_ts = time.time() + product_interval
+
+            # --- Finalize cycle ---
+            with STATE.lock:
+                STATE.clear_step()
+                if cycle_errors:
+                    STATE.errors = cycle_errors
+                    STATE.last_error = cycle_errors[-1]
+                    STATE.status = "error"
+                else:
+                    STATE.last_error = None
+                    STATE.errors = []
+                    STATE.status = "idle"
         finally:
             with STATE.lock:
                 STATE.busy = False
+                STATE.clear_step()
             STATE.busy_lock.release()
 
         if STATE.stop_event.wait(STATE.interval_sec):
@@ -487,11 +556,19 @@ def _sync_counts(conn, table: str, sync_table: str, id_col: str) -> Dict[str, in
         WHERE COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0
         """
     ).fetchone()
+    deleted_row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS c
+        FROM {table} t
+        WHERE COALESCE(t.is_deleted, 0) = 1
+        """
+    ).fetchone()
     return {
         "total": total,
         "synced": int(synced_row["c"]) if synced_row else 0,
         "failed": int(failed_row["c"]) if failed_row else 0,
         "pending": int(pending_row["c"]) if pending_row else 0,
+        "deleted": int(deleted_row["c"]) if deleted_row else 0,
     }
 
 
@@ -547,7 +624,6 @@ def _collect_diagnostics() -> Dict[str, Any]:
 
     with STATE.lock:
         source_doc = STATE.source_doc
-        invoice_prefix = STATE.invoice_dc_prefix
 
     tally_check = _check_tcp_endpoint(required_env["TALLY_URL"], default_port=9000)
     api_check = _check_tcp_endpoint(required_env["CATALYTICS_API_BASE_URL"], default_port=80)
@@ -597,7 +673,6 @@ def _collect_diagnostics() -> Dict[str, Any]:
     return {
         "generated_at": _now_iso(),
         "source_doc": source_doc,
-        "invoice_dc_prefix": invoice_prefix,
         "environment": {"values": required_env, "missing": missing_env},
         "connectivity": {"tally": tally_check, "api": api_check},
         "queue": queue,
@@ -624,90 +699,98 @@ def _max_attempts() -> int:
 
 def _list_dc(status_filter: str, search: str, limit: int, offset: int) -> Dict[str, Any]:
     conn, _ = _connect_db()
-    params: List[Any] = []
-    where = []
-    if status_filter == "synced":
-        where.append("COALESCE(ss.is_synced, 0) = 1")
-    elif status_filter == "failed":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
-    elif status_filter == "pending":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
-    if search:
-        where.append("(dn.dc_no LIKE ? OR dn.party_ledger_name LIKE ? OR dn.reference LIKE ?)")
-        like = f"%{search}%"
-        params.extend([like, like, like])
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    try:
+        params: List[Any] = []
+        where = []
+        if status_filter == "synced":
+            where.append("COALESCE(ss.is_synced, 0) = 1")
+        elif status_filter == "failed":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
+        elif status_filter == "pending":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
+        elif status_filter == "deleted":
+            where.append("COALESCE(dn.is_deleted, 0) = 1")
+        if search:
+            where.append("(dn.dc_no LIKE ? OR dn.party_ledger_name LIKE ? OR dn.reference LIKE ?)")
+            like = f"%{search}%"
+            params.extend([like, like, like])
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-    count_row = conn.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM delivery_notes dn
-        LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
-        {where_sql}
-        """,
-        tuple(params),
-    ).fetchone()
-    total = int(count_row[0]) if count_row else 0
+        count_row = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM delivery_notes dn
+            LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
+            {where_sql}
+            """,
+            tuple(params),
+        ).fetchone()
+        total = int(count_row[0]) if count_row else 0
 
-    params.extend([limit, offset])
-    rows = conn.execute(
-        f"""
-        SELECT dn.id, dn.dc_no, dn.voucher_date, dn.party_ledger_name, dn.reference,
-               dn.updated_at,
-               ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at, ss.last_error
-        FROM delivery_notes dn
-        LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
-        {where_sql}
-        ORDER BY dn.updated_at DESC
-        LIMIT ? OFFSET ?
-        """,
-        tuple(params),
-    ).fetchall()
-    max_attempts = _max_attempts()
-    data = []
-    for row in rows:
-        item = dict(row)
-        item["sync_state"] = _sync_state(item.get("is_synced"), item.get("attempts"))
-        if not item.get("last_error") and item["sync_state"] == "failed":
-            if max_attempts and (item.get("attempts") or 0) >= max_attempts:
-                item["last_error"] = f"Max attempts reached ({max_attempts}). Click Retry or Mark."
-        item["last_error_short"] = _short_error(item.get("last_error"))
-        item["error_hint"] = _error_hint(item.get("last_error"))
-        data.append(item)
-    conn.close()
-    return {"total": total, "items": data}
+        params.extend([limit, offset])
+        rows = conn.execute(
+            f"""
+            SELECT dn.id, dn.dc_no, dn.voucher_date, dn.party_ledger_name, dn.reference,
+                   dn.updated_at, COALESCE(dn.is_deleted, 0) as is_deleted,
+                   ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at, ss.last_error
+            FROM delivery_notes dn
+            LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
+            {where_sql}
+            ORDER BY dn.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params),
+        ).fetchall()
+        max_attempts = _max_attempts()
+        data = []
+        for row in rows:
+            item = dict(row)
+            item["sync_state"] = _sync_state(item.get("is_synced"), item.get("attempts"))
+            if not item.get("last_error") and item["sync_state"] == "failed":
+                if max_attempts and (item.get("attempts") or 0) >= max_attempts:
+                    item["last_error"] = f"Max attempts reached ({max_attempts}). Click Retry or Mark."
+            item["last_error_short"] = _short_error(item.get("last_error"))
+            item["error_hint"] = _error_hint(item.get("last_error"))
+            data.append(item)
+        return {"total": total, "items": data}
+    finally:
+        conn.close()
 
 
 def _select_dc_ids(status_filter: str, search: str, limit: int) -> List[int]:
     conn, _ = _connect_db()
-    params: List[Any] = []
-    where = []
-    if status_filter == "synced":
-        where.append("COALESCE(ss.is_synced, 0) = 1")
-    elif status_filter == "failed":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
-    elif status_filter == "pending":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
-    if search:
-        where.append("(dn.dc_no LIKE ? OR dn.party_ledger_name LIKE ? OR dn.reference LIKE ?)")
-        like = f"%{search}%"
-        params.extend([like, like, like])
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT dn.id
-        FROM delivery_notes dn
-        LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
-        {where_sql}
-        ORDER BY dn.updated_at DESC
-        LIMIT ?
-        """,
-        tuple(params),
-    ).fetchall()
-    ids = [int(row["id"]) for row in rows]
-    conn.close()
-    return ids
+    try:
+        params: List[Any] = []
+        where = []
+        if status_filter == "synced":
+            where.append("COALESCE(ss.is_synced, 0) = 1")
+        elif status_filter == "failed":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
+        elif status_filter == "pending":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
+        elif status_filter == "deleted":
+            where.append("COALESCE(dn.is_deleted, 0) = 1")
+        if search:
+            where.append("(dn.dc_no LIKE ? OR dn.party_ledger_name LIKE ? OR dn.reference LIKE ?)")
+            like = f"%{search}%"
+            params.extend([like, like, like])
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT dn.id
+            FROM delivery_notes dn
+            LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
+            {where_sql}
+            ORDER BY dn.updated_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        return ids
+    finally:
+        conn.close()
 
 
 def _list_simple(
@@ -721,105 +804,113 @@ def _list_simple(
     offset: int,
 ) -> Dict[str, Any]:
     conn, _ = _connect_db()
-    params: List[Any] = []
-    where = []
-    if status_filter == "synced":
-        where.append("COALESCE(ss.is_synced, 0) = 1")
-    elif status_filter == "failed":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
-    elif status_filter == "pending":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
-    if search:
-        where.append("t.name LIKE ?")
-        params.append(f"%{search}%")
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    try:
+        params: List[Any] = []
+        where = []
+        if status_filter == "synced":
+            where.append("COALESCE(ss.is_synced, 0) = 1")
+        elif status_filter == "failed":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
+        elif status_filter == "pending":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
+        elif status_filter == "deleted":
+            where.append("COALESCE(t.is_deleted, 0) = 1")
+        if search:
+            where.append("t.name LIKE ?")
+            params.append(f"%{search}%")
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-    count_row = conn.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM {table} t
-        LEFT JOIN {sync_table} ss ON ss.{id_col} = t.id
-        {where_sql}
-        """,
-        tuple(params),
-    ).fetchone()
-    total = int(count_row[0]) if count_row else 0
+        count_row = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {table} t
+            LEFT JOIN {sync_table} ss ON ss.{id_col} = t.id
+            {where_sql}
+            """,
+            tuple(params),
+        ).fetchone()
+        total = int(count_row[0]) if count_row else 0
 
-    params.extend([limit, offset])
-    rows = conn.execute(
-        f"""
-        SELECT t.id, t.name, t.updated_at,
-               ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at, ss.last_error
-        FROM {table} t
-        LEFT JOIN {sync_table} ss ON ss.{id_col} = t.id
-        {where_sql}
-        ORDER BY t.updated_at DESC
-        LIMIT ? OFFSET ?
-        """,
-        tuple(params),
-    ).fetchall()
-    max_attempts = _max_attempts()
-    data = []
-    for row in rows:
-        item = dict(row)
-        item["sync_state"] = _sync_state(item.get("is_synced"), item.get("attempts"))
-        if not item.get("last_error") and item["sync_state"] == "failed":
-            if max_attempts and (item.get("attempts") or 0) >= max_attempts:
-                item["last_error"] = f"Max attempts reached ({max_attempts}). Click Retry or Mark."
-        item["last_error_short"] = _short_error(item.get("last_error"))
-        item["error_hint"] = _error_hint(item.get("last_error"))
-        data.append(item)
-    conn.close()
-    return {"total": total, "items": data}
+        params.extend([limit, offset])
+        rows = conn.execute(
+            f"""
+            SELECT t.id, t.name, t.updated_at, COALESCE(t.is_deleted, 0) as is_deleted,
+                   ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at, ss.last_error
+            FROM {table} t
+            LEFT JOIN {sync_table} ss ON ss.{id_col} = t.id
+            {where_sql}
+            ORDER BY t.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params),
+        ).fetchall()
+        max_attempts = _max_attempts()
+        data = []
+        for row in rows:
+            item = dict(row)
+            item["sync_state"] = _sync_state(item.get("is_synced"), item.get("attempts"))
+            if not item.get("last_error") and item["sync_state"] == "failed":
+                if max_attempts and (item.get("attempts") or 0) >= max_attempts:
+                    item["last_error"] = f"Max attempts reached ({max_attempts}). Click Retry or Mark."
+            item["last_error_short"] = _short_error(item.get("last_error"))
+            item["error_hint"] = _error_hint(item.get("last_error"))
+            data.append(item)
+        return {"total": total, "items": data}
+    finally:
+        conn.close()
 
 
 def _list_customers(status_filter: str, search: str, limit: int, offset: int) -> Dict[str, Any]:
     conn, _ = _connect_db()
-    params: List[Any] = []
-    where = []
-    if status_filter == "synced":
-        where.append("COALESCE(ss.is_synced, 0) = 1")
-    elif status_filter == "failed":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
-    elif status_filter == "pending":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
-    if search:
-        where.append("t.name LIKE ?")
-        params.append(f"%{search}%")
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    try:
+        params: List[Any] = []
+        where = []
+        if status_filter == "synced":
+            where.append("COALESCE(ss.is_synced, 0) = 1")
+        elif status_filter == "failed":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
+        elif status_filter == "pending":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
+        elif status_filter == "deleted":
+            where.append("COALESCE(t.is_deleted, 0) = 1")
+        if search:
+            where.append("t.name LIKE ?")
+            params.append(f"%{search}%")
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-    rows = conn.execute(
-        f"""
-        SELECT t.id, t.name, t.updated_at, t.data_json,
-               ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at, ss.last_error
-        FROM ledgers t
-        LEFT JOIN ledger_sync_status ss ON ss.ledger_id = t.id
-        {where_sql}
-        ORDER BY t.updated_at DESC
-        """,
-        tuple(params),
-    ).fetchall()
+        rows = conn.execute(
+            f"""
+            SELECT t.id, t.name, t.updated_at, t.data_json, COALESCE(t.is_deleted, 0) as is_deleted,
+                   ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at, ss.last_error
+            FROM ledgers t
+            LEFT JOIN ledger_sync_status ss ON ss.ledger_id = t.id
+            {where_sql}
+            ORDER BY t.updated_at DESC
+            """,
+            tuple(params),
+        ).fetchall()
 
-    filtered: List[Dict[str, Any]] = []
-    for row in rows:
-        if _is_sundry_debtor_json(row["data_json"]):
-            filtered.append(dict(row))
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            if _is_sundry_debtor_json(row["data_json"]):
+                filtered.append(dict(row))
 
-    total = len(filtered)
-    page = filtered[offset : offset + limit]
-    max_attempts = _max_attempts()
-    data = []
-    for row in page:
-        item = dict(row)
-        item["sync_state"] = _sync_state(item.get("is_synced"), item.get("attempts"))
-        if not item.get("last_error") and item["sync_state"] == "failed":
-            if max_attempts and (item.get("attempts") or 0) >= max_attempts:
-                item["last_error"] = f"Max attempts reached ({max_attempts}). Click Retry or Mark."
-        item["last_error_short"] = _short_error(item.get("last_error"))
-        item["error_hint"] = _error_hint(item.get("last_error"))
-        data.append(item)
-    conn.close()
-    return {"total": total, "items": data}
+        total = len(filtered)
+        page = filtered[offset : offset + limit]
+        max_attempts = _max_attempts()
+        data = []
+        for row in page:
+            item = dict(row)
+            item["sync_state"] = _sync_state(item.get("is_synced"), item.get("attempts"))
+            if not item.get("last_error") and item["sync_state"] == "failed":
+                if max_attempts and (item.get("attempts") or 0) >= max_attempts:
+                    item["last_error"] = f"Max attempts reached ({max_attempts}). Click Retry or Mark."
+            item["last_error_short"] = _short_error(item.get("last_error"))
+            item["error_hint"] = _error_hint(item.get("last_error"))
+            data.append(item)
+        return {"total": total, "items": data}
+    finally:
+        conn.close()
 
 
 def _select_simple_ids(
@@ -832,171 +923,185 @@ def _select_simple_ids(
     limit: int,
 ) -> List[int]:
     conn, _ = _connect_db()
-    params: List[Any] = []
-    where = []
-    if status_filter == "synced":
-        where.append("COALESCE(ss.is_synced, 0) = 1")
-    elif status_filter == "failed":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
-    elif status_filter == "pending":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
-    if search:
-        where.append("t.name LIKE ?")
-        params.append(f"%{search}%")
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT t.id
-        FROM {table} t
-        LEFT JOIN {sync_table} ss ON ss.{id_col} = t.id
-        {where_sql}
-        ORDER BY t.updated_at DESC
-        LIMIT ?
-        """,
-        tuple(params),
-    ).fetchall()
-    ids = [int(row["id"]) for row in rows]
-    conn.close()
-    return ids
+    try:
+        params: List[Any] = []
+        where = []
+        if status_filter == "synced":
+            where.append("COALESCE(ss.is_synced, 0) = 1")
+        elif status_filter == "failed":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
+        elif status_filter == "pending":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
+        elif status_filter == "deleted":
+            where.append("COALESCE(t.is_deleted, 0) = 1")
+        if search:
+            where.append("t.name LIKE ?")
+            params.append(f"%{search}%")
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT t.id
+            FROM {table} t
+            LEFT JOIN {sync_table} ss ON ss.{id_col} = t.id
+            {where_sql}
+            ORDER BY t.updated_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        return ids
+    finally:
+        conn.close()
 
 
 def _select_customer_ids(status_filter: str, search: str, limit: int) -> List[int]:
     conn, _ = _connect_db()
-    params: List[Any] = []
-    where = []
-    if status_filter == "synced":
-        where.append("COALESCE(ss.is_synced, 0) = 1")
-    elif status_filter == "failed":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
-    elif status_filter == "pending":
-        where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
-    if search:
-        where.append("t.name LIKE ?")
-        params.append(f"%{search}%")
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    try:
+        params: List[Any] = []
+        where = []
+        if status_filter == "synced":
+            where.append("COALESCE(ss.is_synced, 0) = 1")
+        elif status_filter == "failed":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) > 0")
+        elif status_filter == "pending":
+            where.append("COALESCE(ss.is_synced, 0) = 0 AND COALESCE(ss.attempts, 0) = 0")
+        elif status_filter == "deleted":
+            where.append("COALESCE(t.is_deleted, 0) = 1")
+        if search:
+            where.append("t.name LIKE ?")
+            params.append(f"%{search}%")
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-    rows = conn.execute(
-        f"""
-        SELECT t.id, t.data_json
-        FROM ledgers t
-        LEFT JOIN ledger_sync_status ss ON ss.ledger_id = t.id
-        {where_sql}
-        ORDER BY t.updated_at DESC
-        """,
-        tuple(params),
-    ).fetchall()
+        rows = conn.execute(
+            f"""
+            SELECT t.id, t.data_json
+            FROM ledgers t
+            LEFT JOIN ledger_sync_status ss ON ss.ledger_id = t.id
+            {where_sql}
+            ORDER BY t.updated_at DESC
+            """,
+            tuple(params),
+        ).fetchall()
 
-    ids: List[int] = []
-    for row in rows:
-        if _is_sundry_debtor_json(row["data_json"]):
-            ids.append(int(row["id"]))
-        if len(ids) >= limit:
-            break
+        ids: List[int] = []
+        for row in rows:
+            if _is_sundry_debtor_json(row["data_json"]):
+                ids.append(int(row["id"]))
+            if len(ids) >= limit:
+                break
 
-    conn.close()
-    return ids
+        return ids
+    finally:
+        conn.close()
 
 
 def _dc_detail(note_id: int) -> Dict[str, Any]:
     conn, _ = _connect_db()
-    note = conn.execute(
-        """
-        SELECT dn.*, ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at,
-               ss.last_error, ss.last_response_json
-        FROM delivery_notes dn
-        LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
-        WHERE dn.id = ?
-        """,
-        (note_id,),
-    ).fetchone()
-    if not note:
-        conn.close()
-        raise ValueError("DC not found")
+    try:
+        note = conn.execute(
+            """
+            SELECT dn.*, ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at,
+                   ss.last_error, ss.last_response_json
+            FROM delivery_notes dn
+            LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
+            WHERE dn.id = ?
+            """,
+            (note_id,),
+        ).fetchone()
+        if not note:
+            raise ValueError("DC not found")
 
-    items = conn.execute(
-        "SELECT data_json FROM delivery_note_items WHERE delivery_note_id = ? ORDER BY line_no",
-        (note_id,),
-    ).fetchall()
-    item_payloads = [db.json_loads(r["data_json"]) for r in items if r["data_json"]]
-    result = dict(note)
-    result["payload"] = db.json_loads(note["data_json"]) if note["data_json"] else None
-    result["items"] = item_payloads
-    result["last_response_json"] = db.json_loads(note["last_response_json"]) if note["last_response_json"] else None
-    result["sync_state"] = _sync_state(note["is_synced"], note["attempts"])
-    result["error_hint"] = _error_hint(note["last_error"])
-    conn.close()
-    return result
+        items = conn.execute(
+            "SELECT data_json FROM delivery_note_items WHERE delivery_note_id = ? ORDER BY line_no",
+            (note_id,),
+        ).fetchall()
+        item_payloads = [db.json_loads(r["data_json"]) for r in items if r["data_json"]]
+        result = dict(note)
+        result["payload"] = db.json_loads(note["data_json"]) if note["data_json"] else None
+        result["items"] = item_payloads
+        result["last_response_json"] = db.json_loads(note["last_response_json"]) if note["last_response_json"] else None
+        result["sync_state"] = _sync_state(note["is_synced"], note["attempts"])
+        result["error_hint"] = _error_hint(note["last_error"])
+        return result
+    finally:
+        conn.close()
 
 
 def _simple_detail(table: str, sync_table: str, id_col: str, item_id: int) -> Dict[str, Any]:
     conn, _ = _connect_db()
-    row = conn.execute(
-        f"""
-        SELECT t.*, ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at,
-               ss.last_error, ss.last_response_json
-        FROM {table} t
-        LEFT JOIN {sync_table} ss ON ss.{id_col} = t.id
-        WHERE t.id = ?
-        """,
-        (item_id,),
-    ).fetchone()
-    if not row:
+    try:
+        row = conn.execute(
+            f"""
+            SELECT t.*, ss.is_synced, ss.attempts, ss.last_attempt_at, ss.synced_at,
+                   ss.last_error, ss.last_response_json
+            FROM {table} t
+            LEFT JOIN {sync_table} ss ON ss.{id_col} = t.id
+            WHERE t.id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Record not found")
+        result = dict(row)
+        result["payload"] = db.json_loads(row["data_json"]) if row["data_json"] else None
+        result["last_response_json"] = db.json_loads(row["last_response_json"]) if row["last_response_json"] else None
+        result["sync_state"] = _sync_state(row["is_synced"], row["attempts"])
+        result["error_hint"] = _error_hint(row["last_error"])
+        return result
+    finally:
         conn.close()
-        raise ValueError("Record not found")
-    result = dict(row)
-    result["payload"] = db.json_loads(row["data_json"]) if row["data_json"] else None
-    result["last_response_json"] = db.json_loads(row["last_response_json"]) if row["last_response_json"] else None
-    result["sync_state"] = _sync_state(row["is_synced"], row["attempts"])
-    result["error_hint"] = _error_hint(row["last_error"])
-    conn.close()
-    return result
 
 
 def _mark_unsynced(table: str, id_col: str, item_id: int) -> None:
     conn, _ = _connect_db()
-    ts = db.now_ts()
-    conn.execute(
-        f"""
-        UPDATE {table}
-        SET is_synced = 0,
-            attempts = 0,
-            last_attempt_at = NULL,
-            synced_at = NULL,
-            last_error = NULL,
-            last_response_json = NULL,
-            updated_at = ?
-        WHERE {id_col} = ?
-        """,
-        (ts, item_id),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        ts = db.now_ts()
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET is_synced = 0,
+                attempts = 0,
+                last_attempt_at = NULL,
+                synced_at = NULL,
+                last_error = NULL,
+                last_response_json = NULL,
+                updated_at = ?
+            WHERE {id_col} = ?
+            """,
+            (ts, item_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _mark_unsynced_many(table: str, id_col: str, ids: List[int]) -> int:
     if not ids:
         return 0
     conn, _ = _connect_db()
-    ts = db.now_ts()
-    placeholders = ",".join(["?"] * len(ids))
-    conn.execute(
-        f"""
-        UPDATE {table}
-        SET is_synced = 0,
-            attempts = 0,
-            last_attempt_at = NULL,
-            synced_at = NULL,
-            last_error = NULL,
-            last_response_json = NULL,
-            updated_at = ?
-        WHERE {id_col} IN ({placeholders})
-        """,
-        tuple([ts] + ids),
-    )
-    conn.commit()
-    conn.close()
-    return len(ids)
+    try:
+        ts = db.now_ts()
+        placeholders = ",".join(["?"] * len(ids))
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET is_synced = 0,
+                attempts = 0,
+                last_attempt_at = NULL,
+                synced_at = NULL,
+                last_error = NULL,
+                last_response_json = NULL,
+                updated_at = ?
+            WHERE {id_col} IN ({placeholders})
+            """,
+            tuple([ts] + ids),
+        )
+        conn.commit()
+        return len(ids)
+    finally:
+        conn.close()
 
 
 def _retry_dc(note_id: int) -> Dict[str, Any]:
@@ -1009,48 +1114,49 @@ def _retry_dc(note_id: int) -> Dict[str, Any]:
         raise ValueError("db_path and api_base_url are required")
 
     conn = db.connect(sync_config.db_path)
-    db.init_db(conn)
-    note = conn.execute("SELECT * FROM delivery_notes WHERE id = ?", (note_id,)).fetchone()
-    if not note:
-        conn.close()
-        raise ValueError("DC not found")
-
-    payload, payload_hash = sync_dc_mod._build_payload_for_note(
-        conn,
-        dict(note),
-        entity_id=sync_config.entity_id,
-        company_name=sync_config.company,
-        allow_tally_fetch=sync_config.allow_tally_fetch,
-    )
-
-    endpoint = sync_config.api_base_url.rstrip("/") + "/import/tally-delivery-challan-payload/"
-    headers = {}
-    if sync_config.api_key:
-        headers["X-API-Key"] = sync_config.api_key
-
-    resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
     try:
-        response_json = resp.json()
-    except Exception:
-        response_json = {"status": "error", "message": resp.text}
+        db.init_db(conn)
+        note = conn.execute("SELECT * FROM delivery_notes WHERE id = ?", (note_id,)).fetchone()
+        if not note:
+            raise ValueError("DC not found")
 
-    result = (response_json.get("data") or {}).get("results") or []
-    status_val = None
-    if result:
-        status_val = (result[0] or {}).get("status")
-    success = status_val in ("created", "updated")
+        payload, payload_hash = sync_dc_mod._build_payload_for_note(
+            conn,
+            dict(note),
+            entity_id=sync_config.entity_id,
+            company_name=sync_config.company,
+            allow_tally_fetch=sync_config.allow_tally_fetch,
+        )
 
-    sync_dc_mod._update_sync_status(
-        conn,
-        delivery_note_id=note_id,
-        success=success,
-        payload_hash=payload_hash,
-        response_json=response_json,
-        error_text=None if success else response_json.get("message") or "sync_failed",
-    )
-    conn.commit()
-    conn.close()
-    return {"success": success, "response": response_json}
+        endpoint = sync_config.api_base_url.rstrip("/") + "/import/tally-delivery-challan-payload/"
+        headers = {}
+        if sync_config.api_key:
+            headers["X-API-Key"] = sync_config.api_key
+
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
+        try:
+            response_json = resp.json()
+        except Exception:
+            response_json = {"status": "error", "message": resp.text}
+
+        result = (response_json.get("data") or {}).get("results") or []
+        status_val = None
+        if result:
+            status_val = (result[0] or {}).get("status")
+        success = status_val in ("created", "updated")
+
+        sync_dc_mod._update_sync_status(
+            conn,
+            delivery_note_id=note_id,
+            success=success,
+            payload_hash=payload_hash,
+            response_json=response_json,
+            error_text=None if success else response_json.get("message") or "sync_failed",
+        )
+        conn.commit()
+        return {"success": success, "response": response_json}
+    finally:
+        conn.close()
 
 
 def _retry_customer(ledger_id: int) -> Dict[str, Any]:
@@ -1063,62 +1169,63 @@ def _retry_customer(ledger_id: int) -> Dict[str, Any]:
         raise ValueError("db_path and api_base_url are required")
 
     conn = db.connect(sync_config.db_path)
-    db.init_db(conn)
-    row = conn.execute("SELECT * FROM ledgers WHERE id = ?", (ledger_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise ValueError("Customer not found")
-
-    payload = sync_cust_mod._build_payload_for_ledger(
-        dict(row),
-        entity_id=sync_config.entity_id,
-        company_name=sync_config.company,
-    )
-    payload_hash = db.sha256_text(db.json_dumps(payload))
-
-    endpoint = sync_config.api_base_url.rstrip("/") + "/import/tally-customer-payload/"
-    headers = {}
-    if sync_config.api_key:
-        headers["X-API-Key"] = sync_config.api_key
-
-    resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
     try:
-        response_json = resp.json()
-    except Exception:
-        response_json = {"status": "error", "message": resp.text}
+        db.init_db(conn)
+        row = conn.execute("SELECT * FROM ledgers WHERE id = ?", (ledger_id,)).fetchone()
+        if not row:
+            raise ValueError("Customer not found")
 
-    results = (response_json.get("data") or {}).get("results") or []
-    res = None
-    if results and isinstance(results[0], dict):
-        res = results[0]
-    status_val = (res or {}).get("status")
-    success = sync_cust_mod._status_is_success(status_val)
-    if not success and res is None and sync_cust_mod._response_indicates_success(response_json):
-        success = True
+        payload = sync_cust_mod._build_payload_for_ledger(
+            dict(row),
+            entity_id=sync_config.entity_id,
+            company_name=sync_config.company,
+        )
+        payload_hash = db.sha256_text(db.json_dumps(payload))
 
-    error_text = None
-    if not success:
-        raw_error = (res or {}).get("message")
-        if not raw_error:
-            data = response_json.get("data") or {}
-            errors = data.get("errors")
-            if response_json.get("status") != "success" or (isinstance(errors, int) and errors > 0):
-                raw_error = response_json.get("message") or "sync_failed"
-            else:
-                raw_error = "sync_failed"
-        error_text = sync_cust_mod._clean_error_text(raw_error) or "sync_failed"
+        endpoint = sync_config.api_base_url.rstrip("/") + "/import/tally-customer-payload/"
+        headers = {}
+        if sync_config.api_key:
+            headers["X-API-Key"] = sync_config.api_key
 
-    sync_cust_mod._update_sync_status(
-        conn,
-        ledger_id=ledger_id,
-        success=success,
-        payload_hash=payload_hash,
-        response_json=response_json,
-        error_text=error_text,
-    )
-    conn.commit()
-    conn.close()
-    return {"success": success, "response": response_json}
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
+        try:
+            response_json = resp.json()
+        except Exception:
+            response_json = {"status": "error", "message": resp.text}
+
+        results = (response_json.get("data") or {}).get("results") or []
+        res = None
+        if results and isinstance(results[0], dict):
+            res = results[0]
+        status_val = (res or {}).get("status")
+        success = sync_cust_mod._status_is_success(status_val)
+        if not success and res is None and sync_cust_mod._response_indicates_success(response_json):
+            success = True
+
+        error_text = None
+        if not success:
+            raw_error = (res or {}).get("message")
+            if not raw_error:
+                data = response_json.get("data") or {}
+                errors = data.get("errors")
+                if response_json.get("status") != "success" or (isinstance(errors, int) and errors > 0):
+                    raw_error = response_json.get("message") or "sync_failed"
+                else:
+                    raw_error = "sync_failed"
+            error_text = sync_cust_mod._clean_error_text(raw_error) or "sync_failed"
+
+        sync_cust_mod._update_sync_status(
+            conn,
+            ledger_id=ledger_id,
+            success=success,
+            payload_hash=payload_hash,
+            response_json=response_json,
+            error_text=error_text,
+        )
+        conn.commit()
+        return {"success": success, "response": response_json}
+    finally:
+        conn.close()
 
 
 def _retry_product(stock_item_id: int) -> Dict[str, Any]:
@@ -1131,47 +1238,48 @@ def _retry_product(stock_item_id: int) -> Dict[str, Any]:
         raise ValueError("db_path and api_base_url are required")
 
     conn = db.connect(sync_config.db_path)
-    db.init_db(conn)
-    row = conn.execute("SELECT * FROM stock_items WHERE id = ?", (stock_item_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise ValueError("Product not found")
-
-    payload = sync_prod_mod._build_payload_for_item(
-        dict(row),
-        entity_id=sync_config.entity_id,
-        company_name=sync_config.company,
-    )
-    payload_hash = db.sha256_text(db.json_dumps(payload))
-
-    endpoint = sync_config.api_base_url.rstrip("/") + "/import/tally-product-payload/"
-    headers = {}
-    if sync_config.api_key:
-        headers["X-API-Key"] = sync_config.api_key
-
-    resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
     try:
-        response_json = resp.json()
-    except Exception:
-        response_json = {"status": "error", "message": resp.text}
+        db.init_db(conn)
+        row = conn.execute("SELECT * FROM stock_items WHERE id = ?", (stock_item_id,)).fetchone()
+        if not row:
+            raise ValueError("Product not found")
 
-    results = (response_json.get("data") or {}).get("results") or []
-    status_val = None
-    if results:
-        status_val = (results[0] or {}).get("status")
-    success = status_val in ("created", "updated")
+        payload = sync_prod_mod._build_payload_for_item(
+            dict(row),
+            entity_id=sync_config.entity_id,
+            company_name=sync_config.company,
+        )
+        payload_hash = db.sha256_text(db.json_dumps(payload))
 
-    sync_prod_mod._update_sync_status(
-        conn,
-        stock_item_id=stock_item_id,
-        success=success,
-        payload_hash=payload_hash,
-        response_json=response_json,
-        error_text=None if success else response_json.get("message") or "sync_failed",
-    )
-    conn.commit()
-    conn.close()
-    return {"success": success, "response": response_json}
+        endpoint = sync_config.api_base_url.rstrip("/") + "/import/tally-product-payload/"
+        headers = {}
+        if sync_config.api_key:
+            headers["X-API-Key"] = sync_config.api_key
+
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
+        try:
+            response_json = resp.json()
+        except Exception:
+            response_json = {"status": "error", "message": resp.text}
+
+        results = (response_json.get("data") or {}).get("results") or []
+        status_val = None
+        if results:
+            status_val = (results[0] or {}).get("status")
+        success = status_val in ("created", "updated")
+
+        sync_prod_mod._update_sync_status(
+            conn,
+            stock_item_id=stock_item_id,
+            success=success,
+            payload_hash=payload_hash,
+            response_json=response_json,
+            error_text=None if success else response_json.get("message") or "sync_failed",
+        )
+        conn.commit()
+        return {"success": success, "response": response_json}
+    finally:
+        conn.close()
 
 
 def _check_auth() -> Optional[Response]:
@@ -1186,7 +1294,7 @@ def _check_auth() -> Optional[Response]:
 
 def _parse_list_args() -> Tuple[str, str, int, int]:
     status = (request.args.get("status") or "all").lower()
-    if status not in ("all", "synced", "failed", "pending"):
+    if status not in ("all", "synced", "failed", "pending", "deleted"):
         status = "all"
     search = (request.args.get("search") or "").strip()
     try:
@@ -1256,10 +1364,8 @@ def api_source_mode():
         return auth_resp
     data = request.get_json(silent=True) or {}
     source_doc = _normalize_source_doc(data.get("source_doc"))
-    invoice_dc_prefix = str(data.get("invoice_dc_prefix") or "INV-").strip() or "INV-"
     with STATE.lock:
         STATE.source_doc = source_doc
-        STATE.invoice_dc_prefix = invoice_dc_prefix
         payload = STATE.to_dict()
     return jsonify({"status": "success", "data": payload})
 
@@ -1718,20 +1824,24 @@ def api_fetch():
         return jsonify({"status": "error", "message": "Busy"}), 409
     with STATE.lock:
         STATE.busy = True
+        STATE.current_step = "Fetching DCs (manual)"
     try:
         stats = _run_fetch()
         with STATE.lock:
             STATE.fetch_stats = stats
             STATE.last_fetch_at = _now_iso()
             STATE.last_error = None
+            STATE.add_activity("Fetch DCs (manual)", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
         return jsonify({"status": "success", "data": stats})
     except Exception as exc:
         with STATE.lock:
             STATE.last_error = str(exc)
+            STATE.add_activity("Fetch DCs (manual)", "error", str(exc))
         return jsonify({"status": "error", "message": str(exc)}), 500
     finally:
         with STATE.lock:
             STATE.busy = False
+            STATE.current_step = None
         STATE.busy_lock.release()
 
 
@@ -1744,20 +1854,24 @@ def api_sync():
         return jsonify({"status": "error", "message": "Busy"}), 409
     with STATE.lock:
         STATE.busy = True
+        STATE.current_step = "Syncing DCs (manual)"
     try:
         stats = _run_sync()
         with STATE.lock:
             STATE.sync_stats = stats
             STATE.last_sync_at = _now_iso()
             STATE.last_error = None
+            STATE.add_activity("Sync DCs (manual)", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
         return jsonify({"status": "success", "data": stats})
     except Exception as exc:
         with STATE.lock:
             STATE.last_error = str(exc)
+            STATE.add_activity("Sync DCs (manual)", "error", str(exc))
         return jsonify({"status": "error", "message": str(exc)}), 500
     finally:
         with STATE.lock:
             STATE.busy = False
+            STATE.current_step = None
         STATE.busy_lock.release()
 
 
@@ -1779,20 +1893,24 @@ def api_fetch_customers():
         return jsonify({"status": "error", "message": "Busy"}), 409
     with STATE.lock:
         STATE.busy = True
+        STATE.current_step = "Fetching Customers (manual)"
     try:
         stats = _run_fetch_customers()
         with STATE.lock:
             STATE.customer_fetch_stats = stats
             STATE.last_customer_fetch_at = _now_iso()
             STATE.last_error = None
+            STATE.add_activity("Fetch Customers (manual)", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
         return jsonify({"status": "success", "data": stats})
     except Exception as exc:
         with STATE.lock:
             STATE.last_error = str(exc)
+            STATE.add_activity("Fetch Customers (manual)", "error", str(exc))
         return jsonify({"status": "error", "message": str(exc)}), 500
     finally:
         with STATE.lock:
             STATE.busy = False
+            STATE.current_step = None
         STATE.busy_lock.release()
 
 
@@ -1805,20 +1923,24 @@ def api_sync_customers():
         return jsonify({"status": "error", "message": "Busy"}), 409
     with STATE.lock:
         STATE.busy = True
+        STATE.current_step = "Syncing Customers (manual)"
     try:
         stats = _run_sync_customers()
         with STATE.lock:
             STATE.customer_sync_stats = stats
             STATE.last_customer_sync_at = _now_iso()
             STATE.last_error = None
+            STATE.add_activity("Sync Customers (manual)", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
         return jsonify({"status": "success", "data": stats})
     except Exception as exc:
         with STATE.lock:
             STATE.last_error = str(exc)
+            STATE.add_activity("Sync Customers (manual)", "error", str(exc))
         return jsonify({"status": "error", "message": str(exc)}), 500
     finally:
         with STATE.lock:
             STATE.busy = False
+            STATE.current_step = None
         STATE.busy_lock.release()
 
 
@@ -1831,20 +1953,24 @@ def api_fetch_products():
         return jsonify({"status": "error", "message": "Busy"}), 409
     with STATE.lock:
         STATE.busy = True
+        STATE.current_step = "Fetching Products (manual)"
     try:
         stats = _run_fetch_products()
         with STATE.lock:
             STATE.product_fetch_stats = stats
             STATE.last_product_fetch_at = _now_iso()
             STATE.last_error = None
+            STATE.add_activity("Fetch Products (manual)", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
         return jsonify({"status": "success", "data": stats})
     except Exception as exc:
         with STATE.lock:
             STATE.last_error = str(exc)
+            STATE.add_activity("Fetch Products (manual)", "error", str(exc))
         return jsonify({"status": "error", "message": str(exc)}), 500
     finally:
         with STATE.lock:
             STATE.busy = False
+            STATE.current_step = None
         STATE.busy_lock.release()
 
 
@@ -1857,20 +1983,24 @@ def api_sync_products():
         return jsonify({"status": "error", "message": "Busy"}), 409
     with STATE.lock:
         STATE.busy = True
+        STATE.current_step = "Syncing Products (manual)"
     try:
         stats = _run_sync_products()
         with STATE.lock:
             STATE.product_sync_stats = stats
             STATE.last_product_sync_at = _now_iso()
             STATE.last_error = None
+            STATE.add_activity("Sync Products (manual)", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
         return jsonify({"status": "success", "data": stats})
     except Exception as exc:
         with STATE.lock:
             STATE.last_error = str(exc)
+            STATE.add_activity("Sync Products (manual)", "error", str(exc))
         return jsonify({"status": "error", "message": str(exc)}), 500
     finally:
         with STATE.lock:
             STATE.busy = False
+            STATE.current_step = None
         STATE.busy_lock.release()
 
 
@@ -1940,6 +2070,7 @@ def _html_page() -> str:
     .badge.synced { background: #dcfce7; color: #166534; }
     .badge.failed { background: #fee2e2; color: #991b1b; }
     .badge.pending { background: #fef3c7; color: #92400e; }
+    .badge.deleted { background: #e5e7eb; color: #6b7280; text-decoration: line-through; }
     .truncate { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .pagination { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; gap: 8px; }
     .btn.small { padding: 4px 8px; font-size: 12px; }
@@ -1952,6 +2083,23 @@ def _html_page() -> str:
     .modal-section h3 { margin: 0 0 6px 0; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
     .modal-body pre { background: #0b1220; color: #d1d5db; padding: 12px; border-radius: 8px; white-space: pre-wrap; font-size: 12px; line-height: 1.4; }
     .modal-body .empty { color: var(--muted); font-style: italic; }
+    .step-bar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 8px; margin-bottom: 12px; }
+    .step-bar .step-label { font-size: 13px; font-weight: 600; color: #3730a3; }
+    .step-bar .step-progress { flex: 1; height: 6px; background: #c7d2fe; border-radius: 4px; overflow: hidden; }
+    .step-bar .step-fill { height: 100%; background: #4f46e5; border-radius: 4px; transition: width 0.3s; }
+    .step-bar .step-count { font-size: 12px; color: #6366f1; white-space: nowrap; }
+    .activity-list { max-height: 240px; overflow-y: auto; }
+    .activity-item { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+    .activity-item:last-child { border-bottom: none; }
+    .activity-item .act-time { color: var(--muted); white-space: nowrap; min-width: 130px; }
+    .activity-item .act-action { font-weight: 600; min-width: 160px; }
+    .activity-item .act-detail { color: var(--muted); flex: 1; }
+    .activity-item .act-ok { color: #166534; }
+    .activity-item .act-error { color: #991b1b; }
+    .errors-list { margin: 4px 0 0; padding-left: 16px; font-size: 12px; }
+    .errors-list li { color: var(--danger); margin: 2px 0; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+    .pulse { animation: pulse 1.5s ease-in-out infinite; }
   </style>
 </head>
 <body>
@@ -1960,6 +2108,17 @@ def _html_page() -> str:
       <h1>Tally Middleware UI</h1>
       <div class="sub">Live control panel for Tally fetch and Catalytics sync</div>
     </header>
+
+    <div id="stepBar" class="step-bar hidden">
+      <span class="step-label pulse" id="stepLabel">-</span>
+      <div class="step-progress"><div class="step-fill" id="stepFill" style="width:0%"></div></div>
+      <span class="step-count" id="stepCount">-</span>
+    </div>
+
+    <div id="errorsCard" class="card hidden" style="margin-bottom:12px; border-color: #fecaca;">
+      <div class="label" style="color: var(--danger);">Errors in Last Cycle</div>
+      <ul id="errorsList" class="errors-list"></ul>
+    </div>
 
     <div class="grid">
       <div class="card">
@@ -1985,10 +2144,6 @@ def _html_page() -> str:
       <div class="card">
         <div class="label">Source Mode</div>
         <div id="sourceMode" class="value">-</div>
-      </div>
-      <div class="card">
-        <div class="label">Invoice Prefix</div>
-        <div id="invoicePrefix" class="value">-</div>
       </div>
       <div class="card">
         <div class="label">Last Error</div>
@@ -2030,7 +2185,6 @@ def _html_page() -> str:
               <option value="delivery_note">Delivery Note -> DC</option>
               <option value="sales_invoice">Sales Invoice -> DC</option>
             </select>
-            <input id="invoicePrefixInput" type="text" value="INV-" placeholder="Invoice prefix" style="width:110px;" />
             <button id="btnSaveSource" class="btn" onclick="saveSourceMode()">Apply</button>
           </div>
         </div>
@@ -2108,6 +2262,18 @@ def _html_page() -> str:
     </div>
 
     <div class="section">
+      <h2>Activity Log</h2>
+      <div class="card">
+        <div class="toolbar">
+          <span class="pill">Recent Operations</span>
+        </div>
+        <div id="activityLog" class="activity-list" style="margin-top:8px;">
+          <div class="stat-line">No activity yet</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
       <h2>Data</h2>
       <div class="tabs">
         <button class="tab active" data-tab="dc" onclick="switchTab('dc')">Delivery Challans</button>
@@ -2123,6 +2289,7 @@ def _html_page() -> str:
               <option value="pending">Pending</option>
               <option value="failed">Failed</option>
               <option value="synced">Synced</option>
+              <option value="deleted">Deleted</option>
             </select>
           </label>
           <label>Search <input id="dataSearch" type="text" placeholder="dc no, party, name..." /></label>
@@ -2264,7 +2431,6 @@ def _html_page() -> str:
       document.getElementById('btnStop').disabled = !running;
       document.getElementById('btnRestart').disabled = !running;
       document.getElementById('sourceModeSelect').disabled = busy;
-      document.getElementById('invoicePrefixInput').disabled = busy;
       document.getElementById('btnSaveSource').disabled = busy;
       document.getElementById('btnAnalyze').disabled = busy;
       document.getElementById('btnFetch').disabled = busy;
@@ -2295,15 +2461,10 @@ def _html_page() -> str:
       const sourceDoc = s.source_doc || 'delivery_note';
       const modeLabel = sourceDoc === 'sales_invoice' ? 'Sales Invoice -> DC' : 'Delivery Note -> DC';
       document.getElementById('sourceMode').innerText = modeLabel;
-      document.getElementById('invoicePrefix').innerText = s.invoice_dc_prefix || '-';
 
       const sourceModeSelect = document.getElementById('sourceModeSelect');
       if (document.activeElement !== sourceModeSelect) {
         sourceModeSelect.value = sourceDoc;
-      }
-      const invoicePrefixInput = document.getElementById('invoicePrefixInput');
-      if (document.activeElement !== invoicePrefixInput) {
-        invoicePrefixInput.value = s.invoice_dc_prefix || 'INV-';
       }
 
       const errEl = document.getElementById('lastError');
@@ -2313,6 +2474,46 @@ def _html_page() -> str:
       } else {
         errEl.innerText = '-';
         errEl.className = 'value';
+      }
+
+      // Step progress bar
+      const stepBar = document.getElementById('stepBar');
+      if (s.current_step && s.busy) {
+        stepBar.classList.remove('hidden');
+        document.getElementById('stepLabel').innerText = s.current_step;
+        const pct = s.step_total > 0 ? Math.round((s.step_index / s.step_total) * 100) : 0;
+        document.getElementById('stepFill').style.width = pct + '%';
+        document.getElementById('stepCount').innerText = `Step ${s.step_index}/${s.step_total}`;
+      } else {
+        stepBar.classList.add('hidden');
+      }
+
+      // Errors from last cycle
+      const errorsCard = document.getElementById('errorsCard');
+      const errorsList = document.getElementById('errorsList');
+      const errors = s.errors || [];
+      if (errors.length > 0) {
+        errorsCard.classList.remove('hidden');
+        errorsList.innerHTML = errors.map(e => `<li>${escapeHtml(e)}</li>`).join('');
+      } else {
+        errorsCard.classList.add('hidden');
+      }
+
+      // Activity log
+      const activityLog = document.getElementById('activityLog');
+      const activity = s.activity || [];
+      if (activity.length > 0) {
+        activityLog.innerHTML = activity.map(a => {
+          const cls = a.result === 'ok' ? 'act-ok' : 'act-error';
+          const icon = a.result === 'ok' ? '&#10003;' : '&#10007;';
+          return `<div class="activity-item">
+            <span class="act-time">${escapeHtml(a.time || '')}</span>
+            <span class="act-action ${cls}">${icon} ${escapeHtml(a.action || '')}</span>
+            <span class="act-detail">${escapeHtml(a.detail || '')}</span>
+          </div>`;
+        }).join('');
+      } else {
+        activityLog.innerHTML = '<div class="stat-line">No activity yet</div>';
       }
 
       const intervalInput = document.getElementById('interval');
@@ -2335,17 +2536,23 @@ def _html_page() -> str:
       const productFetchStats = s.product_fetch_stats || {};
       const productSyncStats = s.product_sync_stats || {};
       document.getElementById('fetchStats').innerHTML =
-        `<strong>created</strong>: ${fetchStats.created ?? '-'} | <strong>updated</strong>: ${fetchStats.updated ?? '-'} | <strong>skipped</strong>: ${fetchStats.skipped ?? '-'}`;
+        `<strong>created</strong>: ${fetchStats.created ?? '-'} | <strong>updated</strong>: ${fetchStats.updated ?? '-'} | <strong>skipped</strong>: ${fetchStats.skipped ?? '-'}` +
+        (fetchStats.deleted != null ? ` | <strong>deleted</strong>: ${fetchStats.deleted}` : '');
       document.getElementById('syncStats').innerHTML =
-        `<strong>sent</strong>: ${syncStats.sent ?? '-'} | <strong>ok</strong>: ${syncStats.ok ?? '-'} | <strong>failed</strong>: ${syncStats.failed ?? '-'}`;
+        `<strong>sent</strong>: ${syncStats.sent ?? '-'} | <strong>ok</strong>: ${syncStats.ok ?? '-'} | <strong>failed</strong>: ${syncStats.failed ?? '-'}` +
+        (syncStats.delete_sent != null ? ` | <strong>del_sent</strong>: ${syncStats.delete_sent} | <strong>del_ok</strong>: ${syncStats.delete_ok ?? 0}` : '');
       document.getElementById('customerFetchStats').innerHTML =
-        `<strong>created</strong>: ${customerFetchStats.created ?? '-'} | <strong>updated</strong>: ${customerFetchStats.updated ?? '-'} | <strong>skipped</strong>: ${customerFetchStats.skipped ?? '-'}`;
+        `<strong>created</strong>: ${customerFetchStats.created ?? '-'} | <strong>updated</strong>: ${customerFetchStats.updated ?? '-'} | <strong>skipped</strong>: ${customerFetchStats.skipped ?? '-'}` +
+        (customerFetchStats.deleted != null ? ` | <strong>deleted</strong>: ${customerFetchStats.deleted}` : '');
       document.getElementById('customerSyncStats').innerHTML =
-        `<strong>sent</strong>: ${customerSyncStats.sent ?? '-'} | <strong>ok</strong>: ${customerSyncStats.ok ?? '-'} | <strong>failed</strong>: ${customerSyncStats.failed ?? '-'}`;
+        `<strong>sent</strong>: ${customerSyncStats.sent ?? '-'} | <strong>ok</strong>: ${customerSyncStats.ok ?? '-'} | <strong>failed</strong>: ${customerSyncStats.failed ?? '-'}` +
+        (customerSyncStats.delete_sent != null ? ` | <strong>del_sent</strong>: ${customerSyncStats.delete_sent} | <strong>del_ok</strong>: ${customerSyncStats.delete_ok ?? 0}` : '');
       document.getElementById('productFetchStats').innerHTML =
-        `<strong>created</strong>: ${productFetchStats.created ?? '-'} | <strong>updated</strong>: ${productFetchStats.updated ?? '-'} | <strong>skipped</strong>: ${productFetchStats.skipped ?? '-'}`;
+        `<strong>created</strong>: ${productFetchStats.created ?? '-'} | <strong>updated</strong>: ${productFetchStats.updated ?? '-'} | <strong>skipped</strong>: ${productFetchStats.skipped ?? '-'}` +
+        (productFetchStats.deleted != null ? ` | <strong>deleted</strong>: ${productFetchStats.deleted}` : '');
       document.getElementById('productSyncStats').innerHTML =
-        `<strong>sent</strong>: ${productSyncStats.sent ?? '-'} | <strong>ok</strong>: ${productSyncStats.ok ?? '-'} | <strong>failed</strong>: ${productSyncStats.failed ?? '-'}`;
+        `<strong>sent</strong>: ${productSyncStats.sent ?? '-'} | <strong>ok</strong>: ${productSyncStats.ok ?? '-'} | <strong>failed</strong>: ${productSyncStats.failed ?? '-'}` +
+        (productSyncStats.delete_sent != null ? ` | <strong>del_sent</strong>: ${productSyncStats.delete_sent} | <strong>del_ok</strong>: ${productSyncStats.delete_ok ?? 0}` : '');
 
       updateButtons(!!s.running, !!s.busy);
     }
@@ -2385,7 +2592,7 @@ def _html_page() -> str:
           `Mode: ${(data.source_doc === 'sales_invoice') ? 'Sales Invoice -> DC' : 'Delivery Note -> DC'}`,
           `Env missing: ${missing.length ? missing.join(', ') : 'none'}`,
           `Connectivity: Tally=${tallyReachable ? 'OK' : 'FAIL'}, API=${apiReachable ? 'OK' : 'FAIL'}`,
-          `Queue: DC(F:${queue.dc?.failed ?? 0}/P:${queue.dc?.pending ?? 0}), Customers(F:${queue.customers?.failed ?? 0}/P:${queue.customers?.pending ?? 0}), Products(F:${queue.products?.failed ?? 0}/P:${queue.products?.pending ?? 0})`,
+          `Queue: DC(F:${queue.dc?.failed ?? 0}/P:${queue.dc?.pending ?? 0}/D:${queue.dc?.deleted ?? 0}), Customers(F:${queue.customers?.failed ?? 0}/P:${queue.customers?.pending ?? 0}/D:${queue.customers?.deleted ?? 0}), Products(F:${queue.products?.failed ?? 0}/P:${queue.products?.pending ?? 0}/D:${queue.products?.deleted ?? 0})`,
           `Generated: ${data.generated_at || '-'}`
         ];
         document.getElementById('diagSummary').innerText = summary.join(' | ');
@@ -2434,7 +2641,10 @@ def _html_page() -> str:
         .replace(/'/g, '&#39;');
     }
 
-    function renderBadge(state) {
+    function renderBadge(state, isDeleted) {
+      if (isDeleted) {
+        return `<span class="badge deleted">deleted</span>`;
+      }
       const val = state || 'pending';
       return `<span class="badge ${val}">${val}</span>`;
     }
@@ -2524,22 +2734,25 @@ def _html_page() -> str:
         const errText = escapeHtml(errDisplay);
         const hintText = hintDisplay ? `<div class="hint-text" title="${escapeHtml(hintDisplay)}">${escapeHtml(hintDisplay)}</div>` : '';
         const errCell = errDisplay !== '-' ? `<span class="truncate" title="${escapeHtml(errFull)}">${errText}</span>${hintText}` : '-';
+        const isDeleted = item.is_deleted === 1 || item.is_deleted === true;
+        const rowStyle = isDeleted ? ' style="text-decoration: line-through; opacity: 0.6;"' : '';
+        const actionBtns = isDeleted
+          ? `<button class="btn small" onclick="viewDetail('dc', ${item.id})">View</button>`
+          : `<button class="btn small" onclick="viewDetail('dc', ${item.id})">View</button>
+             <button class="btn small" onclick="retryItem('dc', ${item.id})">Retry</button>
+             <button class="btn small" onclick="markUnsynced('dc', ${item.id})">Mark</button>`;
         return `
-          <tr>
+          <tr${rowStyle}>
             <td>${item.id ?? '-'}</td>
             <td>${escapeHtml(item.dc_no ?? '-')}</td>
             <td>${escapeHtml(item.voucher_date ?? '-')}</td>
             <td>${escapeHtml(item.party_ledger_name ?? '-')}</td>
             <td>${escapeHtml(item.reference ?? '-')}</td>
             <td>${escapeHtml(item.updated_at ?? '-')}</td>
-            <td>${renderBadge(item.sync_state)}</td>
+            <td>${renderBadge(item.sync_state, isDeleted)}</td>
             <td>${item.attempts ?? 0}</td>
             <td>${errCell}</td>
-            <td>
-              <button class="btn small" onclick="viewDetail('dc', ${item.id})">View</button>
-              <button class="btn small" onclick="retryItem('dc', ${item.id})">Retry</button>
-              <button class="btn small" onclick="markUnsynced('dc', ${item.id})">Mark</button>
-            </td>
+            <td>${actionBtns}</td>
           </tr>
         `;
       }).join('');
@@ -2559,19 +2772,22 @@ def _html_page() -> str:
         const errText = escapeHtml(errDisplay);
         const hintText = hintDisplay ? `<div class="hint-text" title="${escapeHtml(hintDisplay)}">${escapeHtml(hintDisplay)}</div>` : '';
         const errCell = errDisplay !== '-' ? `<span class="truncate" title="${escapeHtml(errFull)}">${errText}</span>${hintText}` : '-';
+        const isDeleted = item.is_deleted === 1 || item.is_deleted === true;
+        const rowStyle = isDeleted ? ' style="text-decoration: line-through; opacity: 0.6;"' : '';
+        const actionBtns = isDeleted
+          ? `<button class="btn small" onclick="viewDetail('${tab}', ${item.id})">View</button>`
+          : `<button class="btn small" onclick="viewDetail('${tab}', ${item.id})">View</button>
+             <button class="btn small" onclick="retryItem('${tab}', ${item.id})">Retry</button>
+             <button class="btn small" onclick="markUnsynced('${tab}', ${item.id})">Mark</button>`;
         return `
-          <tr>
+          <tr${rowStyle}>
             <td>${item.id ?? '-'}</td>
             <td>${escapeHtml(item.name ?? '-')}</td>
             <td>${escapeHtml(item.updated_at ?? '-')}</td>
-            <td>${renderBadge(item.sync_state)}</td>
+            <td>${renderBadge(item.sync_state, isDeleted)}</td>
             <td>${item.attempts ?? 0}</td>
             <td>${errCell}</td>
-            <td>
-              <button class="btn small" onclick="viewDetail('${tab}', ${item.id})">View</button>
-              <button class="btn small" onclick="retryItem('${tab}', ${item.id})">Retry</button>
-              <button class="btn small" onclick="markUnsynced('${tab}', ${item.id})">Mark</button>
-            </td>
+            <td>${actionBtns}</td>
           </tr>
         `;
       }).join('');
@@ -2742,13 +2958,16 @@ def _html_page() -> str:
       const container = document.getElementById('modalContent');
       const record = data || {};
 
+      const isDeleted = record.is_deleted === 1 || record.is_deleted === true;
       const meta = {
         id: record.id ?? null,
         dc_no: record.dc_no ?? null,
         name: record.name ?? null,
         party: record.party_ledger_name ?? null,
         reference: record.reference ?? null,
-        sync_state: record.sync_state ?? null,
+        is_deleted: isDeleted,
+        deleted_at: record.deleted_at ?? null,
+        sync_state: isDeleted ? 'deleted' : (record.sync_state ?? null),
         attempts: record.attempts ?? null,
         last_error: record.last_error ?? null,
         error_hint: record.error_hint ?? null,
@@ -2798,11 +3017,10 @@ def _html_page() -> str:
 
     async function saveSourceMode() {
       const sourceDoc = (document.getElementById('sourceModeSelect').value || 'delivery_note');
-      const invoicePrefix = (document.getElementById('invoicePrefixInput').value || 'INV-').trim() || 'INV-';
       const res = await apiFetch('/api/source-mode', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({source_doc: sourceDoc, invoice_dc_prefix: invoicePrefix})
+        body: JSON.stringify({source_doc: sourceDoc})
       });
       const payload = await res.json();
       if (!res.ok || payload.status !== 'success') {

@@ -90,16 +90,25 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
         parent = (ledger.get("PARENT") or ledger.get("PARENTNAME") or "").strip()
         ledger_data = ledger
-        if config.fetch_full and (not parent or parent.strip().casefold() != "sundry debtors"):
-            full = tally_api.get_ledger_by_name(company_name, name, config.tally_url)
-            if full:
-                ledger_data = full
-                parent = (ledger_data.get("PARENT") or ledger_data.get("PARENTNAME") or "").strip()
+
+        # If parent unknown, do a full fetch to determine the parent group
+        if not parent or parent.strip().casefold() != "sundry debtors":
+            if config.fetch_full:
+                full = tally_api.get_ledger_by_name(company_name, name, config.tally_url)
+                if full:
+                    ledger_data = full
+                    parent = (ledger_data.get("PARENT") or ledger_data.get("PARENTNAME") or "").strip()
 
         # Only keep Party Ledgers where Ledger Group = Sundry Debtors (Customers)
         if not parent or parent.strip().casefold() != "sundry debtors":
             skipped += 1
             continue
+
+        # Always do a full fetch for Sundry Debtors to get delivery addresses, GST, PAN etc.
+        if config.fetch_full and ledger_data is ledger:
+            full = tally_api.get_ledger_by_name(company_name, name, config.tally_url)
+            if full:
+                ledger_data = full
 
         existing = conn.execute(
             "SELECT data_json FROM ledgers WHERE company_id = ? AND name = ?",
@@ -130,9 +139,60 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 payload_hash=payload_hash,
             )
 
+    # --- Delete detection ---
+    # Collect all Sundry Debtor names from Tally response
+    deleted = 0
+    tally_names = set()
+    for ledger in ledgers:
+        name = (ledger.get("NAME") or ledger.get("LEDGERNAME") or "").strip()
+        parent = (ledger.get("PARENT") or ledger.get("PARENTNAME") or "").strip()
+        if name and parent and parent.casefold() == "sundry debtors":
+            tally_names.add(name)
+
+    # Safety: only detect deletions if Tally returned >0 Sundry Debtor names
+    # and there are previously synced records (not a first-run scenario)
+    has_synced_records = conn.execute(
+        """SELECT 1 FROM ledger_sync_status ls
+           JOIN ledgers l ON l.id = ls.ledger_id
+           WHERE ls.is_synced = 1 AND l.company_id = ? LIMIT 1""",
+        (company_id,),
+    ).fetchone() is not None
+
+    if tally_names and has_synced_records:
+        # Find active ledgers in SQLite that are NOT in the Tally response
+        sqlite_ledgers = conn.execute(
+            "SELECT id, name, data_json FROM ledgers WHERE company_id = ? AND COALESCE(is_deleted, 0) = 0",
+            (company_id,),
+        ).fetchall()
+
+        names_to_delete = []
+        for row in sqlite_ledgers:
+            row_data = db.json_loads(row["data_json"]) if row["data_json"] else {}
+            row_parent = (row_data.get("PARENT") or row_data.get("PARENTNAME") or "").strip()
+            if row_parent and row_parent.casefold() == "sundry debtors":
+                if row["name"] not in tally_names:
+                    names_to_delete.append(row["name"])
+
+        if names_to_delete:
+            deleted = db.mark_records_deleted(conn, "ledgers", company_id, names_to_delete)
+            logger.info("Marked %d ledgers as deleted (not in Tally response)", deleted)
+            # Mark deleted records as unsynced so they get propagated
+            for row_name in names_to_delete:
+                row = conn.execute(
+                    "SELECT id FROM ledgers WHERE company_id = ? AND name = ?",
+                    (company_id, row_name),
+                ).fetchone()
+                if row:
+                    db.ensure_ledger_sync_status(
+                        conn,
+                        ledger_id=row["id"],
+                        is_synced=0,
+                        payload_hash="DELETED",
+                    )
+
     conn.commit()
-    logger.info("Done. created=%d updated=%d skipped=%d", created, updated, skipped)
-    return {"created": created, "updated": updated, "skipped": skipped}
+    logger.info("Done. created=%d updated=%d skipped=%d deleted=%d", created, updated, skipped, deleted)
+    return {"created": created, "updated": updated, "skipped": skipped, "deleted": deleted}
 
 
 def main() -> int:

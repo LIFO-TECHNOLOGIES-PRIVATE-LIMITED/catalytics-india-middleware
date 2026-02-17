@@ -29,7 +29,6 @@ class FetchConfig:
     from_date: Optional[str]
     to_date: Optional[str]
     days_back: Optional[int]
-    dc_prefix: str
     fetch_stock: bool
     dry_run: bool
     log_level: str
@@ -96,7 +95,6 @@ def build_config(args: argparse.Namespace) -> FetchConfig:
         from_date=args.from_date or cfg.get_env("TALLY_FROM_DATE"),
         to_date=args.to_date or cfg.get_env("TALLY_TO_DATE"),
         days_back=args.days_back or cfg.get_env_int("TALLY_DAYS_BACK"),
-        dc_prefix=(args.dc_prefix or cfg.get_env("TALLY_INVOICE_DC_PREFIX", "INV-") or "").strip(),
         fetch_stock=bool(args.fetch_stock) or cfg.get_env_bool("TALLY_FETCH_STOCK", False),
         dry_run=bool(args.dry_run) or cfg.get_env_bool("TALLY_DRY_RUN", False),
         log_level=args.log_level or cfg.get_env("LOG_LEVEL", "INFO"),
@@ -150,15 +148,15 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     ledgers_fetched = 0
     stock_items_fetched = 0
 
-    for voucher in vouchers:
-        voucher = dict(voucher)
+    for voucher_raw in vouchers:
+        voucher = dict(voucher_raw)
         source_doc_no = _normalize_dc_no(voucher)
         dc_no = source_doc_no
-        if config.dc_prefix and dc_no and not dc_no.startswith(config.dc_prefix):
-            dc_no = f"{config.dc_prefix}{dc_no}"
         if not dc_no:
             skipped += 1
             continue
+        # Keep a copy of original Tally data for stable hash computation
+        voucher_for_hash = dict(voucher)
         voucher["SOURCE_DOC_TYPE"] = "SALES_INVOICE"
         voucher["SOURCE_DOC_NO"] = source_doc_no
         voucher["VOUCHERNUMBER"] = dc_no
@@ -230,7 +228,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 if row:
                     stock_items_map[stock_name] = db.json_loads(row["data_json"])
 
-        payload_hash = _build_payload_hash(voucher, inventory_items, party_name, ledger_data, stock_items_map)
+        payload_hash = _build_payload_hash(voucher_for_hash, inventory_items, party_name, ledger_data, stock_items_map)
         existing_hash = None
         if dn_id:
             hash_row = conn.execute(
@@ -256,15 +254,70 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         if not config.dry_run:
             conn.commit()
 
+    # --- Delete detection (date-range scoped) ---
+    deleted = 0
+    tally_dc_nos = set()
+    for voucher_raw in vouchers:
+        final_dc_no = _normalize_dc_no(voucher_raw)
+        if final_dc_no:
+            tally_dc_nos.add(final_dc_no.strip().lower())
+
+    # Safety: only detect deletions if Tally returned >0 vouchers
+    # and there are previously synced records (not a first-run scenario)
+    has_synced_records = conn.execute(
+        """SELECT 1 FROM sync_status ss
+           JOIN delivery_notes dn ON dn.id = ss.delivery_note_id
+           WHERE ss.is_synced = 1 AND dn.company_id = ? LIMIT 1""",
+        (company_id,),
+    ).fetchone() is not None
+
+    if tally_dc_nos and has_synced_records:
+        # Find active DCs in SQLite within the same date range
+        sqlite_dcs = conn.execute(
+            """SELECT id, dc_no FROM delivery_notes
+               WHERE company_id = ?
+                 AND COALESCE(is_deleted, 0) = 0
+                 AND voucher_date IS NOT NULL
+                 AND voucher_date >= ?
+                 AND voucher_date <= ?""",
+            (company_id, from_date, to_date),
+        ).fetchall()
+
+        dc_nos_to_delete = []
+        for row in sqlite_dcs:
+            if (row["dc_no"] or "").strip().lower() not in tally_dc_nos:
+                dc_nos_to_delete.append(row["dc_no"])
+
+        if dc_nos_to_delete:
+            deleted = db.mark_dc_records_deleted(conn, company_id, dc_nos_to_delete)
+            logger.info("Marked %d delivery notes as deleted (not in Tally response for date range %s-%s)", deleted, from_date, to_date)
+            # Mark deleted records as unsynced so they get propagated
+            for dc_no_del in dc_nos_to_delete:
+                row = conn.execute(
+                    "SELECT id FROM delivery_notes WHERE company_id = ? AND dc_no = ?",
+                    (company_id, dc_no_del),
+                ).fetchone()
+                if row:
+                    db.ensure_sync_status(
+                        conn,
+                        delivery_note_id=row["id"],
+                        is_synced=0,
+                        payload_hash="DELETED",
+                    )
+
+        if not config.dry_run:
+            conn.commit()
+
     logger.info(
-        "Done. created=%d updated=%d skipped=%d ledgers=%d stock_items=%d",
+        "Done. created=%d updated=%d skipped=%d deleted=%d ledgers=%d stock_items=%d",
         created,
         updated,
         skipped,
+        deleted,
         ledgers_fetched,
         stock_items_fetched,
     )
-    return {"created": created, "updated": updated, "skipped": skipped}
+    return {"created": created, "updated": updated, "skipped": skipped, "deleted": deleted}
 
 
 def main() -> int:
@@ -277,7 +330,6 @@ def main() -> int:
     parser.add_argument("--from-date", help="From date YYYYMMDD")
     parser.add_argument("--to-date", help="To date YYYYMMDD")
     parser.add_argument("--days-back", type=int, help="Days back from today (overrides FY default)")
-    parser.add_argument("--dc-prefix", default="INV-", help="Prefix to apply to invoice number when creating DC number")
     parser.add_argument("--fetch-stock", action="store_true", help="Fetch stock item details")
     parser.add_argument("--dry-run", action="store_true", help="Do not commit changes")
     parser.add_argument("--log-level", help="Logging level")

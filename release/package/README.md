@@ -222,6 +222,7 @@ cd C:\Github\catalytics-india-middleware
 ```
 
 Executables are created in `dist\`. The UI executable is `dist\tally_ui.exe`.
+`tally_ui.exe` is built with `--noconsole` (no terminal window).
 Invoice binaries:
 `dist\tally_fetch_invoices.exe`, `dist\tally_invoice_loop.exe`.
 New customer/product binaries:
@@ -288,6 +289,12 @@ PowerShell:
 ```powershell
 .\enable_autostart_ui.ps1
 .\disable_autostart_ui.ps1
+```
+
+Quick setup (build + enable auto-start):
+```bat
+.\build_exe.bat
+.\enable_autostart_ui.bat
 ```
 
 These scripts also set `TALLY_ENV_PATH` to `.env`.

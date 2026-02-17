@@ -125,6 +125,38 @@ CREATE TABLE IF NOT EXISTS stock_sync_status (
 """
 
 
+_SOFT_DELETE_COLUMNS = {
+    "ledgers": ["is_deleted", "deleted_at"],
+    "stock_items": ["is_deleted", "deleted_at"],
+    "delivery_notes": ["is_deleted", "deleted_at"],
+}
+
+
+_soft_delete_ready = False
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    """Add is_deleted / deleted_at columns to tables that lack them."""
+    global _soft_delete_ready
+    for table, columns in _SOFT_DELETE_COLUMNS.items():
+        try:
+            existing = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+        except Exception:
+            continue
+        for col in columns:
+            if col not in existing:
+                col_type = "INTEGER DEFAULT 0" if col == "is_deleted" else "TEXT"
+                try:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"
+                    )
+                except Exception:
+                    pass  # Column may already exist from concurrent migration
+    _soft_delete_ready = True
+
+
 def now_ts() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -145,11 +177,13 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    migrate_db(conn)
 
 
 def ensure_company(
@@ -187,13 +221,16 @@ def upsert_json_row(
 ) -> None:
     ts = now_ts()
     data_json = json_dumps(data)
+    restore_clause = ""
+    if _soft_delete_ready:
+        restore_clause = ",\n            is_deleted = 0,\n            deleted_at = NULL"
     conn.execute(
         f"""
         INSERT INTO {table} (company_id, name, data_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(company_id, name) DO UPDATE SET
             data_json = excluded.data_json,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at{restore_clause}
         """,
         (company_id, name, data_json, ts, ts),
     )
@@ -241,8 +278,11 @@ def upsert_delivery_note(
 ) -> int:
     ts = now_ts()
     data_json = json_dumps(data)
+    restore_clause = ""
+    if _soft_delete_ready:
+        restore_clause = ",\n            is_deleted = 0,\n            deleted_at = NULL"
     conn.execute(
-        """
+        f"""
         INSERT INTO delivery_notes
             (company_id, dc_no, voucher_date, party_ledger_name, reference, data_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -251,7 +291,7 @@ def upsert_delivery_note(
             party_ledger_name = excluded.party_ledger_name,
             reference = excluded.reference,
             data_json = excluded.data_json,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at{restore_clause}
         """,
         (company_id, dc_no, voucher_date, party_ledger_name, reference, data_json, ts, ts),
     )
@@ -304,6 +344,52 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def mark_records_deleted(
+    conn: sqlite3.Connection,
+    table: str,
+    company_id: int,
+    names: Iterable[str],
+) -> int:
+    """Mark records as deleted by name. Returns count of records marked."""
+    ts = now_ts()
+    name_list = list(names)
+    if not name_list:
+        return 0
+    count = 0
+    # Batch in groups of 500 to stay within SQLite variable limits
+    for i in range(0, len(name_list), 500):
+        batch = name_list[i : i + 500]
+        placeholders = ",".join("?" for _ in batch)
+        cursor = conn.execute(
+            f"UPDATE {table} SET is_deleted = 1, deleted_at = ? WHERE company_id = ? AND name IN ({placeholders}) AND COALESCE(is_deleted, 0) = 0",
+            [ts, company_id] + batch,
+        )
+        count += cursor.rowcount
+    return count
+
+
+def mark_dc_records_deleted(
+    conn: sqlite3.Connection,
+    company_id: int,
+    dc_nos: Iterable[str],
+) -> int:
+    """Mark delivery notes as deleted by dc_no. Returns count of records marked."""
+    ts = now_ts()
+    dc_list = list(dc_nos)
+    if not dc_list:
+        return 0
+    count = 0
+    for i in range(0, len(dc_list), 500):
+        batch = dc_list[i : i + 500]
+        placeholders = ",".join("?" for _ in batch)
+        cursor = conn.execute(
+            f"UPDATE delivery_notes SET is_deleted = 1, deleted_at = ? WHERE company_id = ? AND dc_no IN ({placeholders}) AND COALESCE(is_deleted, 0) = 0",
+            [ts, company_id] + batch,
+        )
+        count += cursor.rowcount
+    return count
 
 
 def ensure_sync_status(
