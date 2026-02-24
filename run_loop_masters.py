@@ -4,16 +4,16 @@ import os
 import sys
 import time
 
-ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-import config as cfg
-from fetch_customers import build_config as build_fetch_customers_config, run_once as fetch_customers_once
-from fetch_products import build_config as build_fetch_products_config, run_once as fetch_products_once
-from sync_customers import build_config as build_sync_customers_config, run_once as sync_customers_once
-from sync_products import build_config as build_sync_products_config, run_once as sync_products_once
-from logging_utils import setup_logging
+from tally_middleware import config as cfg
+from tally_middleware.fetch_customers import build_config as build_fetch_customers_config, run_once as fetch_customers_once
+from tally_middleware.fetch_products import build_config as build_fetch_products_config, run_once as fetch_products_once
+from tally_middleware.sync_customers import build_config as build_sync_customers_config, run_once as sync_customers_once
+from tally_middleware.sync_products import build_config as build_sync_products_config, run_once as sync_products_once
+from tally_middleware.logging_utils import setup_logging
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
 

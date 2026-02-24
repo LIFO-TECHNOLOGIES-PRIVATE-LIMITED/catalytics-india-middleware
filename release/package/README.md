@@ -1,8 +1,7 @@
-﻿# Tally Delivery Challan Middleware
+# Tally Delivery Challan Middleware
 
 Standalone scripts:
 - `fetch_tally.py`: Pull delivery notes, ledgers, and stock items from Tally and store into SQLite (DC flow).
-- `fetch_invoices.py`: Pull sales invoices from Tally and stage them as DC-ready records in SQLite (invoice flow).
 - `sync_catalytics.py`: Push unsynced delivery notes from SQLite to Catalytics via API.
 - `fetch_customers.py`: Pull customer ledgers from Tally and store into SQLite.
 - `sync_customers.py`: Push unsynced ledgers from SQLite to Catalytics.
@@ -23,7 +22,7 @@ SQLite tables (created automatically):
 
 ## Fetch From Tally
 ```bash
-python fetch_tally.py \
+python tally_middleware/fetch_tally.py \
   --db-path C:\path\to\tally_dc.sqlite \
   --tally-url http://localhost:9000/ \
   --company "Your Tally Company" \
@@ -35,21 +34,9 @@ python fetch_tally.py \
 
 If `--from-date`/`--to-date` are omitted, it defaults to the current financial year range.
 
-## Fetch Sales Invoices (Invoice -> DC Flow)
-```bash
-python fetch_invoices.py \
-  --db-path C:\path\to\tally_dc.sqlite \
-  --tally-url http://localhost:9000/ \
-  --company "Your Tally Company" \
-  --entity-id 25 \
-  --from-date 20240101 \
-  --to-date 20240204 \
-  --dc-prefix INV-
-```
-
 ## Sync To Catalytics
 ```bash
-python sync_catalytics.py \
+python tally_middleware/sync_catalytics.py \
   --db-path C:\path\to\tally_dc.sqlite \
   --api-base-url http://localhost:8000 \
   --api-key YOUR_API_KEY \
@@ -59,7 +46,7 @@ python sync_catalytics.py \
 
 ## Fetch Customers (Ledger Master)
 ```bash
-python fetch_customers.py \
+python tally_middleware/fetch_customers.py \
   --db-path C:\path\to\tally_dc.sqlite \
   --tally-url http://localhost:9000/ \
   --company "Your Tally Company" \
@@ -69,7 +56,7 @@ python fetch_customers.py \
 
 ## Sync Customers
 ```bash
-python sync_customers.py \
+python tally_middleware/sync_customers.py \
   --db-path C:\path\to\tally_dc.sqlite \
   --api-base-url http://localhost:8000 \
   --api-key YOUR_API_KEY \
@@ -79,7 +66,7 @@ python sync_customers.py \
 
 ## Fetch Products (Stock Master)
 ```bash
-python fetch_products.py \
+python tally_middleware/fetch_products.py \
   --db-path C:\path\to\tally_dc.sqlite \
   --tally-url http://localhost:9000/ \
   --company "Your Tally Company" \
@@ -89,7 +76,7 @@ python fetch_products.py \
 
 ## Sync Products
 ```bash
-python sync_products.py \
+python tally_middleware/sync_products.py \
   --db-path C:\path\to\tally_dc.sqlite \
   --api-base-url http://localhost:8000 \
   --api-key YOUR_API_KEY \
@@ -99,15 +86,15 @@ python sync_products.py \
 
 ## Reset Sync Flags (Force Re-sync)
 ```bash
-python reset_sync.py --db-path C:\path\to\tally_dc.sqlite --reset-type products
-python reset_sync.py --db-path C:\path\to\tally_dc.sqlite --reset-type customers
-python reset_sync.py --db-path C:\path\to\tally_dc.sqlite --reset-type dc
-python reset_sync.py --db-path C:\path\to\tally_dc.sqlite --reset-type all
+python tally_middleware/reset_sync.py --db-path C:\path\to\tally_dc.sqlite --reset-type products
+python tally_middleware/reset_sync.py --db-path C:\path\to\tally_dc.sqlite --reset-type customers
+python tally_middleware/reset_sync.py --db-path C:\path\to\tally_dc.sqlite --reset-type dc
+python tally_middleware/reset_sync.py --db-path C:\path\to\tally_dc.sqlite --reset-type all
 ```
 
 ## Run Loop (Polling)
 ```bash
-python run_loop.py \
+python tally_middleware/run_loop.py \
   --db-path C:\path\to\tally_dc.sqlite \
   --tally-url http://localhost:9000/ \
   --company "Your Tally Company" \
@@ -119,22 +106,9 @@ python run_loop.py \
 
 Use `--once` for a single run.
 
-Invoice loop variant:
-```bash
-python run_loop_invoices.py \
-  --db-path C:\path\to\tally_dc.sqlite \
-  --tally-url http://localhost:9000/ \
-  --company "Your Tally Company" \
-  --entity-id 25 \
-  --api-base-url http://localhost:8000 \
-  --api-key YOUR_API_KEY \
-  --dc-prefix INV- \
-  --interval 300
-```
-
 ## Run Master Loop (Customers/Products)
 ```bash
-python run_loop_masters.py \
+python tally_middleware/run_loop_masters.py \
   --db-path C:\path\to\tally_dc.sqlite \
   --tally-url http://localhost:9000/ \
   --company "Your Tally Company" \
@@ -157,7 +131,6 @@ CATALYTICS_ENTITY_ID=25
 CATALYTICS_API_BASE_URL=http://localhost:8000
 CATALYTICS_API_KEY=YOUR_API_KEY
 TALLY_FETCH_STOCK=true
-TALLY_INVOICE_DC_PREFIX=INV-
 TALLY_FETCH_FULL_CUSTOMERS=false
 TALLY_FETCH_FULL_PRODUCTS=false
 TALLY_FETCH_FULL_PRODUCTS_AUTO_HSN=true
@@ -171,9 +144,9 @@ LOG_JSON=false
 
 Then run with `--config path\to\.env`.
 
-`fetch_tally.py`, `fetch_invoices.py`, `sync_catalytics.py`, `run_loop.py`, and `run_loop_invoices.py` will also auto-load `.env` if present.
+`fetch_tally.py`, `sync_catalytics.py`, and `run_loop.py` will also auto-load `tally_middleware\.env` if present.
 
-Sample file: `.env.example`
+Sample file: `tally_middleware/.env.example`
 
 ## Logging
 - Set `LOG_JSON=true` for JSON logs.
@@ -206,24 +179,22 @@ Payload:
 
 ## Tests
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+python -m unittest discover -s tally_middleware/tests -p "test_*.py"
 ```
 
 ## Build .exe (Windows)
 ```bat
-cd C:\Github\catalytics-india-middleware
-.\build_exe.bat
+cd C:\Github\catalytics-india-backend
+.\tally_middleware\build_exe.bat
 ```
 
 Or with PowerShell:
 ```powershell
-cd C:\Github\catalytics-india-middleware
-.\build_exe.ps1
+cd C:\Github\catalytics-india-backend
+.\tally_middleware\build_exe.ps1
 ```
 
 Executables are created in `dist\`. The UI executable is `dist\tally_ui.exe`.
-Invoice binaries:
-`dist\tally_fetch_invoices.exe`, `dist\tally_invoice_loop.exe`.
 New customer/product binaries:
 `dist\tally_fetch_customers.exe`, `dist\tally_sync_customers.exe`, `dist\tally_fetch_products.exe`, `dist\tally_sync_products.exe`.
 Master loop binary:
@@ -234,8 +205,8 @@ Reset sync binary:
 ## Web UI (Flask)
 Run the web UI server:
 ```bat
-pip install -r requirements.txt
-py web_ui.py
+pip install -r tally_middleware\requirements.txt
+py tally_middleware\web_ui.py
 ```
 
 Defaults:
@@ -251,81 +222,62 @@ UI_API_KEY=
 UI_AUTO_START=false
 AUTO_SYNC_CUSTOMERS=false
 AUTO_SYNC_PRODUCTS=false
-LOG_FILE=C:\Github\catalytics-india-middleware\logs\app.log
+LOG_FILE=C:\Github\catalytics-india-backend\tally_middleware\logs\app.log
 ```
 
 If `UI_API_KEY` is set, pass `X-API-Key` in requests.
 
-DC source selection in UI:
-- Use the `DC Source` card to switch between `Delivery Note -> DC` and `Sales Invoice -> DC`.
-- For invoice mode, set prefix (example `INV-`) and click `Apply`.
-- This change applies immediately to UI fetch/loop runs.
-- Persistent default still comes from `.env`:
-  - `TALLY_SOURCE_DOC=delivery_note` or `sales_invoice`
-  - `TALLY_INVOICE_DC_PREFIX=INV-`
-
-Diagnostics in UI:
-- Use `Diagnostics -> Analyze Now` to quickly inspect failed sync reasons.
-- The panel shows:
-  - Missing env/config keys
-  - Tally/API connectivity status
-  - Pending/failed queue counts
-  - Top error patterns with fix hints
-- Use it before retrying failed records in production.
-
 ## Auto-start UI on Windows login
 Enable:
 ```bat
-.\enable_autostart_ui.bat
+.\tally_middleware\enable_autostart_ui.bat
 ```
 
 Disable:
 ```bat
-.\disable_autostart_ui.bat
+.\tally_middleware\disable_autostart_ui.bat
 ```
 
 PowerShell:
 ```powershell
-.\enable_autostart_ui.ps1
-.\disable_autostart_ui.ps1
+.\tally_middleware\enable_autostart_ui.ps1
+.\tally_middleware\disable_autostart_ui.ps1
 ```
 
-These scripts also set `TALLY_ENV_PATH` to `.env`.
+These scripts also set `TALLY_ENV_PATH` to `tally_middleware\.env`.
 If you need a custom `.env` location, set `TALLY_ENV_PATH` in Windows Environment variables.
 
 ### Auto-start for ALL users (admin required)
 ```bat
-.\enable_autostart_ui_all_users.bat
-.\disable_autostart_ui_all_users.bat
+.\tally_middleware\enable_autostart_ui_all_users.bat
+.\tally_middleware\disable_autostart_ui_all_users.bat
 ```
 
 PowerShell (run as Administrator):
 ```powershell
-.\enable_autostart_ui_all_users.ps1
-.\disable_autostart_ui_all_users.ps1
+.\tally_middleware\enable_autostart_ui_all_users.ps1
+.\tally_middleware\disable_autostart_ui_all_users.ps1
 ```
 
 ## Package .exe + env into zip
 Batch:
 ```bat
-cd C:\Github\catalytics-india-middleware
-.\package_release.bat
+cd C:\Github\catalytics-india-backend
+.\tally_middleware\package_release.bat
 ```
 
 Include `.env` (if present):
 ```bat
-.\package_release.bat --include-env
+.\tally_middleware\package_release.bat --include-env
 ```
 
 PowerShell:
 ```powershell
-cd C:\Github\catalytics-india-middleware
-.\package_release.ps1
+cd C:\Github\catalytics-india-backend
+.\tally_middleware\package_release.ps1
 ```
 
 Include `.env`:
 ```powershell
-.\package_release.ps1 -IncludeEnv
+.\tally_middleware\package_release.ps1 -IncludeEnv
 ```
-
-

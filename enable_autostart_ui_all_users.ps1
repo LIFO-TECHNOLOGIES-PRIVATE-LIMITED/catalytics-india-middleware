@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$Root = $PSScriptRoot
+$Root = Split-Path -Parent $PSScriptRoot
 $DefaultExe = Join-Path $Root "dist\tally_ui.exe"
 $DefaultEnv = Join-Path $PSScriptRoot ".env"
 
@@ -19,7 +19,7 @@ if (-not $EnvPath) {
 
 if (!(Test-Path $ExePath)) {
     Write-Host "Executable not found: $ExePath"
-    Write-Host "Build it first with: .\build_exe.ps1"
+    Write-Host "Build it first with: .\tally_middleware\build_exe.ps1"
     exit 1
 }
 

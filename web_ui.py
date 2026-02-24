@@ -13,23 +13,23 @@ import requests
 from flask import Flask, jsonify, request, Response
 from werkzeug.serving import make_server
 
-ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-import db
-import config as cfg
-from fetch_tally import build_config as build_fetch_config, run_once as fetch_once
-from fetch_invoices import build_config as build_fetch_invoice_config, run_once as fetch_invoice_once
-from sync_catalytics import build_config as build_sync_config, run_once as sync_once
-from fetch_customers import build_config as build_fetch_customers_config, run_once as fetch_customers_once
-from sync_customers import build_config as build_sync_customers_config, run_once as sync_customers_once
-from fetch_products import build_config as build_fetch_products_config, run_once as fetch_products_once
-from sync_products import build_config as build_sync_products_config, run_once as sync_products_once
-from logging_utils import setup_logging
-import sync_catalytics as sync_dc_mod
-import sync_customers as sync_cust_mod
-import sync_products as sync_prod_mod
+from tally_middleware import db
+from tally_middleware import config as cfg
+from tally_middleware.fetch_tally import build_config as build_fetch_config, run_once as fetch_once
+from tally_middleware.fetch_invoices import build_config as build_fetch_invoice_config, run_once as fetch_invoice_once
+from tally_middleware.sync_catalytics import build_config as build_sync_config, run_once as sync_once
+from tally_middleware.fetch_customers import build_config as build_fetch_customers_config, run_once as fetch_customers_once
+from tally_middleware.sync_customers import build_config as build_sync_customers_config, run_once as sync_customers_once
+from tally_middleware.fetch_products import build_config as build_fetch_products_config, run_once as fetch_products_once
+from tally_middleware.sync_products import build_config as build_sync_products_config, run_once as sync_products_once
+from tally_middleware.logging_utils import setup_logging
+from tally_middleware import sync_catalytics as sync_dc_mod
+from tally_middleware import sync_customers as sync_cust_mod
+from tally_middleware import sync_products as sync_prod_mod
 
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
@@ -390,12 +390,12 @@ def _error_signature(error_text: Optional[str]) -> Tuple[str, str]:
     if any(token in lower for token in ("unauthorized", "forbidden", "401", "403", "api key")):
         return (
             "API authentication/authorization failure",
-            "Verify `CATALYTICS_API_KEY` in middleware and API permissions on server.",
+            "Verify `API_KEY` in middleware and API permissions on server.",
         )
     if any(token in lower for token in ("connection refused", "failed to establish", "newconnectionerror", "timed out", "timeout")):
         return (
             "Network/API connectivity issue",
-            "Check `CATALYTICS_API_BASE_URL`, network route, firewall, and whether API server is running.",
+            "Check `API_BASE_URL`, network route, firewall, and whether API server is running.",
         )
     if any(token in lower for token in ("name or service not known", "nodename nor servname", "temporary failure in name resolution")):
         return (
@@ -405,7 +405,7 @@ def _error_signature(error_text: Optional[str]) -> Tuple[str, str]:
     if any(token in lower for token in ("404", "not found")):
         return (
             "API endpoint path mismatch",
-            "Check `CATALYTICS_API_BASE_URL` and endpoint paths in middleware config.",
+            "Check `API_BASE_URL` and endpoint paths in middleware config.",
         )
     if any(token in lower for token in ("company", "not found")):
         return (
@@ -526,22 +526,12 @@ def _collect_error_buckets(conn, sync_table: str) -> List[Dict[str, Any]]:
 
 
 def _collect_diagnostics() -> Dict[str, Any]:
-    api_base_url = (
-        cfg.get_env("CATALYTICS_API_BASE_URL")
-        or cfg.get_env("API_BASE_URL")
-        or ""
-    ).strip()
-    entity_id = (
-        cfg.get_env("CATALYTICS_ENTITY_ID")
-        or cfg.get_env("ENTITY_ID")
-        or ""
-    ).strip()
     required_env = {
         "TALLY_DB_PATH": (cfg.get_env("TALLY_DB_PATH") or "").strip(),
         "TALLY_URL": (cfg.get_env("TALLY_URL") or "").strip(),
         "TALLY_COMPANY": (cfg.get_env("TALLY_COMPANY") or "").strip(),
-        "CATALYTICS_API_BASE_URL": api_base_url,
-        "CATALYTICS_ENTITY_ID": entity_id,
+        "API_BASE_URL": (cfg.get_env("API_BASE_URL") or "").strip(),
+        "ENTITY_ID": (cfg.get_env("ENTITY_ID") or "").strip(),
     }
     missing_env = [name for name, value in required_env.items() if not value]
 
@@ -550,7 +540,7 @@ def _collect_diagnostics() -> Dict[str, Any]:
         invoice_prefix = STATE.invoice_dc_prefix
 
     tally_check = _check_tcp_endpoint(required_env["TALLY_URL"], default_port=9000)
-    api_check = _check_tcp_endpoint(required_env["CATALYTICS_API_BASE_URL"], default_port=80)
+    api_check = _check_tcp_endpoint(required_env["API_BASE_URL"], default_port=80)
 
     queue = {
         "dc": {"total": 0, "synced": 0, "failed": 0, "pending": 0},
@@ -586,7 +576,7 @@ def _collect_diagnostics() -> Dict[str, Any]:
     if not tally_check.get("reachable"):
         recommendations.append("Tally endpoint not reachable. Start Tally and verify TALLY_URL/port.")
     if not api_check.get("reachable"):
-        recommendations.append("API endpoint not reachable. Verify CATALYTICS_API_BASE_URL/network/firewall.")
+        recommendations.append("API endpoint not reachable. Verify API_BASE_URL/network/firewall.")
     for item in reasons[:5]:
         hint = item.get("hint")
         if hint and hint not in recommendations:
