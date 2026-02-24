@@ -135,56 +135,9 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 payload_hash=payload_hash,
             )
 
-    # --- Delete detection ---
-    # Collect all stock item names from Tally response
-    deleted = 0
-    tally_names = set()
-    for item in stock_items:
-        name = (item.get("NAME") or "").strip()
-        if name:
-            tally_names.add(name)
-
-    # Safety: only detect deletions if Tally returned >0 items
-    # and there are previously synced records (not a first-run scenario)
-    has_synced_records = conn.execute(
-        """SELECT 1 FROM stock_sync_status ss
-           JOIN stock_items si ON si.id = ss.stock_item_id
-           WHERE ss.is_synced = 1 AND si.company_id = ? LIMIT 1""",
-        (company_id,),
-    ).fetchone() is not None
-
-    if tally_names and has_synced_records:
-        # Find active stock items in SQLite that are NOT in the Tally response
-        sqlite_items = conn.execute(
-            "SELECT id, name FROM stock_items WHERE company_id = ? AND COALESCE(is_deleted, 0) = 0",
-            (company_id,),
-        ).fetchall()
-
-        names_to_delete = []
-        for row in sqlite_items:
-            if row["name"] not in tally_names:
-                names_to_delete.append(row["name"])
-
-        if names_to_delete:
-            deleted = db.mark_records_deleted(conn, "stock_items", company_id, names_to_delete)
-            logger.info("Marked %d stock items as deleted (not in Tally response)", deleted)
-            # Mark deleted records as unsynced so they get propagated
-            for row_name in names_to_delete:
-                row = conn.execute(
-                    "SELECT id FROM stock_items WHERE company_id = ? AND name = ?",
-                    (company_id, row_name),
-                ).fetchone()
-                if row:
-                    db.ensure_stock_sync_status(
-                        conn,
-                        stock_item_id=row["id"],
-                        is_synced=0,
-                        payload_hash="DELETED",
-                    )
-
     conn.commit()
-    logger.info("Done. created=%d updated=%d skipped=%d deleted=%d", created, updated, skipped, deleted)
-    return {"created": created, "updated": updated, "skipped": skipped, "deleted": deleted}
+    logger.info("Done. created=%d updated=%d skipped=%d", created, updated, skipped)
+    return {"created": created, "updated": updated, "skipped": skipped}
 
 
 def main() -> int:

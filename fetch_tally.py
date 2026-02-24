@@ -247,70 +247,15 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         if not config.dry_run:
             conn.commit()
 
-    # --- Delete detection (date-range scoped) ---
-    deleted = 0
-    tally_dc_nos = set()
-    for voucher in vouchers:
-        dc_no = _normalize_dc_no(voucher)
-        if dc_no:
-            tally_dc_nos.add(dc_no.strip().lower())
-
-    # Safety: only detect deletions if Tally returned >0 vouchers
-    # and there are previously synced records (not a first-run scenario)
-    has_synced_records = conn.execute(
-        """SELECT 1 FROM sync_status ss
-           JOIN delivery_notes dn ON dn.id = ss.delivery_note_id
-           WHERE ss.is_synced = 1 AND dn.company_id = ? LIMIT 1""",
-        (company_id,),
-    ).fetchone() is not None
-
-    if tally_dc_nos and has_synced_records:
-        # Find active DCs in SQLite within the same date range
-        sqlite_dcs = conn.execute(
-            """SELECT id, dc_no FROM delivery_notes
-               WHERE company_id = ?
-                 AND COALESCE(is_deleted, 0) = 0
-                 AND voucher_date IS NOT NULL
-                 AND voucher_date >= ?
-                 AND voucher_date <= ?""",
-            (company_id, from_date, to_date),
-        ).fetchall()
-
-        dc_nos_to_delete = []
-        for row in sqlite_dcs:
-            if (row["dc_no"] or "").strip().lower() not in tally_dc_nos:
-                dc_nos_to_delete.append(row["dc_no"])
-
-        if dc_nos_to_delete:
-            deleted = db.mark_dc_records_deleted(conn, company_id, dc_nos_to_delete)
-            logger.info("Marked %d delivery notes as deleted (not in Tally response for date range %s-%s)", deleted, from_date, to_date)
-            # Mark deleted records as unsynced so they get propagated
-            for dc_no_del in dc_nos_to_delete:
-                row = conn.execute(
-                    "SELECT id FROM delivery_notes WHERE company_id = ? AND dc_no = ?",
-                    (company_id, dc_no_del),
-                ).fetchone()
-                if row:
-                    db.ensure_sync_status(
-                        conn,
-                        delivery_note_id=row["id"],
-                        is_synced=0,
-                        payload_hash="DELETED",
-                    )
-
-        if not config.dry_run:
-            conn.commit()
-
     logger.info(
-        "Done. created=%d updated=%d skipped=%d deleted=%d ledgers=%d stock_items=%d",
+        "Done. created=%d updated=%d skipped=%d ledgers=%d stock_items=%d",
         created,
         updated,
         skipped,
-        deleted,
         ledgers_fetched,
         stock_items_fetched,
     )
-    return {"created": created, "updated": updated, "skipped": skipped, "deleted": deleted}
+    return {"created": created, "updated": updated, "skipped": skipped}
 
 
 def main() -> int:

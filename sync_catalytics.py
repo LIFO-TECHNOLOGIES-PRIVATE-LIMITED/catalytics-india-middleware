@@ -57,7 +57,6 @@ def _fetch_unsynced(
         LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
         WHERE COALESCE(ss.is_synced, 0) = 0
           AND COALESCE(ss.attempts, 0) < ?
-          AND COALESCE(dn.is_deleted, 0) = 0
           {where_company}
         ORDER BY dn.updated_at ASC
         LIMIT ?
@@ -185,138 +184,6 @@ def _update_sync_status(
     )
 
 
-def _fetch_deleted_unsynced(
-    conn,
-    *,
-    company_id: Optional[int],
-    limit: int,
-    max_attempts: int,
-) -> List[Dict[str, Any]]:
-    """Fetch delivery notes that are deleted but not yet synced to Catalytics."""
-    params: List[Any] = [max_attempts]
-    where_company = ""
-    if company_id:
-        where_company = "AND dn.company_id = ?"
-        params.append(company_id)
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT dn.*, ss.is_synced, ss.attempts, ss.payload_hash
-        FROM delivery_notes dn
-        LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
-        WHERE COALESCE(dn.is_deleted, 0) = 1
-          AND COALESCE(ss.is_synced, 0) = 0
-          AND COALESCE(ss.attempts, 0) < ?
-          {where_company}
-        ORDER BY dn.updated_at ASC
-        LIMIT ?
-        """,
-        tuple(params),
-    ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def _sync_deleted_dcs(
-    conn,
-    *,
-    config: "SyncConfig",
-    company_id: Optional[int],
-    company_name: Optional[str],
-) -> Dict[str, int]:
-    """Sync deleted DC records to Catalytics delete endpoint."""
-    deleted_notes = _fetch_deleted_unsynced(
-        conn,
-        company_id=company_id,
-        limit=config.limit,
-        max_attempts=config.max_attempts,
-    )
-    if not deleted_notes:
-        return {"sent": 0, "ok": 0, "failed": 0}
-
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-delivery-challan-delete/"
-    headers = {}
-    if config.api_key:
-        headers["X-API-Key"] = config.api_key
-
-    total_sent = 0
-    total_ok = 0
-    total_fail = 0
-
-    for i in range(0, len(deleted_notes), config.batch_size):
-        batch = deleted_notes[i : i + config.batch_size]
-        delete_items = []
-        for note in batch:
-            dc_no = note.get("dc_no") or ""
-            delete_items.append({"dc_no": dc_no})
-
-        batch_payload: Dict[str, Any] = {"delete_dcs": delete_items}
-        if config.entity_id:
-            batch_payload["entity_id"] = config.entity_id
-        if company_name:
-            batch_payload["company_name"] = company_name
-
-        if config.dry_run:
-            logger.info("Dry-run: would delete %d DCs", len(delete_items))
-            continue
-
-        try:
-            resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
-            total_sent += len(delete_items)
-        except Exception as exc:
-            logger.exception("Delete API request failed")
-            for note in batch:
-                _update_sync_status(
-                    conn,
-                    delivery_note_id=note["id"],
-                    success=False,
-                    payload_hash="DELETED",
-                    response_json=None,
-                    error_text=str(exc),
-                )
-            conn.commit()
-            total_fail += len(batch)
-            continue
-
-        response_json = None
-        try:
-            response_json = resp.json()
-        except Exception:
-            response_json = {"status": "error", "message": f"HTTP {resp.status_code} non-JSON"}
-
-        results = (response_json.get("data") or {}).get("results") or []
-        results_map = {
-            _norm_dc_no(r.get("dc_no")): r
-            for r in results
-            if isinstance(r, dict) and r.get("dc_no")
-        }
-
-        for note in batch:
-            dc_no = _norm_dc_no(note.get("dc_no"))
-            res = results_map.get(dc_no) if dc_no else None
-            status_val = (res or {}).get("status")
-            success = status_val in ("deleted", "skipped")
-            error_text = None
-            if not success:
-                error_text = (res or {}).get("message") or response_json.get("message") or "delete_sync_failed"
-            _update_sync_status(
-                conn,
-                delivery_note_id=note["id"],
-                success=success,
-                payload_hash="DELETED",
-                response_json=response_json,
-                error_text=error_text,
-            )
-            if success:
-                total_ok += 1
-            else:
-                total_fail += 1
-
-        conn.commit()
-
-    logger.info("DC delete sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
-    return {"sent": total_sent, "ok": total_ok, "failed": total_fail}
-
-
 def build_config(args: argparse.Namespace) -> SyncConfig:
     env_path = getattr(args, "config", None) or DEFAULT_ENV_PATH
     cfg.load_env_file(env_path)
@@ -377,26 +244,13 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         stock_map: Dict[str, Any] = {}
 
         for note in batch:
-            try:
-                payload, payload_hash = _build_payload_for_note(
-                    conn,
-                    note,
-                    entity_id=config.entity_id,
-                    company_name=company_name,
-                    allow_tally_fetch=config.allow_tally_fetch,
-                )
-            except Exception as exc:
-                logger.exception("Failed to build payload for DC id=%s dc_no=%s", note.get("id"), note.get("dc_no"))
-                _update_sync_status(
-                    conn,
-                    delivery_note_id=note["id"],
-                    success=False,
-                    payload_hash="",
-                    response_json=None,
-                    error_text=f"payload_build_error: {exc}",
-                )
-                total_fail += 1
-                continue
+            payload, payload_hash = _build_payload_for_note(
+                conn,
+                note,
+                entity_id=config.entity_id,
+                company_name=company_name,
+                allow_tally_fetch=config.allow_tally_fetch,
+            )
             voucher = payload["voucher"]
             vouchers.append(voucher)
             ledgers_map.update(payload.get("ledgers") or {})
@@ -496,23 +350,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         total_ok,
         total_fail,
     )
-
-    # --- Delete sync phase ---
-    delete_stats = _sync_deleted_dcs(
-        conn,
-        config=config,
-        company_id=company_id,
-        company_name=company_name,
-    )
-
-    return {
-        "sent": total_sent,
-        "ok": total_ok,
-        "failed": total_fail,
-        "delete_sent": delete_stats.get("sent", 0),
-        "delete_ok": delete_stats.get("ok", 0),
-        "delete_failed": delete_stats.get("failed", 0),
-    }
+    return {"sent": total_sent, "ok": total_ok, "failed": total_fail}
 
 
 def main() -> int:

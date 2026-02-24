@@ -33,7 +33,7 @@ def main() -> int:
     parser.add_argument("--from-date", help="From date YYYYMMDD")
     parser.add_argument("--to-date", help="To date YYYYMMDD")
     parser.add_argument("--days-back", type=int, help="Days back from today")
-    parser.add_argument("--dc-prefix", default=None, help="Prefix to apply to invoice number when creating DC number")
+    parser.add_argument("--dc-prefix", default="INV-", help="Prefix to apply to invoice number when creating DC number")
     parser.add_argument("--fetch-stock", action="store_true", help="Fetch stock item details")
 
     # Shared overrides for sync

@@ -56,7 +56,6 @@ def _fetch_unsynced(
         LEFT JOIN stock_sync_status ss ON ss.stock_item_id = s.id
         WHERE COALESCE(ss.is_synced, 0) = 0
           AND COALESCE(ss.attempts, 0) < ?
-          AND COALESCE(s.is_deleted, 0) = 0
           {where_company}
         ORDER BY s.updated_at ASC
         LIMIT ?
@@ -84,7 +83,7 @@ def _build_payload_for_item(
 def _norm_name(value: Any) -> str:
     if value is None:
         return ""
-    return " ".join(str(value).split()).strip().casefold()
+    return str(value).strip().casefold()
 
 
 def _clean_error_text(text: Optional[str]) -> Optional[str]:
@@ -135,145 +134,6 @@ def _update_sync_status(
             ts,
         ),
     )
-
-
-def _fetch_deleted_unsynced(
-    conn,
-    *,
-    company_id: Optional[int],
-    limit: int,
-    max_attempts: int,
-) -> List[Dict[str, Any]]:
-    """Fetch stock items that are deleted but not yet synced to Catalytics."""
-    params: List[Any] = [max_attempts]
-    where_company = ""
-    if company_id:
-        where_company = "AND s.company_id = ?"
-        params.append(company_id)
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT s.*, ss.is_synced, ss.attempts, ss.payload_hash
-        FROM stock_items s
-        LEFT JOIN stock_sync_status ss ON ss.stock_item_id = s.id
-        WHERE COALESCE(s.is_deleted, 0) = 1
-          AND COALESCE(ss.is_synced, 0) = 0
-          AND COALESCE(ss.attempts, 0) < ?
-          {where_company}
-        ORDER BY s.updated_at ASC
-        LIMIT ?
-        """,
-        tuple(params),
-    ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def _sync_deleted_products(
-    conn,
-    *,
-    config: "SyncConfig",
-    company_id: Optional[int],
-    company_name: Optional[str],
-) -> Dict[str, int]:
-    """Sync deleted product records to Catalytics delete endpoint."""
-    deleted_items = _fetch_deleted_unsynced(
-        conn,
-        company_id=company_id,
-        limit=config.limit,
-        max_attempts=config.max_attempts,
-    )
-    if not deleted_items:
-        return {"sent": 0, "ok": 0, "failed": 0}
-
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-product-delete/"
-    headers = {}
-    if config.api_key:
-        headers["X-API-Key"] = config.api_key
-
-    total_sent = 0
-    total_ok = 0
-    total_fail = 0
-
-    for i in range(0, len(deleted_items), config.batch_size):
-        batch = deleted_items[i : i + config.batch_size]
-        delete_items = []
-        for row in batch:
-            stock_data = db.json_loads(row["data_json"]) or {}
-            guid = (
-                stock_data.get("GUID")
-                or stock_data.get("MASTERID")
-                or stock_data.get("REMOTEALTGUID")
-                or stock_data.get("REMOTEID")
-                or ""
-            )
-            delete_items.append({"name": row["name"], "guid": str(guid).strip()})
-
-        batch_payload: Dict[str, Any] = {"delete_products": delete_items}
-        if config.entity_id:
-            batch_payload["entity_id"] = config.entity_id
-        if company_name:
-            batch_payload["company_name"] = company_name
-
-        if config.dry_run:
-            logger.info("Dry-run: would delete %d products", len(delete_items))
-            continue
-
-        try:
-            resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
-            total_sent += len(delete_items)
-        except Exception as exc:
-            logger.exception("Delete API request failed")
-            for row in batch:
-                _update_sync_status(
-                    conn,
-                    stock_item_id=row["id"],
-                    success=False,
-                    payload_hash="DELETED",
-                    response_json=None,
-                    error_text=str(exc),
-                )
-            conn.commit()
-            total_fail += len(batch)
-            continue
-
-        response_json = None
-        try:
-            response_json = resp.json()
-        except Exception:
-            response_json = {"status": "error", "message": f"HTTP {resp.status_code} non-JSON"}
-
-        results = (response_json.get("data") or {}).get("results") or []
-        results_map = {
-            _norm_name(r.get("name")): r
-            for r in results
-            if isinstance(r, dict) and r.get("name")
-        }
-
-        for row in batch:
-            name_key = _norm_name(row.get("name"))
-            res = results_map.get(name_key) if name_key else None
-            status_val = (res or {}).get("status")
-            success = status_val in ("deleted", "skipped")
-            error_text = None
-            if not success:
-                error_text = (res or {}).get("message") or response_json.get("message") or "delete_sync_failed"
-            _update_sync_status(
-                conn,
-                stock_item_id=row["id"],
-                success=success,
-                payload_hash="DELETED",
-                response_json=response_json,
-                error_text=error_text,
-            )
-            if success:
-                total_ok += 1
-            else:
-                total_fail += 1
-
-        conn.commit()
-
-    logger.info("Product delete sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
-    return {"sent": total_sent, "ok": total_ok, "failed": total_fail}
 
 
 def build_config(args: argparse.Namespace) -> SyncConfig:
@@ -337,31 +197,14 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         item_payloads: List[Dict[str, Any]] = []
 
         for row in batch:
-            name_key = _norm_name(row.get("name"))
-            if not name_key:
-                logger.warning("Skipping stock item id=%s with empty name", row.get("id"))
-                continue
-            try:
-                payload = _build_payload_for_item(
-                    row,
-                    entity_id=config.entity_id,
-                    company_name=company_name,
-                )
-            except Exception as exc:
-                logger.exception("Failed to build payload for stock item id=%s name=%s", row.get("id"), row.get("name"))
-                _update_sync_status(
-                    conn,
-                    stock_item_id=row["id"],
-                    success=False,
-                    payload_hash="",
-                    response_json=None,
-                    error_text=f"payload_build_error: {exc}",
-                )
-                total_fail += 1
-                continue
+            payload = _build_payload_for_item(
+                row,
+                entity_id=config.entity_id,
+                company_name=company_name,
+            )
             item_data = payload["stock_item"]
             item_payloads.append(item_data)
-            payload_hashes[name_key] = db.sha256_text(db.json_dumps(payload))
+            payload_hashes[_norm_name(row.get("name"))] = db.sha256_text(db.json_dumps(payload))
 
         batch_payload = {"stock_items": item_payloads}
         if config.entity_id:
@@ -447,23 +290,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         conn.commit()
 
     logger.info("Product sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
-
-    # --- Delete sync phase ---
-    delete_stats = _sync_deleted_products(
-        conn,
-        config=config,
-        company_id=company_id,
-        company_name=company_name,
-    )
-
-    return {
-        "sent": total_sent,
-        "ok": total_ok,
-        "failed": total_fail,
-        "delete_sent": delete_stats.get("sent", 0),
-        "delete_ok": delete_stats.get("ok", 0),
-        "delete_failed": delete_stats.get("failed", 0),
-    }
+    return {"sent": total_sent, "ok": total_ok, "failed": total_fail}
 
 
 def main() -> int:
