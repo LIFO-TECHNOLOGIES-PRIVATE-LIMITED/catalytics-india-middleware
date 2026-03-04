@@ -330,8 +330,18 @@ class Database:
             customer_id,
         ))
 
-    def get_unsynced_customers(self, limit=50):
-        """Get customers that haven't been synced"""
+    def get_unsynced_customers(self, limit=None):
+        """Get customers that haven't been synced.
+
+        Args:
+            limit: max rows to return; if None, return all unsynced.
+        """
+        if limit is None:
+            return self.query_all("""
+                SELECT * FROM customers
+                WHERE is_synced = 0
+                ORDER BY first_fetched_at
+            """)
         return self.query_all("""
             SELECT * FROM customers
             WHERE is_synced = 0
@@ -449,6 +459,19 @@ class Database:
 
     def mark_product_synced(self, product_id, catalytics_id, response_json=None):
         """Mark product as successfully synced"""
+        if catalytics_id is None and response_json:
+            try:
+                data = json.loads(response_json)
+                payload = data.get('data', {}) if isinstance(data, dict) else {}
+                catalytics_id = payload.get('product_id') or payload.get('id')
+                if not catalytics_id:
+                    results = payload.get('results', [])
+                    if isinstance(results, list) and results:
+                        first = results[0]
+                        if isinstance(first, dict):
+                            catalytics_id = first.get('product_id') or first.get('id')
+            except Exception:
+                pass
         self.execute("""
             UPDATE products
             SET is_synced = 1,

@@ -4,8 +4,10 @@ Implements duplicate prevention based on customer name
 """
 import json
 import logging
+import os
+from pathlib import Path
 from datetime import datetime
-from config import config
+from config import config, BASE_DIR
 from db import Database
 from tally_client import TallyClient
 
@@ -16,6 +18,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _attach_customer_fetch_file_handler():
+    """Ensure customer fetch logs also go to a dedicated file."""
+    log_path = Path(BASE_DIR) / 'logs' / 'customer_fetch.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'customer_fetch_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'customer_fetch_file'
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+_attach_customer_fetch_file_handler()
 
 def fetch_customers_from_all_companies():
     """
@@ -48,6 +66,17 @@ def fetch_customers_from_all_companies():
     }
 
     # Process each company in order (priority by configuration order)
+    groups_env = os.getenv("CUSTOMER_LEDGER_GROUPS", "Sundry Debtors")
+    allowed_groups = [g.strip().lower() for g in groups_env.replace(";", ",").split(",") if g.strip()]
+
+    def _is_allowed_group(parent_group: str) -> bool:
+        if not allowed_groups:
+            return True
+        pg = (parent_group or "").strip().lower()
+        if not pg:
+            return False
+        return any(g in pg for g in allowed_groups)
+
     for company_name in active_companies:
         company_key = config.get_company_key(company_name)
         logger.info(f"\n{'='*60}")
@@ -68,9 +97,17 @@ def fetch_customers_from_all_companies():
             # Step 2: Process each customer with duplicate check
             for customer in customers:
                 customer_name = customer['name']
+                parent_group = customer.get('parent_group', '')
 
                 if not customer_name:
                     logger.warning(f"Skipping customer with empty name")
+                    continue
+
+                if not _is_allowed_group(parent_group):
+                    logger.info(
+                        f"[GROUP SKIP] '{customer_name}' (company: {company_name}) "
+                        f"under '{parent_group}' not in allowed groups: {', '.join(allowed_groups)}"
+                    )
                     continue
 
                 # Step 3: Check if customer name already exists

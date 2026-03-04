@@ -7,8 +7,9 @@ import logging
 import requests
 import json
 import time
+from pathlib import Path
 from datetime import datetime
-from config import config
+from config import config, BASE_DIR
 from db import Database
 from verify_sync import SyncVerifier
 import tally_client
@@ -19,6 +20,57 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+def _attach_invoice_sync_file_handler():
+    """Log invoice sync operations to dedicated file."""
+    log_path = Path(BASE_DIR) / 'logs' / 'invoice_sync.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'invoice_sync_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'invoice_sync_file'
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+_attach_invoice_sync_file_handler()
+
+def _attach_customer_sync_file_handler():
+    """Log customer sync operations to dedicated file."""
+    log_path = Path(BASE_DIR) / 'logs' / 'customer_sync.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'customer_sync_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'customer_sync_file'
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+_attach_customer_sync_file_handler()
+
+def _attach_product_sync_file_handler():
+    """Send product sync logs to dedicated file alongside console."""
+    log_path = Path(BASE_DIR) / 'logs' / 'product_sync.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'product_sync_file':
+            return
+
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'product_sync_file'
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+_attach_product_sync_file_handler()
 
 
 class CatalyticsSyncer:
@@ -33,6 +85,7 @@ class CatalyticsSyncer:
         self.batch_size = config.SYNC_BATCH_SIZE
         self.verify_enabled = config.VERIFY_AFTER_SYNC
         self.tally_url = config.TALLY_URL
+        self._filling_station_cache = {}  # name -> id cache
 
     def _api_request(self, method, endpoint, **kwargs):
         """Make API request to Catalytics"""
@@ -157,19 +210,30 @@ class CatalyticsSyncer:
                         filling_station_id = val
                         break
 
-        # 3) Default from env
+        # 3) Try name-based lookup if still missing
+        if not filling_station_id:
+            station_name = self._get_filling_station(invoice)
+            name_match_id = self._lookup_filling_station_id_by_name(station_name)
+            if name_match_id:
+                filling_station_id = name_match_id
+
+        # 4) Default from env
         if not filling_station_id:
             filling_station_id = config.DEFAULT_FILLING_STATION_ID
             logger.info(f"Using default filling station ID: {filling_station_id}")
 
-        # Ensure numeric ID; if not numeric, fallback to default
+        # Ensure numeric ID; if not numeric, try name lookup then fallback to default
         fs_id_str = str(filling_station_id).strip()
         if not fs_id_str.isdigit():
-            logger.warning(
-                f"Invalid filling station ID '{fs_id_str}' from invoice data; "
-                f"using default ID {config.DEFAULT_FILLING_STATION_ID}"
-            )
-            fs_id_str = str(config.DEFAULT_FILLING_STATION_ID).strip()
+            name_match_id = self._lookup_filling_station_id_by_name(fs_id_str)
+            if name_match_id:
+                fs_id_str = str(name_match_id).strip()
+            else:
+                logger.warning(
+                    f"Invalid filling station ID '{fs_id_str}' from invoice data; "
+                    f"using default ID {config.DEFAULT_FILLING_STATION_ID}"
+                )
+                fs_id_str = str(config.DEFAULT_FILLING_STATION_ID).strip()
 
         return fs_id_str
 
@@ -372,8 +436,8 @@ class CatalyticsSyncer:
         logger.info("CUSTOMER SYNC")
         logger.info("="*60)
 
-        customers = self.db.get_unsynced_customers(self.batch_size)
-        logger.info(f"Found {len(customers)} unsynced customers")
+        customers = self.db.get_unsynced_customers(None)
+        logger.info(f"Found {len(customers)} unsynced customers (batching disabled)")
 
         if not customers:
             logger.info("No customers to sync")
@@ -401,19 +465,29 @@ class CatalyticsSyncer:
                 if not ledger:
                     raise ValueError(f"Could not fetch ledger '{name}' from Tally")
 
+                # Store request payload for debugging
+                request_payload = {
+                    'entity_id': self.entity_id,
+                    'ledger': ledger
+                }
+                try:
+                    self.db.execute(
+                        'UPDATE customers SET sync_request_json = ? WHERE id = ?',
+                        (json.dumps(request_payload), customer_id)
+                    )
+                except Exception:
+                    pass
+
                 # Step 2: Send to Catalytics payload endpoint
                 response = self._api_request(
                     'POST',
                     '/import/tally-customer-payload/',
-                    json={
-                        'entity_id': self.entity_id,
-                        'ledger': ledger
-                    }
+                    json=request_payload
                 )
 
                 if response.status_code in [200, 201]:
                     result = response.json()
-                    response_json = json.dumps(result)  # Store full response
+                    response_json = json.dumps(result, indent=2)  # Store full response with formatting
 
                     if result.get('status') != 'success':
                         raise ValueError(f"API returned non-success status: {result.get('message')}")
@@ -424,8 +498,26 @@ class CatalyticsSyncer:
                     errors = data.get('errors', 0)
 
                     if errors > 0:
-                        error_msg = data.get('results', [{}])[0].get('message', 'Unknown error')
-                        raise ValueError(f"API error: {error_msg}")
+                        # Extract detailed error from results
+                        results_list = data.get('results', [])
+                        error_details = {}
+                        error_msg = "Unknown error"
+                        
+                        for result_item in results_list:
+                            if isinstance(result_item, dict) and result_item.get('status') in ['error', 'skipped']:
+                                error_type = result_item.get('error_type', 'UNKNOWN')
+                                error_msg = result_item.get('message', 'Unknown error')
+                                error_details = result_item.get('error_details', {})
+                                
+                                # Log detailed error
+                                logger.error(f"Customer '{name}' API error details:")
+                                logger.error(f"  Error Type: {error_type}")
+                                logger.error(f"  Message: {error_msg}")
+                                if error_details:
+                                    logger.error(f"  Details: {json.dumps(error_details, indent=4)}")
+                                break
+                        
+                        raise ValueError(f"API error ({error_type}): {error_msg}")
 
                     if created == 0 and updated == 0:
                         raise ValueError("Customer not created or updated")
@@ -433,34 +525,77 @@ class CatalyticsSyncer:
                     logger.info(f"API sync successful: Created={created}, Updated={updated}")
                     stats['synced'] += 1
 
-                    # Step 3: Get customer ID from Catalytics
-                    # The payload endpoint doesn't return the customer ID directly
-                    # We need to query by name to get the ID
+                    # Extract customer ID from results
                     catalytics_id = None
+                    results_list = data.get('results', [])
+                    if results_list and isinstance(results_list, list) and len(results_list) > 0:
+                        first_result = results_list[0]
+                        if isinstance(first_result, dict):
+                            catalytics_id = first_result.get('customer_id')
+                    
+                    if catalytics_id:
+                        logger.info(f"Customer ID from API: {catalytics_id}")
+                    else:
+                        logger.warning(f"API did not return customer_id for '{name}'")
 
-                    # Mark as synced
-                    # Note: The API endpoint doesn't return customer ID, so we store None
-                    # This is a Catalytics API limitation - the endpoint should return customer_id
-                    self.db.mark_customer_synced(customer_id, None, response_json)
+                    # Mark as synced with customer ID
+                    self.db.mark_customer_synced(customer_id, catalytics_id, response_json)
                     stats['verified'] += 1
 
                     logger.info(
                         f"SUCCESS: Customer '{name}' synced "
-                        f"(SQLite ID={customer_id}, Status={'created' if created else 'updated'})"
+                        f"(SQLite ID={customer_id}, Catalytics ID={catalytics_id}, Status={'created' if created else 'updated'})"
                     )
 
                 else:
+                    # Enhanced error handling with detailed error extraction
                     error_msg = f"API error: HTTP {response.status_code}"
                     error_response_json = None
+                    detailed_error = None
+                    
                     try:
                         error_result = response.json()
-                        error_response_json = json.dumps(error_result)
-                        error_detail = error_result.get('message', response.text[:200])
-                        error_msg = f"{error_msg} - {error_detail}"
-                    except Exception:
-                        pass
-
-                    logger.error(f"Sync failed for '{name}': {error_msg}")
+                        error_response_json = json.dumps(error_result, indent=2)
+                        
+                        # Extract detailed error information
+                        if error_result.get('data'):
+                            data = error_result['data']
+                            results = data.get('results', [])
+                            
+                            if results and isinstance(results, list):
+                                for result in results:
+                                    if isinstance(result, dict) and result.get('status') in ['error', 'skipped']:
+                                        error_type = result.get('error_type', 'UNKNOWN')
+                                        error_message = result.get('message', 'No message')
+                                        error_details = result.get('error_details', {})
+                                        
+                                        detailed_error = {
+                                            'type': error_type,
+                                            'message': error_message,
+                                            'details': error_details
+                                        }
+                                        
+                                        # Log detailed error
+                                        logger.error(f"Customer '{name}' sync error details:")
+                                        logger.error(f"  Error Type: {error_type}")
+                                        logger.error(f"  Message: {error_message}")
+                                        if error_details:
+                                            logger.error(f"  Details: {json.dumps(error_details, indent=4)}")
+                                        
+                                        error_msg = f"{error_msg} - {error_type}: {error_message}"
+                                        break
+                        
+                        if not detailed_error:
+                            error_detail = error_result.get('message', response.text[:500])
+                            error_msg = f"{error_msg} - {error_detail}"
+                            
+                    except Exception as parse_error:
+                        logger.debug(f"Could not parse error response: {parse_error}")
+                        error_detail = (response.text or '')[:500]
+                        if error_response_json is None and error_detail:
+                            error_response_json = json.dumps({'raw': error_detail})
+                    
+                    logger.error(f"Sync failed for '{name}' (company: {company}): {error_msg}")
                     self.db.mark_customer_sync_failed(customer_id, error_msg, error_response_json)
                     stats['failed'] += 1
 
@@ -482,6 +617,118 @@ class CatalyticsSyncer:
         logger.info(f"{'-'*60}")
 
         return stats
+
+    def sync_single_customer(self, customer_dict, ledger_data=None):
+        """
+        Sync a single customer to Catalytics.
+        Used for immediate sync during invoice fetch.
+        
+        Args:
+            customer_dict: Customer data dict with keys: id, name, tally_company, etc.
+            ledger_data: Optional pre-fetched ledger data from Tally
+            
+        Returns:
+            dict: {'success': bool, 'error': str, 'catalytics_id': int}
+        """
+        customer_id = customer_dict.get('id')
+        name = customer_dict.get('name')
+        company = customer_dict.get('tally_company')
+        
+        try:
+            logger.info(f"Syncing single customer '{name}' (company: {company})...")
+            
+            # Fetch ledger data if not provided
+            if not ledger_data:
+                logger.debug(f"Fetching ledger data from Tally for '{name}'...")
+                ledger_data = tally_client.get_ledger_by_name(company, name, self.tally_url)
+                
+                if not ledger_data:
+                    return {
+                        'success': False,
+                        'error': f"Could not fetch ledger '{name}' from Tally",
+                        'catalytics_id': None
+                    }
+            
+            # Build request payload
+            request_payload = {
+                'entity_id': self.entity_id,
+                'ledger': ledger_data
+            }
+            
+            # Send to Catalytics
+            response = self._api_request(
+                'POST',
+                '/import/tally-customer-payload/',
+                json=request_payload
+            )
+            
+            if response.status_code in [200, 201]:
+                result = response.json()
+                
+                if result.get('status') != 'success':
+                    return {
+                        'success': False,
+                        'error': f"API returned non-success: {result.get('message')}",
+                        'catalytics_id': None
+                    }
+                
+                data = result.get('data', {})
+                created = data.get('created', 0)
+                updated = data.get('updated', 0)
+                errors = data.get('errors', 0)
+                
+                if errors > 0:
+                    error_msg = data.get('results', [{}])[0].get('message', 'Unknown error')
+                    return {
+                        'success': False,
+                        'error': f"API error: {error_msg}",
+                        'catalytics_id': None
+                    }
+                
+                if created == 0 and updated == 0:
+                    return {
+                        'success': False,
+                        'error': "Customer not created or updated",
+                        'catalytics_id': None
+                    }
+                
+                # Extract customer ID from results
+                catalytics_id = None
+                results_list = data.get('results', [])
+                if results_list and isinstance(results_list, list) and len(results_list) > 0:
+                    first_result = results_list[0]
+                    if isinstance(first_result, dict):
+                        catalytics_id = first_result.get('customer_id')
+                
+                logger.info(f"✓ Customer '{name}' synced (Created={created}, Updated={updated}, ID={catalytics_id})")
+                
+                return {
+                    'success': True,
+                    'error': None,
+                    'catalytics_id': catalytics_id
+                }
+            else:
+                error_msg = f"HTTP {response.status_code}"
+                try:
+                    error_result = response.json()
+                    error_detail = error_result.get('message', response.text[:200])
+                    error_msg = f"{error_msg} - {error_detail}"
+                except:
+                    pass
+                
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'catalytics_id': None
+                }
+                
+        except Exception as e:
+            logger.error(f"Error syncing customer '{name}': {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'catalytics_id': None
+            }
 
     # ========================================================================
     # PRODUCT SYNC
@@ -592,6 +839,18 @@ class CatalyticsSyncer:
 
                     # Mark as synced
                     catalytics_id = data.get('product_id') or data.get('id')
+                    if not catalytics_id:
+                        results_list = data.get('results', [])
+                        if results_list and isinstance(results_list, list):
+                            first_result = results_list[0]
+                            if isinstance(first_result, dict):
+                                catalytics_id = first_result.get('product_id') or first_result.get('id')
+
+                    if catalytics_id:
+                        logger.info(f"Product ID from API: {catalytics_id}")
+                    else:
+                        logger.warning(f"API did not return product_id for '{name}'")
+
                     self.db.mark_product_synced(product_id, catalytics_id, response_json)
                     stats['verified'] += 1
 
@@ -757,6 +1016,56 @@ class CatalyticsSyncer:
         if filling_station:
             return filling_station
 
+
+    def _lookup_filling_station_id_by_name(self, station_name):
+        name = str(station_name or '').strip()
+        if not name:
+            return None
+
+        key = name.lower()
+        if key in self._filling_station_cache:
+            return self._filling_station_cache[key]
+
+        url = f"{self.api_base}/master/gas_filling_station"
+        params = {
+            'entity_id': self.entity_id,
+            'search_data': name,
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code >= 400:
+                logger.warning(f"Filling station lookup failed ({resp.status_code}) for '{name}'")
+                self._filling_station_cache[key] = None
+                return None
+            payload = resp.json()
+        except Exception as exc:
+            logger.warning(f"Filling station lookup error for '{name}': {exc}")
+            self._filling_station_cache[key] = None
+            return None
+
+        data = payload.get('data') if isinstance(payload, dict) else None
+        match_id = None
+
+        if isinstance(data, dict):
+            match_id = data.get('id')
+        elif isinstance(data, list):
+            # Prefer exact name match
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                item_name = str(item.get('name') or '').strip().lower()
+                if item_name == key:
+                    match_id = item.get('id')
+                    break
+            # If only one result, accept it as best effort
+            if not match_id and len(data) == 1 and isinstance(data[0], dict):
+                match_id = data[0].get('id')
+
+        self._filling_station_cache[key] = match_id
+        if match_id:
+            logger.info(f"Matched filling station '{name}' -> ID {match_id}")
+        return match_id
+
         # 2) Stored raw voucher JSON
         voucher_data = self._safe_json_load(get_val('data_json'))
         if isinstance(voucher_data, dict):
@@ -866,20 +1175,26 @@ class CatalyticsSyncer:
         # Clean up and extract PO number (filter out "Delivery" and other non-PO values)
         po_number = self._extract_po_number(invoice)
         if po_number:
-            voucher_payload['PONUMBER'] = po_number
+            # Set PARTYORDERNO (Order No(s) field) as primary PO number field
+            voucher_payload['PARTYORDERNO'] = po_number
+            voucher_payload['PONUMBER'] = po_number  # Keep for backward compatibility
             logger.info(f"PO Number: {po_number}")
         else:
             # If no valid PO found, set to empty
+            voucher_payload.pop('PARTYORDERNO', None)
             voucher_payload.pop('PONUMBER', None)
             voucher_payload.pop('BASICORDERREF', None)
 
         # Clean up and extract PO date
         po_date = self._extract_po_date(invoice)
         if po_date:
-            voucher_payload['PODATE'] = po_date
+            # Set PARTYORDERDATE (Order date field) as primary PO date field
+            voucher_payload['PARTYORDERDATE'] = po_date
+            voucher_payload['PODATE'] = po_date  # Keep for backward compatibility
             logger.info(f"PO Date: {po_date}")
         else:
             # If no valid PO date found, set to empty
+            voucher_payload.pop('PARTYORDERDATE', None)
             voucher_payload.pop('PODATE', None)
 
         return voucher_payload
@@ -986,6 +1301,23 @@ class CatalyticsSyncer:
 
                 voucher_payload = self._build_invoice_voucher_payload(invoice)
                 ledgers_map, stock_items_map = self._build_invoice_support_payloads(company, voucher_payload)
+
+                # Persist request payload for debugging
+                request_payload = {
+                    'entity_id': self.entity_id,
+                    'company_name': company,
+                    'voucher': voucher_payload,
+                    'ledgers': ledgers_map,
+                    'stock_items': stock_items_map,
+                    'allow_tally_fetch': False,
+                }
+                try:
+                    self.db.execute(
+                        'UPDATE invoices SET sync_request_json = ? WHERE id = ?',
+                        (json.dumps(request_payload), invoice_id)
+                    )
+                except Exception:
+                    pass
 
                 # Log what's being sent
                 po_number = voucher_payload.get('PONUMBER', '').strip() or '[EMPTY]'
@@ -1130,6 +1462,138 @@ class CatalyticsSyncer:
 
         return stats
 
+    def sync_invoices_simple(self):
+        """
+        Sync invoices using lightweight API with name-based matching.
+        Sends only voucher data (no ledgers, no stock_items).
+        """
+        logger.info("\n" + "="*60)
+        logger.info("INVOICE TO DC SYNC (SIMPLE API)")
+        logger.info("="*60)
+
+        invoices = self.db.get_unsynced_invoices(self.batch_size)
+        logger.info(f"Found {len(invoices)} unsynced invoices")
+
+        if not invoices:
+            logger.info("No invoices to sync")
+            return {'total': 0, 'synced': 0, 'verified': 0, 'failed': 0}
+
+        stats = {
+            'total': len(invoices),
+            'synced': 0,
+            'verified': 0,
+            'failed': 0,
+        }
+
+        for invoice_row in invoices:
+            invoice = dict(invoice_row)
+            invoice_id = invoice['id']
+            voucher_no = invoice.get('tally_voucher_no', '')
+            company = invoice.get('tally_company', '')
+            customer_name = invoice.get('customer_name', '')
+
+            try:
+                logger.info(
+                    f"Syncing invoice #{voucher_no} "
+                    f"(company: {company}, customer: {customer_name})..."
+                )
+
+                # Build simple voucher payload (no ledgers, no stock_items)
+                voucher_payload = self._build_invoice_voucher_payload(invoice)
+
+                # Get filling station ID (from godown/location or default from .env)
+                filling_station_id = self._get_filling_station_id(invoice)
+
+                # Simple payload - only voucher data + filling station ID
+                request_payload = {
+                    'entity_id': self.entity_id,
+                    'company_name': company,
+                    'voucher': voucher_payload,
+                    'filling_station_id': filling_station_id,
+                }
+                try:
+                    self.db.execute(
+                        'UPDATE invoices SET sync_request_json = ? WHERE id = ?',
+                        (json.dumps(request_payload), invoice_id)
+                    )
+                except Exception:
+                    pass
+
+                logger.info(f"Payload Details:")
+                logger.info(f"  Filling Station ID: {filling_station_id}")
+                logger.debug(f"Sending simple payload for #{voucher_no}")
+
+                response = self._api_request(
+                    'POST',
+                    '/import/tally-dc-name-payload/',
+                    json=request_payload,
+                )
+
+                if response.status_code in [200, 201]:
+                    result = response.json()
+                    response_json = json.dumps(result)
+
+                    if result.get('status') != 'success':
+                        error_msg = result.get('message', 'Unknown error')
+                        raise ValueError(f"API returned error: {error_msg}")
+
+                    data = result.get('data', {})
+                    dc_status = data.get('status', '')
+                    dc_no = data.get('dc_no', voucher_no)
+                    dc_id = data.get('dc_id')
+
+                    if dc_status in ['created', 'updated']:
+                        logger.info(f"API sync successful: {dc_status}")
+                        stats['synced'] += 1
+
+                        self.db.mark_invoice_synced(
+                            invoice_id,
+                            dc_no,
+                            dc_id,
+                            response_json,
+                        )
+                        stats['verified'] += 1
+
+                        logger.info(
+                            f"SUCCESS: Invoice #{voucher_no} synced as DC "
+                            f"(DC No={dc_no}, Catalytics ID={dc_id}, Status={dc_status})"
+                        )
+                    else:
+                        raise ValueError(f"Unexpected status: {dc_status}")
+
+                else:
+                    error_msg = f"API error: HTTP {response.status_code}"
+                    error_response_json = None
+                    try:
+                        error_result = response.json()
+                        error_response_json = json.dumps(error_result)
+                        error_detail = error_result.get('message', response.text[:200])
+                        error_msg = f"{error_msg} - {error_detail}"
+                    except Exception:
+                        pass
+
+                    logger.error(f"Sync failed for invoice #{voucher_no}: {error_msg}")
+                    self.db.mark_invoice_sync_failed(invoice_id, error_msg, error_response_json)
+                    stats['failed'] += 1
+
+            except Exception as e:
+                logger.error(f"Error syncing invoice #{voucher_no}: {e}", exc_info=True)
+                self.db.mark_invoice_sync_failed(invoice_id, str(e))
+                stats['failed'] += 1
+
+        logger.info(f"\n{'-'*60}")
+        logger.info("INVOICE TO DC SYNC (SIMPLE) SUMMARY")
+        logger.info(f"{'-'*60}")
+        logger.info(f"Total: {stats['total']}")
+        logger.info(f"API Synced: {stats['synced']}")
+        logger.info(f"Verified: {stats['verified']}")
+        logger.info(f"Failed: {stats['failed']}")
+        if stats['total'] > 0:
+            logger.info(f"Success Rate: {stats['verified']/stats['total']*100:.1f}%")
+        logger.info(f"{'-'*60}")
+
+        return stats
+
     def sync_all(self):
         """Run complete sync cycle"""
         logger.info("\n" + "="*60)
@@ -1140,7 +1604,7 @@ class CatalyticsSyncer:
         results = {
             'customers': self.sync_customers(),
             'products': self.sync_products(),
-            'invoices': self.sync_invoices_to_dc()
+            'invoices': self.sync_invoices_simple()  # Using lightweight API with name-based matching
         }
 
         # Overall summary

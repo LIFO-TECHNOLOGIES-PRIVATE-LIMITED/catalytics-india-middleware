@@ -1,0 +1,1200 @@
+[2026-03-03 17:12:50] [INFO] 
+============================================================
+[2026-03-03 17:12:50] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-03 17:12:50] [INFO] ============================================================
+[2026-03-03 17:12:50] [INFO] Found 3 unsynced invoices
+[2026-03-03 17:12:50] [INFO] Syncing invoice #IO-1722 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-03 17:12:50] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:12:50] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:12:50] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:12:50] [INFO] PO Number: Not Applicable
+[2026-03-03 17:12:52] [ERROR] Sync failed for invoice #IO-1722: API error: HTTP 500 - relation "master.customer" does not exist
+LINE 1: ...odified_by", "master.customer"."modified_ip" FROM "master.cu...
+                                                             ^
+
+[2026-03-03 17:12:52] [INFO] Syncing invoice #IO-1724 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-03 17:12:52] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:12:52] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:12:52] [INFO] PO Date found: 20260303
+[2026-03-03 17:12:52] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:12:52] [INFO] PO Number: Not Applicable
+[2026-03-03 17:12:52] [INFO] PO Date: 20260303
+[2026-03-03 17:12:55] [ERROR] Sync failed for invoice #IO-1724: API error: HTTP 500 - relation "master.customer" does not exist
+LINE 1: ...odified_by", "master.customer"."modified_ip" FROM "master.cu...
+                                                             ^
+
+[2026-03-03 17:12:55] [INFO] Syncing invoice #IO-1725 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-03 17:12:55] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:12:55] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:12:55] [INFO] PO Date found: 20260303
+[2026-03-03 17:12:55] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:12:55] [INFO] PO Number: Not Applicable
+[2026-03-03 17:12:55] [INFO] PO Date: 20260303
+[2026-03-03 17:12:57] [ERROR] Sync failed for invoice #IO-1725: API error: HTTP 500 - relation "master.customer" does not exist
+LINE 1: ...odified_by", "master.customer"."modified_ip" FROM "master.cu...
+                                                             ^
+
+[2026-03-03 17:12:57] [INFO] 
+------------------------------------------------------------
+[2026-03-03 17:12:57] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-03 17:12:57] [INFO] ------------------------------------------------------------
+[2026-03-03 17:12:57] [INFO] Total: 3
+[2026-03-03 17:12:57] [INFO] API Synced: 0
+[2026-03-03 17:12:57] [INFO] Verified: 0
+[2026-03-03 17:12:57] [INFO] Failed: 3
+[2026-03-03 17:12:57] [INFO] Success Rate: 0.0%
+[2026-03-03 17:12:57] [INFO] ------------------------------------------------------------
+[2026-03-03 17:20:30] [INFO] 
+============================================================
+[2026-03-03 17:20:30] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-03 17:20:30] [INFO] ============================================================
+[2026-03-03 17:20:30] [INFO] Found 3 unsynced invoices
+[2026-03-03 17:20:30] [INFO] Syncing invoice #IO-1722 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-03 17:20:30] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:20:30] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:20:30] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:20:30] [INFO] PO Number: Not Applicable
+[2026-03-03 17:20:33] [ERROR] Sync failed for invoice #IO-1722: API error: HTTP 500 - relation "master.customer" does not exist
+LINE 1: ...odified_by", "master.customer"."modified_ip" FROM "master.cu...
+                                                             ^
+
+[2026-03-03 17:20:33] [INFO] Syncing invoice #IO-1724 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-03 17:20:33] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:20:33] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:20:33] [INFO] PO Date found: 20260303
+[2026-03-03 17:20:33] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:20:33] [INFO] PO Number: Not Applicable
+[2026-03-03 17:20:33] [INFO] PO Date: 20260303
+[2026-03-03 17:20:35] [ERROR] Sync failed for invoice #IO-1724: API error: HTTP 500 - relation "master.customer" does not exist
+LINE 1: ...odified_by", "master.customer"."modified_ip" FROM "master.cu...
+                                                             ^
+
+[2026-03-03 17:20:35] [INFO] Syncing invoice #IO-1725 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-03 17:20:35] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:20:35] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:20:35] [INFO] PO Date found: 20260303
+[2026-03-03 17:20:35] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:20:35] [INFO] PO Number: Not Applicable
+[2026-03-03 17:20:35] [INFO] PO Date: 20260303
+[2026-03-03 17:20:37] [ERROR] Sync failed for invoice #IO-1725: API error: HTTP 500 - relation "master.customer" does not exist
+LINE 1: ...odified_by", "master.customer"."modified_ip" FROM "master.cu...
+                                                             ^
+
+[2026-03-03 17:20:37] [INFO] 
+------------------------------------------------------------
+[2026-03-03 17:20:37] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-03 17:20:37] [INFO] ------------------------------------------------------------
+[2026-03-03 17:20:37] [INFO] Total: 3
+[2026-03-03 17:20:37] [INFO] API Synced: 0
+[2026-03-03 17:20:37] [INFO] Verified: 0
+[2026-03-03 17:20:37] [INFO] Failed: 3
+[2026-03-03 17:20:37] [INFO] Success Rate: 0.0%
+[2026-03-03 17:20:37] [INFO] ------------------------------------------------------------
+[2026-03-03 17:26:06] [INFO] 
+============================================================
+[2026-03-03 17:26:06] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-03 17:26:06] [INFO] ============================================================
+[2026-03-03 17:26:06] [INFO] Found 3 unsynced invoices
+[2026-03-03 17:26:06] [INFO] Syncing invoice #IO-1722 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-03 17:26:06] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:26:06] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:26:06] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:26:06] [INFO] PO Number: Not Applicable
+[2026-03-03 17:26:08] [ERROR] Sync failed for invoice #IO-1722: API error: HTTP 500 - relation "master.customer" does not exist
+LINE 1: ...odified_by", "master.customer"."modified_ip" FROM "master.cu...
+                                                             ^
+
+[2026-03-03 17:26:08] [INFO] Syncing invoice #IO-1724 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-03 17:26:08] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:26:08] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:26:08] [INFO] PO Date found: 20260303
+[2026-03-03 17:26:08] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:26:08] [INFO] PO Number: Not Applicable
+[2026-03-03 17:26:08] [INFO] PO Date: 20260303
+[2026-03-03 17:26:10] [ERROR] Sync failed for invoice #IO-1724: API error: HTTP 500 - relation "master.customer" does not exist
+LINE 1: ...odified_by", "master.customer"."modified_ip" FROM "master.cu...
+                                                             ^
+
+[2026-03-03 17:26:10] [INFO] Syncing invoice #IO-1725 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-03 17:26:10] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:26:10] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:26:10] [INFO] PO Date found: 20260303
+[2026-03-03 17:26:10] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:26:10] [INFO] PO Number: Not Applicable
+[2026-03-03 17:26:10] [INFO] PO Date: 20260303
+[2026-03-03 17:26:13] [ERROR] Sync failed for invoice #IO-1725: API error: HTTP 500 - relation "master.customer" does not exist
+LINE 1: ...odified_by", "master.customer"."modified_ip" FROM "master.cu...
+                                                             ^
+
+[2026-03-03 17:26:13] [INFO] 
+------------------------------------------------------------
+[2026-03-03 17:26:13] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-03 17:26:13] [INFO] ------------------------------------------------------------
+[2026-03-03 17:26:13] [INFO] Total: 3
+[2026-03-03 17:26:13] [INFO] API Synced: 0
+[2026-03-03 17:26:13] [INFO] Verified: 0
+[2026-03-03 17:26:13] [INFO] Failed: 3
+[2026-03-03 17:26:13] [INFO] Success Rate: 0.0%
+[2026-03-03 17:26:13] [INFO] ------------------------------------------------------------
+[2026-03-03 17:43:20] [INFO] 
+============================================================
+[2026-03-03 17:43:20] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-03 17:43:20] [INFO] ============================================================
+[2026-03-03 17:43:20] [INFO] Found 3 unsynced invoices
+[2026-03-03 17:43:20] [INFO] Syncing invoice #IO-1722 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-03 17:43:20] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:43:20] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:43:20] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:43:20] [INFO] PO Number: Not Applicable
+[2026-03-03 17:43:22] [INFO] API sync successful: updated
+[2026-03-03 17:43:22] [INFO] SUCCESS: Invoice #IO-1722 synced as DC (DC No=IO-1722, Catalytics ID=4672, Status=updated)
+[2026-03-03 17:43:22] [INFO] Syncing invoice #IO-1724 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-03 17:43:22] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:43:22] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:43:22] [INFO] PO Date found: 20260303
+[2026-03-03 17:43:22] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:43:22] [INFO] PO Number: Not Applicable
+[2026-03-03 17:43:22] [INFO] PO Date: 20260303
+[2026-03-03 17:43:25] [INFO] API sync successful: created
+[2026-03-03 17:43:25] [INFO] SUCCESS: Invoice #IO-1724 synced as DC (DC No=IO-1724, Catalytics ID=4674, Status=created)
+[2026-03-03 17:43:25] [INFO] Syncing invoice #IO-1725 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-03 17:43:25] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:43:25] [INFO] PO Number found: Not Applicable
+[2026-03-03 17:43:25] [INFO] PO Date found: 20260303
+[2026-03-03 17:43:25] [INFO] Using default filling station: Main Warehouse
+[2026-03-03 17:43:25] [INFO] PO Number: Not Applicable
+[2026-03-03 17:43:25] [INFO] PO Date: 20260303
+[2026-03-03 17:43:27] [INFO] API sync successful: created
+[2026-03-03 17:43:27] [INFO] SUCCESS: Invoice #IO-1725 synced as DC (DC No=IO-1725, Catalytics ID=4675, Status=created)
+[2026-03-03 17:43:27] [INFO] 
+------------------------------------------------------------
+[2026-03-03 17:43:27] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-03 17:43:27] [INFO] ------------------------------------------------------------
+[2026-03-03 17:43:27] [INFO] Total: 3
+[2026-03-03 17:43:27] [INFO] API Synced: 3
+[2026-03-03 17:43:27] [INFO] Verified: 3
+[2026-03-03 17:43:27] [INFO] Failed: 0
+[2026-03-03 17:43:27] [INFO] Success Rate: 100.0%
+[2026-03-03 17:43:27] [INFO] ------------------------------------------------------------
+[2026-03-03 22:21:10] [INFO] 
+============================================================
+[2026-03-03 22:21:10] [INFO] CUSTOMER SYNC
+[2026-03-03 22:21:10] [INFO] ============================================================
+[2026-03-03 22:21:10] [INFO] Found 1 unsynced customers (batching disabled)
+[2026-03-03 22:21:10] [INFO] Syncing customer 'NAVEEEN TECH' (company: SHREYAA ENTERPRISES)...
+[2026-03-03 22:21:12] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-03 22:21:12] [INFO] SUCCESS: Customer 'NAVEEEN TECH' synced (SQLite ID=312, Status=created)
+[2026-03-03 22:21:12] [INFO] 
+------------------------------------------------------------
+[2026-03-03 22:21:12] [INFO] CUSTOMER SYNC SUMMARY
+[2026-03-03 22:21:12] [INFO] ------------------------------------------------------------
+[2026-03-03 22:21:12] [INFO] Total: 1
+[2026-03-03 22:21:12] [INFO] API Synced: 1
+[2026-03-03 22:21:12] [INFO] Verified: 1
+[2026-03-03 22:21:12] [INFO] Failed: 0
+[2026-03-03 22:21:12] [INFO] Success Rate: 100.0%
+[2026-03-03 22:21:12] [INFO] ------------------------------------------------------------
+[2026-03-03 22:26:53] [INFO] 
+============================================================
+[2026-03-03 22:26:53] [INFO] CUSTOMER SYNC
+[2026-03-03 22:26:53] [INFO] ============================================================
+[2026-03-03 22:26:53] [INFO] Found 2 unsynced customers (batching disabled)
+[2026-03-03 22:26:53] [INFO] Syncing customer '7' (company: SHREYAA ENTERPRISES)...
+[2026-03-03 22:26:56] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-03 22:26:56] [INFO] SUCCESS: Customer '7' synced (SQLite ID=313, Status=created)
+[2026-03-03 22:26:56] [INFO] Syncing customer '6' (company: Surya Air System)...
+[2026-03-03 22:26:58] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-03 22:26:58] [INFO] SUCCESS: Customer '6' synced (SQLite ID=314, Status=created)
+[2026-03-03 22:26:58] [INFO] 
+------------------------------------------------------------
+[2026-03-03 22:26:58] [INFO] CUSTOMER SYNC SUMMARY
+[2026-03-03 22:26:58] [INFO] ------------------------------------------------------------
+[2026-03-03 22:26:58] [INFO] Total: 2
+[2026-03-03 22:26:58] [INFO] API Synced: 2
+[2026-03-03 22:26:58] [INFO] Verified: 2
+[2026-03-03 22:26:58] [INFO] Failed: 0
+[2026-03-03 22:26:58] [INFO] Success Rate: 100.0%
+[2026-03-03 22:26:58] [INFO] ------------------------------------------------------------
+[2026-03-04 07:08:45] [INFO] 
+============================================================
+[2026-03-04 07:08:45] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 07:08:45] [INFO] ============================================================
+[2026-03-04 07:08:45] [INFO] Found 7 unsynced invoices
+[2026-03-04 07:08:45] [INFO] Syncing invoice #IO-1722 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 07:08:45] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:45] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:45] [INFO] Using default filling station ID: 24
+[2026-03-04 07:08:45] [INFO] Payload Details:
+[2026-03-04 07:08:45] [INFO]   Filling Station ID: 24
+[2026-03-04 07:08:48] [ERROR] Sync failed for invoice #IO-1722: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:08:48] [INFO] Syncing invoice #IO-1723 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 07:08:48] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:48] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:48] [INFO] Using default filling station ID: 24
+[2026-03-04 07:08:48] [INFO] Payload Details:
+[2026-03-04 07:08:48] [INFO]   Filling Station ID: 24
+[2026-03-04 07:08:50] [ERROR] Sync failed for invoice #IO-1723: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:08:50] [INFO] Syncing invoice #IO-1724 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 07:08:50] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:50] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:50] [INFO] Using default filling station ID: 24
+[2026-03-04 07:08:50] [INFO] Payload Details:
+[2026-03-04 07:08:50] [INFO]   Filling Station ID: 24
+[2026-03-04 07:08:53] [ERROR] Sync failed for invoice #IO-1724: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:08:53] [INFO] Syncing invoice #IO-1725 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 07:08:53] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:53] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:53] [INFO] Using default filling station ID: 24
+[2026-03-04 07:08:53] [INFO] Payload Details:
+[2026-03-04 07:08:53] [INFO]   Filling Station ID: 24
+[2026-03-04 07:08:55] [ERROR] Sync failed for invoice #IO-1725: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:08:55] [INFO] Syncing invoice #IO-1726 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 07:08:55] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:55] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:55] [INFO] Using default filling station ID: 24
+[2026-03-04 07:08:55] [INFO] Payload Details:
+[2026-03-04 07:08:55] [INFO]   Filling Station ID: 24
+[2026-03-04 07:08:57] [ERROR] Sync failed for invoice #IO-1726: API error: HTTP 400 - Failed to create DC: DeliveryChallan() got unexpected keyword arguments: 'fill_station_id'
+[2026-03-04 07:08:57] [INFO] Syncing invoice #CO2-63 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 07:08:57] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:57] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:08:57] [INFO] Using default filling station ID: 24
+[2026-03-04 07:08:57] [INFO] Payload Details:
+[2026-03-04 07:08:57] [INFO]   Filling Station ID: 24
+[2026-03-04 07:09:00] [ERROR] Sync failed for invoice #CO2-63: API error: HTTP 400 - Failed to create DC: DeliveryChallan() got unexpected keyword arguments: 'fill_station_id'
+[2026-03-04 07:09:00] [INFO] Syncing invoice #CO2-64 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 07:09:00] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:09:00] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:09:00] [INFO] Using default filling station ID: 24
+[2026-03-04 07:09:00] [INFO] Payload Details:
+[2026-03-04 07:09:00] [INFO]   Filling Station ID: 24
+[2026-03-04 07:09:02] [ERROR] Sync failed for invoice #CO2-64: API error: HTTP 400 - Failed to create DC: DeliveryChallan() got unexpected keyword arguments: 'fill_station_id'
+[2026-03-04 07:09:02] [INFO] 
+------------------------------------------------------------
+[2026-03-04 07:09:02] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-04 07:09:02] [INFO] ------------------------------------------------------------
+[2026-03-04 07:09:02] [INFO] Total: 7
+[2026-03-04 07:09:02] [INFO] API Synced: 0
+[2026-03-04 07:09:02] [INFO] Verified: 0
+[2026-03-04 07:09:02] [INFO] Failed: 7
+[2026-03-04 07:09:02] [INFO] Success Rate: 0.0%
+[2026-03-04 07:09:02] [INFO] ------------------------------------------------------------
+[2026-03-04 07:12:23] [INFO] 
+============================================================
+[2026-03-04 07:12:23] [INFO] ARASAN GAS - COMPLETE SYNC CYCLE
+[2026-03-04 07:12:23] [INFO] Started at: 2026-03-04 07:12:23
+[2026-03-04 07:12:23] [INFO] ============================================================
+[2026-03-04 07:12:23] [INFO] 
+============================================================
+[2026-03-04 07:12:23] [INFO] CUSTOMER SYNC
+[2026-03-04 07:12:23] [INFO] ============================================================
+[2026-03-04 07:12:23] [INFO] Found 0 unsynced customers (batching disabled)
+[2026-03-04 07:12:23] [INFO] No customers to sync
+[2026-03-04 07:12:23] [INFO] 
+============================================================
+[2026-03-04 07:12:23] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 07:12:23] [INFO] ============================================================
+[2026-03-04 07:12:23] [INFO] Found 1 unsynced products
+[2026-03-04 07:12:23] [INFO] Syncing product 'INDUSTRIAL OXYGEN 6 CUM (CYL)' (company: SHREYAA ENTERPRISES)...
+[2026-03-04 07:12:23] [ERROR] Error syncing 'INDUSTRIAL OXYGEN 6 CUM (CYL)': Product 'INDUSTRIAL OXYGEN 6 CUM (CYL)' has no parsed fields — re-run fetch_products.py to populate
+Traceback (most recent call last):
+  File "C:\Github\catalytics-india-middleware\arasan_gas\sync_to_catalytics.py", line 761, in sync_products
+    raise ValueError(
+ValueError: Product 'INDUSTRIAL OXYGEN 6 CUM (CYL)' has no parsed fields — re-run fetch_products.py to populate
+[2026-03-04 07:12:23] [INFO] 
+------------------------------------------------------------
+[2026-03-04 07:12:23] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 07:12:23] [INFO] ------------------------------------------------------------
+[2026-03-04 07:12:23] [INFO] Total: 1
+[2026-03-04 07:12:23] [INFO] API Synced: 0
+[2026-03-04 07:12:23] [INFO] Verified: 0
+[2026-03-04 07:12:23] [INFO] Failed: 1
+[2026-03-04 07:12:23] [INFO] Success Rate: 0.0%
+[2026-03-04 07:12:23] [INFO] ------------------------------------------------------------
+[2026-03-04 07:12:23] [INFO] 
+============================================================
+[2026-03-04 07:12:23] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 07:12:23] [INFO] ============================================================
+[2026-03-04 07:12:23] [INFO] Found 7 unsynced invoices
+[2026-03-04 07:12:23] [INFO] Syncing invoice #IO-1722 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 07:12:23] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:23] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:23] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:23] [INFO] Payload Details:
+[2026-03-04 07:12:23] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:26] [ERROR] Sync failed for invoice #IO-1722: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:12:26] [INFO] Syncing invoice #IO-1723 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 07:12:26] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:26] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:26] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:26] [INFO] Payload Details:
+[2026-03-04 07:12:26] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:28] [ERROR] Sync failed for invoice #IO-1723: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:12:28] [INFO] Syncing invoice #IO-1724 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 07:12:28] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:28] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:28] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:28] [INFO] Payload Details:
+[2026-03-04 07:12:28] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:31] [ERROR] Sync failed for invoice #IO-1724: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:12:31] [INFO] Syncing invoice #IO-1725 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 07:12:31] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:31] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:31] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:31] [INFO] Payload Details:
+[2026-03-04 07:12:31] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:33] [ERROR] Sync failed for invoice #IO-1725: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:12:33] [INFO] Syncing invoice #IO-1726 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 07:12:33] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:33] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:33] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:33] [INFO] Payload Details:
+[2026-03-04 07:12:33] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:35] [ERROR] Sync failed for invoice #IO-1726: API error: HTTP 400 - Failed to create DC: DeliveryChallan() got unexpected keyword arguments: 'fill_station_id'
+[2026-03-04 07:12:35] [INFO] Syncing invoice #CO2-63 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 07:12:35] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:35] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:35] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:35] [INFO] Payload Details:
+[2026-03-04 07:12:35] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:38] [ERROR] Sync failed for invoice #CO2-63: API error: HTTP 400 - Failed to create DC: DeliveryChallan() got unexpected keyword arguments: 'fill_station_id'
+[2026-03-04 07:12:38] [INFO] Syncing invoice #CO2-64 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 07:12:38] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:38] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:38] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:38] [INFO] Payload Details:
+[2026-03-04 07:12:38] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:40] [ERROR] Sync failed for invoice #CO2-64: API error: HTTP 400 - Failed to create DC: DeliveryChallan() got unexpected keyword arguments: 'fill_station_id'
+[2026-03-04 07:12:40] [INFO] 
+------------------------------------------------------------
+[2026-03-04 07:12:40] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-04 07:12:40] [INFO] ------------------------------------------------------------
+[2026-03-04 07:12:40] [INFO] Total: 7
+[2026-03-04 07:12:40] [INFO] API Synced: 0
+[2026-03-04 07:12:40] [INFO] Verified: 0
+[2026-03-04 07:12:40] [INFO] Failed: 7
+[2026-03-04 07:12:40] [INFO] Success Rate: 0.0%
+[2026-03-04 07:12:40] [INFO] ------------------------------------------------------------
+[2026-03-04 07:12:40] [INFO] 
+============================================================
+[2026-03-04 07:12:40] [INFO] OVERALL SYNC SUMMARY
+[2026-03-04 07:12:40] [INFO] ============================================================
+[2026-03-04 07:12:40] [INFO] 
+CUSTOMERS:
+[2026-03-04 07:12:40] [INFO]   Total: 0
+[2026-03-04 07:12:40] [INFO]   Verified: 0
+[2026-03-04 07:12:40] [INFO]   Failed: 0
+[2026-03-04 07:12:40] [INFO] 
+PRODUCTS:
+[2026-03-04 07:12:40] [INFO]   Total: 1
+[2026-03-04 07:12:40] [INFO]   Verified: 0
+[2026-03-04 07:12:40] [INFO]   Failed: 1
+[2026-03-04 07:12:40] [INFO] 
+INVOICES:
+[2026-03-04 07:12:40] [INFO]   Total: 7
+[2026-03-04 07:12:40] [INFO]   Verified: 0
+[2026-03-04 07:12:40] [INFO]   Failed: 7
+[2026-03-04 07:12:40] [INFO] ============================================================
+[2026-03-04 07:12:40] [INFO] 
+Sync cycle completed successfully
+[2026-03-04 07:12:44] [INFO] 
+============================================================
+[2026-03-04 07:12:44] [INFO] ARASAN GAS - COMPLETE SYNC CYCLE
+[2026-03-04 07:12:44] [INFO] Started at: 2026-03-04 07:12:44
+[2026-03-04 07:12:44] [INFO] ============================================================
+[2026-03-04 07:12:44] [INFO] 
+============================================================
+[2026-03-04 07:12:44] [INFO] CUSTOMER SYNC
+[2026-03-04 07:12:44] [INFO] ============================================================
+[2026-03-04 07:12:44] [INFO] Found 0 unsynced customers (batching disabled)
+[2026-03-04 07:12:44] [INFO] No customers to sync
+[2026-03-04 07:12:44] [INFO] 
+============================================================
+[2026-03-04 07:12:44] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 07:12:44] [INFO] ============================================================
+[2026-03-04 07:12:44] [INFO] Found 1 unsynced products
+[2026-03-04 07:12:44] [INFO] Syncing product 'INDUSTRIAL OXYGEN 6 CUM (CYL)' (company: SHREYAA ENTERPRISES)...
+[2026-03-04 07:12:44] [ERROR] Error syncing 'INDUSTRIAL OXYGEN 6 CUM (CYL)': Product 'INDUSTRIAL OXYGEN 6 CUM (CYL)' has no parsed fields — re-run fetch_products.py to populate
+Traceback (most recent call last):
+  File "C:\Github\catalytics-india-middleware\arasan_gas\sync_to_catalytics.py", line 761, in sync_products
+    raise ValueError(
+ValueError: Product 'INDUSTRIAL OXYGEN 6 CUM (CYL)' has no parsed fields — re-run fetch_products.py to populate
+[2026-03-04 07:12:44] [INFO] 
+------------------------------------------------------------
+[2026-03-04 07:12:44] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 07:12:44] [INFO] ------------------------------------------------------------
+[2026-03-04 07:12:44] [INFO] Total: 1
+[2026-03-04 07:12:44] [INFO] API Synced: 0
+[2026-03-04 07:12:44] [INFO] Verified: 0
+[2026-03-04 07:12:44] [INFO] Failed: 1
+[2026-03-04 07:12:44] [INFO] Success Rate: 0.0%
+[2026-03-04 07:12:44] [INFO] ------------------------------------------------------------
+[2026-03-04 07:12:44] [INFO] 
+============================================================
+[2026-03-04 07:12:44] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 07:12:44] [INFO] ============================================================
+[2026-03-04 07:12:44] [INFO] Found 7 unsynced invoices
+[2026-03-04 07:12:44] [INFO] Syncing invoice #IO-1722 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 07:12:44] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:44] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:44] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:44] [INFO] Payload Details:
+[2026-03-04 07:12:44] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:47] [ERROR] Sync failed for invoice #IO-1722: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:12:47] [INFO] Syncing invoice #IO-1723 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 07:12:47] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:47] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:47] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:47] [INFO] Payload Details:
+[2026-03-04 07:12:47] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:49] [ERROR] Sync failed for invoice #IO-1723: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:12:49] [INFO] Syncing invoice #IO-1724 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 07:12:49] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:49] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:49] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:49] [INFO] Payload Details:
+[2026-03-04 07:12:49] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:52] [ERROR] Sync failed for invoice #IO-1724: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:12:52] [INFO] Syncing invoice #IO-1725 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 07:12:52] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:52] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:52] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:52] [INFO] Payload Details:
+[2026-03-04 07:12:52] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:54] [ERROR] Sync failed for invoice #IO-1725: API error: HTTP 400 - Failed to update DC: The following fields do not exist in this model, are m2m fields, primary keys, or are non-concrete fields: fill_station_id
+[2026-03-04 07:12:54] [INFO] Syncing invoice #IO-1726 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 07:12:54] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:54] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:54] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:54] [INFO] Payload Details:
+[2026-03-04 07:12:54] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:57] [ERROR] Sync failed for invoice #IO-1726: API error: HTTP 400 - Failed to create DC: DeliveryChallan() got unexpected keyword arguments: 'fill_station_id'
+[2026-03-04 07:12:57] [INFO] Syncing invoice #CO2-63 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 07:12:57] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:57] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:57] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:57] [INFO] Payload Details:
+[2026-03-04 07:12:57] [INFO]   Filling Station ID: 24
+[2026-03-04 07:12:59] [ERROR] Sync failed for invoice #CO2-63: API error: HTTP 400 - Failed to create DC: DeliveryChallan() got unexpected keyword arguments: 'fill_station_id'
+[2026-03-04 07:12:59] [INFO] Syncing invoice #CO2-64 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 07:12:59] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:59] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 07:12:59] [INFO] Using default filling station ID: 24
+[2026-03-04 07:12:59] [INFO] Payload Details:
+[2026-03-04 07:12:59] [INFO]   Filling Station ID: 24
+[2026-03-04 07:13:01] [ERROR] Sync failed for invoice #CO2-64: API error: HTTP 400 - Failed to create DC: DeliveryChallan() got unexpected keyword arguments: 'fill_station_id'
+[2026-03-04 07:13:01] [INFO] 
+------------------------------------------------------------
+[2026-03-04 07:13:01] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-04 07:13:01] [INFO] ------------------------------------------------------------
+[2026-03-04 07:13:01] [INFO] Total: 7
+[2026-03-04 07:13:01] [INFO] API Synced: 0
+[2026-03-04 07:13:01] [INFO] Verified: 0
+[2026-03-04 07:13:01] [INFO] Failed: 7
+[2026-03-04 07:13:01] [INFO] Success Rate: 0.0%
+[2026-03-04 07:13:01] [INFO] ------------------------------------------------------------
+[2026-03-04 07:13:01] [INFO] 
+============================================================
+[2026-03-04 07:13:01] [INFO] OVERALL SYNC SUMMARY
+[2026-03-04 07:13:01] [INFO] ============================================================
+[2026-03-04 07:13:01] [INFO] 
+CUSTOMERS:
+[2026-03-04 07:13:01] [INFO]   Total: 0
+[2026-03-04 07:13:01] [INFO]   Verified: 0
+[2026-03-04 07:13:01] [INFO]   Failed: 0
+[2026-03-04 07:13:01] [INFO] 
+PRODUCTS:
+[2026-03-04 07:13:01] [INFO]   Total: 1
+[2026-03-04 07:13:01] [INFO]   Verified: 0
+[2026-03-04 07:13:01] [INFO]   Failed: 1
+[2026-03-04 07:13:01] [INFO] 
+INVOICES:
+[2026-03-04 07:13:01] [INFO]   Total: 7
+[2026-03-04 07:13:01] [INFO]   Verified: 0
+[2026-03-04 07:13:01] [INFO]   Failed: 7
+[2026-03-04 07:13:01] [INFO] ============================================================
+[2026-03-04 07:13:01] [INFO] 
+Sync cycle completed successfully
+[2026-03-04 10:40:28] [INFO] 
+============================================================
+[2026-03-04 10:40:28] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 10:40:28] [INFO] ============================================================
+[2026-03-04 10:40:28] [INFO] Found 7 unsynced invoices
+[2026-03-04 10:40:28] [INFO] Syncing invoice #IO-1722 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 10:40:28] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:28] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:28] [INFO] Using default filling station ID: 24
+[2026-03-04 10:40:28] [INFO] Payload Details:
+[2026-03-04 10:40:28] [INFO]   Filling Station ID: 24
+[2026-03-04 10:40:31] [INFO] API sync successful: updated
+[2026-03-04 10:40:31] [INFO] SUCCESS: Invoice #IO-1722 synced as DC (DC No=IO-1722, Catalytics ID=4672, Status=updated)
+[2026-03-04 10:40:32] [INFO] Syncing invoice #IO-1723 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 10:40:32] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:32] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:32] [INFO] Using default filling station ID: 24
+[2026-03-04 10:40:32] [INFO] Payload Details:
+[2026-03-04 10:40:32] [INFO]   Filling Station ID: 24
+[2026-03-04 10:40:34] [INFO] API sync successful: updated
+[2026-03-04 10:40:34] [INFO] SUCCESS: Invoice #IO-1723 synced as DC (DC No=IO-1723, Catalytics ID=4673, Status=updated)
+[2026-03-04 10:40:34] [INFO] Syncing invoice #IO-1724 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 10:40:34] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:34] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:34] [INFO] Using default filling station ID: 24
+[2026-03-04 10:40:34] [INFO] Payload Details:
+[2026-03-04 10:40:34] [INFO]   Filling Station ID: 24
+[2026-03-04 10:40:37] [INFO] API sync successful: updated
+[2026-03-04 10:40:37] [INFO] SUCCESS: Invoice #IO-1724 synced as DC (DC No=IO-1724, Catalytics ID=4674, Status=updated)
+[2026-03-04 10:40:37] [INFO] Syncing invoice #IO-1725 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 10:40:37] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:37] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:37] [INFO] Using default filling station ID: 24
+[2026-03-04 10:40:37] [INFO] Payload Details:
+[2026-03-04 10:40:37] [INFO]   Filling Station ID: 24
+[2026-03-04 10:40:39] [INFO] API sync successful: updated
+[2026-03-04 10:40:39] [INFO] SUCCESS: Invoice #IO-1725 synced as DC (DC No=IO-1725, Catalytics ID=4675, Status=updated)
+[2026-03-04 10:40:39] [INFO] Syncing invoice #IO-1726 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 10:40:39] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:39] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:39] [INFO] Using default filling station ID: 24
+[2026-03-04 10:40:39] [INFO] Payload Details:
+[2026-03-04 10:40:39] [INFO]   Filling Station ID: 24
+[2026-03-04 10:40:42] [INFO] API sync successful: created
+[2026-03-04 10:40:42] [INFO] SUCCESS: Invoice #IO-1726 synced as DC (DC No=IO-1726, Catalytics ID=4676, Status=created)
+[2026-03-04 10:40:42] [INFO] Syncing invoice #CO2-63 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 10:40:42] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:42] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:42] [INFO] Using default filling station ID: 24
+[2026-03-04 10:40:42] [INFO] Payload Details:
+[2026-03-04 10:40:42] [INFO]   Filling Station ID: 24
+[2026-03-04 10:40:44] [INFO] API sync successful: created
+[2026-03-04 10:40:44] [INFO] SUCCESS: Invoice #CO2-63 synced as DC (DC No=CO2-63, Catalytics ID=4677, Status=created)
+[2026-03-04 10:40:44] [INFO] Syncing invoice #CO2-64 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 10:40:44] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:44] [INFO] Using default filling station: Main Warehouse
+[2026-03-04 10:40:44] [INFO] Using default filling station ID: 24
+[2026-03-04 10:40:44] [INFO] Payload Details:
+[2026-03-04 10:40:44] [INFO]   Filling Station ID: 24
+[2026-03-04 10:40:47] [INFO] API sync successful: created
+[2026-03-04 10:40:47] [INFO] SUCCESS: Invoice #CO2-64 synced as DC (DC No=CO2-64, Catalytics ID=4678, Status=created)
+[2026-03-04 10:40:47] [INFO] 
+------------------------------------------------------------
+[2026-03-04 10:40:47] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-04 10:40:47] [INFO] ------------------------------------------------------------
+[2026-03-04 10:40:47] [INFO] Total: 7
+[2026-03-04 10:40:47] [INFO] API Synced: 7
+[2026-03-04 10:40:47] [INFO] Verified: 7
+[2026-03-04 10:40:47] [INFO] Failed: 0
+[2026-03-04 10:40:47] [INFO] Success Rate: 100.0%
+[2026-03-04 10:40:47] [INFO] ------------------------------------------------------------
+[2026-03-04 11:52:17] [INFO] 
+============================================================
+[2026-03-04 11:52:17] [INFO] CUSTOMER SYNC
+[2026-03-04 11:52:17] [INFO] ============================================================
+[2026-03-04 11:52:17] [INFO] Found 8 unsynced customers (batching disabled)
+[2026-03-04 11:52:17] [INFO] Syncing customer 'Supper Weld Tech' (company: SHREYAA ENTERPRISES)...
+[2026-03-04 11:52:22] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-04 11:52:22] [INFO] Customer ID from API: 1041
+[2026-03-04 11:52:22] [INFO] SUCCESS: Customer 'Supper Weld Tech' synced (SQLite ID=315, Catalytics ID=1041, Status=created)
+[2026-03-04 11:52:22] [INFO] Syncing customer 'All Gas' (company: Surya Air System)...
+[2026-03-04 11:52:25] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-04 11:52:25] [INFO] Customer ID from API: 1042
+[2026-03-04 11:52:25] [INFO] SUCCESS: Customer 'All Gas' synced (SQLite ID=316, Catalytics ID=1042, Status=created)
+[2026-03-04 11:52:25] [INFO] Syncing customer 'ARS STEEL' (company: BHARATH OXYGEN LICENSEE)...
+[2026-03-04 11:52:27] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-04 11:52:27] [INFO] Customer ID from API: 1043
+[2026-03-04 11:52:27] [INFO] SUCCESS: Customer 'ARS STEEL' synced (SQLite ID=317, Catalytics ID=1043, Status=created)
+[2026-03-04 11:52:27] [INFO] Syncing customer 'Deenak Engineering' (company: BHARATH OXYGEN LICENSEE)...
+[2026-03-04 11:52:30] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-04 11:52:30] [INFO] Customer ID from API: 1044
+[2026-03-04 11:52:30] [INFO] SUCCESS: Customer 'Deenak Engineering' synced (SQLite ID=318, Catalytics ID=1044, Status=created)
+[2026-03-04 11:52:30] [INFO] Syncing customer 'High Tracker' (company: BHARATH OXYGEN LICENSEE)...
+[2026-03-04 11:52:33] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-04 11:52:33] [INFO] Customer ID from API: 1045
+[2026-03-04 11:52:33] [INFO] SUCCESS: Customer 'High Tracker' synced (SQLite ID=319, Catalytics ID=1045, Status=created)
+[2026-03-04 11:52:33] [INFO] Syncing customer 'SKV Engineering India Private Limited' (company: BHARATH OXYGEN LICENSEE)...
+[2026-03-04 11:52:35] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-04 11:52:35] [INFO] Customer ID from API: 1046
+[2026-03-04 11:52:35] [INFO] SUCCESS: Customer 'SKV Engineering India Private Limited' synced (SQLite ID=320, Catalytics ID=1046, Status=created)
+[2026-03-04 11:52:35] [INFO] Syncing customer 'Sri Sai Hanuman Smelters Pvt Ltd' (company: BHARATH OXYGEN LICENSEE)...
+[2026-03-04 11:52:38] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-04 11:52:38] [INFO] Customer ID from API: 1047
+[2026-03-04 11:52:38] [INFO] SUCCESS: Customer 'Sri Sai Hanuman Smelters Pvt Ltd' synced (SQLite ID=321, Catalytics ID=1047, Status=created)
+[2026-03-04 11:52:38] [INFO] Syncing customer 'TMT Metal Tech Pvt Ltd' (company: BHARATH OXYGEN LICENSEE)...
+[2026-03-04 11:52:41] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-04 11:52:41] [INFO] Customer ID from API: 1048
+[2026-03-04 11:52:41] [INFO] SUCCESS: Customer 'TMT Metal Tech Pvt Ltd' synced (SQLite ID=322, Catalytics ID=1048, Status=created)
+[2026-03-04 11:52:41] [INFO] 
+------------------------------------------------------------
+[2026-03-04 11:52:41] [INFO] CUSTOMER SYNC SUMMARY
+[2026-03-04 11:52:41] [INFO] ------------------------------------------------------------
+[2026-03-04 11:52:41] [INFO] Total: 8
+[2026-03-04 11:52:41] [INFO] API Synced: 8
+[2026-03-04 11:52:41] [INFO] Verified: 8
+[2026-03-04 11:52:41] [INFO] Failed: 0
+[2026-03-04 11:52:41] [INFO] Success Rate: 100.0%
+[2026-03-04 11:52:41] [INFO] ------------------------------------------------------------
+[2026-03-04 12:00:26] [INFO] 
+============================================================
+[2026-03-04 12:00:26] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 12:00:26] [INFO] ============================================================
+[2026-03-04 12:00:26] [INFO] Found 10 unsynced invoices
+[2026-03-04 12:00:26] [INFO] Syncing invoice #IO-1722 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 12:00:26] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:26] [INFO] Payload Details:
+[2026-03-04 12:00:26] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:29] [INFO] API sync successful: updated
+[2026-03-04 12:00:29] [INFO] SUCCESS: Invoice #IO-1722 synced as DC (DC No=IO-1722, Catalytics ID=4672, Status=updated)
+[2026-03-04 12:00:29] [INFO] Syncing invoice #IO-1723 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 12:00:29] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:29] [INFO] Payload Details:
+[2026-03-04 12:00:29] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:31] [INFO] API sync successful: updated
+[2026-03-04 12:00:31] [INFO] SUCCESS: Invoice #IO-1723 synced as DC (DC No=IO-1723, Catalytics ID=4673, Status=updated)
+[2026-03-04 12:00:31] [INFO] Syncing invoice #IO-1724 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 12:00:31] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:31] [INFO] Payload Details:
+[2026-03-04 12:00:31] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:34] [INFO] API sync successful: updated
+[2026-03-04 12:00:34] [INFO] SUCCESS: Invoice #IO-1724 synced as DC (DC No=IO-1724, Catalytics ID=4674, Status=updated)
+[2026-03-04 12:00:34] [INFO] Syncing invoice #IO-1725 (company: SHREYAA ENTERPRISES, customer: ABISAK)...
+[2026-03-04 12:00:34] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:34] [INFO] Payload Details:
+[2026-03-04 12:00:34] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:36] [INFO] API sync successful: updated
+[2026-03-04 12:00:36] [INFO] SUCCESS: Invoice #IO-1725 synced as DC (DC No=IO-1725, Catalytics ID=4675, Status=updated)
+[2026-03-04 12:00:36] [INFO] Syncing invoice #IO-1726 (company: SHREYAA ENTERPRISES, customer: AADHI MANGALA FABRIC)...
+[2026-03-04 12:00:36] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:36] [INFO] Payload Details:
+[2026-03-04 12:00:36] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:38] [INFO] API sync successful: updated
+[2026-03-04 12:00:38] [INFO] SUCCESS: Invoice #IO-1726 synced as DC (DC No=IO-1726, Catalytics ID=4676, Status=updated)
+[2026-03-04 12:00:38] [INFO] Syncing invoice #CO2-63 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 12:00:38] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:38] [INFO] Payload Details:
+[2026-03-04 12:00:38] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:40] [INFO] API sync successful: updated
+[2026-03-04 12:00:40] [INFO] SUCCESS: Invoice #CO2-63 synced as DC (DC No=CO2-63, Catalytics ID=4677, Status=updated)
+[2026-03-04 12:00:40] [INFO] Syncing invoice #CO2-64 (company: SHREYAA ENTERPRISES, customer: A E Engineering)...
+[2026-03-04 12:00:40] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:40] [INFO] Payload Details:
+[2026-03-04 12:00:40] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:43] [INFO] API sync successful: updated
+[2026-03-04 12:00:43] [INFO] SUCCESS: Invoice #CO2-64 synced as DC (DC No=CO2-64, Catalytics ID=4678, Status=updated)
+[2026-03-04 12:00:43] [INFO] Syncing invoice #CO2-65 (company: SHREYAA ENTERPRISES, customer: A.KANNAN)...
+[2026-03-04 12:00:43] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:43] [INFO] Payload Details:
+[2026-03-04 12:00:43] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:45] [INFO] API sync successful: created
+[2026-03-04 12:00:45] [INFO] SUCCESS: Invoice #CO2-65 synced as DC (DC No=CO2-65, Catalytics ID=4679, Status=created)
+[2026-03-04 12:00:45] [INFO] Syncing invoice #CO2-66 (company: SHREYAA ENTERPRISES, customer: AR WELDING)...
+[2026-03-04 12:00:45] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:45] [INFO] Payload Details:
+[2026-03-04 12:00:45] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:47] [INFO] API sync successful: created
+[2026-03-04 12:00:47] [INFO] SUCCESS: Invoice #CO2-66 synced as DC (DC No=CO2-66, Catalytics ID=4680, Status=created)
+[2026-03-04 12:00:47] [INFO] Syncing invoice #6 (company: BHARATH OXYGEN LICENSEE, customer: SKV Engineering India Private Limited)...
+[2026-03-04 12:00:47] [INFO] Using default filling station ID: 24
+[2026-03-04 12:00:47] [INFO] Payload Details:
+[2026-03-04 12:00:47] [INFO]   Filling Station ID: 24
+[2026-03-04 12:00:50] [INFO] API sync successful: created
+[2026-03-04 12:00:50] [INFO] SUCCESS: Invoice #6 synced as DC (DC No=6, Catalytics ID=4681, Status=created)
+[2026-03-04 12:00:50] [INFO] 
+------------------------------------------------------------
+[2026-03-04 12:00:50] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-04 12:00:50] [INFO] ------------------------------------------------------------
+[2026-03-04 12:00:50] [INFO] Total: 10
+[2026-03-04 12:00:50] [INFO] API Synced: 10
+[2026-03-04 12:00:50] [INFO] Verified: 10
+[2026-03-04 12:00:50] [INFO] Failed: 0
+[2026-03-04 12:00:50] [INFO] Success Rate: 100.0%
+[2026-03-04 12:00:50] [INFO] ------------------------------------------------------------
+[2026-03-04 12:29:45] [INFO] 
+============================================================
+[2026-03-04 12:29:45] [INFO] INVOICE TO DC SYNC
+[2026-03-04 12:29:45] [INFO] ============================================================
+[2026-03-04 12:29:45] [INFO] Found 1 unsynced invoices
+[2026-03-04 12:29:45] [INFO] Syncing invoice #7 (company: BHARATH OXYGEN LICENSEE, customer: Deenak Engineering)...
+[2026-03-04 12:29:45] [INFO] Payload Details:
+[2026-03-04 12:29:45] [INFO]   PO_NO: [EMPTY]
+[2026-03-04 12:29:45] [INFO]   PO_DATE: [EMPTY]
+[2026-03-04 12:29:45] [INFO]   FILLING_STATION: [EMPTY]
+[2026-03-04 12:29:45] [INFO]   Total Tally Fields: 34
+[2026-03-04 12:29:47] [INFO] API sync successful: Created=1, Updated=0
+[2026-03-04 12:29:50] [ERROR] DB verification failed for DC #7
+[2026-03-04 12:29:50] [INFO] 
+------------------------------------------------------------
+[2026-03-04 12:29:50] [INFO] INVOICE TO DC SYNC SUMMARY
+[2026-03-04 12:29:50] [INFO] ------------------------------------------------------------
+[2026-03-04 12:29:50] [INFO] Total: 1
+[2026-03-04 12:29:50] [INFO] API Synced: 1
+[2026-03-04 12:29:50] [INFO] Verified: 0
+[2026-03-04 12:29:50] [INFO] Failed: 1
+[2026-03-04 12:29:50] [INFO] Success Rate: 0.0%
+[2026-03-04 12:29:50] [INFO] ------------------------------------------------------------
+[2026-03-04 12:29:50] [INFO] 
+============================================================
+[2026-03-04 12:29:50] [INFO] ARASAN GAS - COMPLETE SYNC CYCLE
+[2026-03-04 12:29:50] [INFO] Started at: 2026-03-04 12:29:50
+[2026-03-04 12:29:50] [INFO] ============================================================
+[2026-03-04 12:29:50] [INFO] 
+============================================================
+[2026-03-04 12:29:50] [INFO] CUSTOMER SYNC
+[2026-03-04 12:29:50] [INFO] ============================================================
+[2026-03-04 12:29:50] [INFO] Found 0 unsynced customers (batching disabled)
+[2026-03-04 12:29:50] [INFO] No customers to sync
+[2026-03-04 12:29:50] [INFO] 
+============================================================
+[2026-03-04 12:29:50] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 12:29:50] [INFO] ============================================================
+[2026-03-04 12:29:50] [INFO] Found 1 unsynced products
+[2026-03-04 12:29:50] [INFO] Syncing product 'INDUSTRIAL OXYGEN 6 CUM (CYL)' (company: SHREYAA ENTERPRISES)...
+[2026-03-04 12:29:50] [ERROR] Error syncing 'INDUSTRIAL OXYGEN 6 CUM (CYL)': Product 'INDUSTRIAL OXYGEN 6 CUM (CYL)' has no parsed fields — re-run fetch_products.py to populate
+Traceback (most recent call last):
+  File "C:\Github\catalytics-india-middleware\arasan_gas\sync_to_catalytics.py", line 773, in sync_products
+    raise ValueError(
+ValueError: Product 'INDUSTRIAL OXYGEN 6 CUM (CYL)' has no parsed fields — re-run fetch_products.py to populate
+[2026-03-04 12:29:50] [INFO] 
+------------------------------------------------------------
+[2026-03-04 12:29:50] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 12:29:50] [INFO] ------------------------------------------------------------
+[2026-03-04 12:29:50] [INFO] Total: 1
+[2026-03-04 12:29:50] [INFO] API Synced: 0
+[2026-03-04 12:29:50] [INFO] Verified: 0
+[2026-03-04 12:29:50] [INFO] Failed: 1
+[2026-03-04 12:29:50] [INFO] Success Rate: 0.0%
+[2026-03-04 12:29:50] [INFO] ------------------------------------------------------------
+[2026-03-04 12:29:50] [INFO] 
+============================================================
+[2026-03-04 12:29:50] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 12:29:50] [INFO] ============================================================
+[2026-03-04 12:29:50] [INFO] Found 1 unsynced invoices
+[2026-03-04 12:29:50] [INFO] Syncing invoice #7 (company: BHARATH OXYGEN LICENSEE, customer: Deenak Engineering)...
+[2026-03-04 12:29:50] [INFO] Using default filling station ID: 24
+[2026-03-04 12:29:50] [INFO] Payload Details:
+[2026-03-04 12:29:50] [INFO]   Filling Station ID: 24
+[2026-03-04 12:29:52] [INFO] API sync successful: updated
+[2026-03-04 12:29:52] [INFO] SUCCESS: Invoice #7 synced as DC (DC No=7, Catalytics ID=4682, Status=updated)
+[2026-03-04 12:29:52] [INFO] 
+------------------------------------------------------------
+[2026-03-04 12:29:52] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-04 12:29:52] [INFO] ------------------------------------------------------------
+[2026-03-04 12:29:52] [INFO] Total: 1
+[2026-03-04 12:29:52] [INFO] API Synced: 1
+[2026-03-04 12:29:52] [INFO] Verified: 1
+[2026-03-04 12:29:52] [INFO] Failed: 0
+[2026-03-04 12:29:52] [INFO] Success Rate: 100.0%
+[2026-03-04 12:29:52] [INFO] ------------------------------------------------------------
+[2026-03-04 12:29:52] [INFO] 
+============================================================
+[2026-03-04 12:29:52] [INFO] OVERALL SYNC SUMMARY
+[2026-03-04 12:29:52] [INFO] ============================================================
+[2026-03-04 12:29:52] [INFO] 
+CUSTOMERS:
+[2026-03-04 12:29:52] [INFO]   Total: 0
+[2026-03-04 12:29:52] [INFO]   Verified: 0
+[2026-03-04 12:29:52] [INFO]   Failed: 0
+[2026-03-04 12:29:52] [INFO] 
+PRODUCTS:
+[2026-03-04 12:29:52] [INFO]   Total: 1
+[2026-03-04 12:29:52] [INFO]   Verified: 0
+[2026-03-04 12:29:52] [INFO]   Failed: 1
+[2026-03-04 12:29:52] [INFO] 
+INVOICES:
+[2026-03-04 12:29:52] [INFO]   Total: 1
+[2026-03-04 12:29:52] [INFO]   Verified: 1
+[2026-03-04 12:29:52] [INFO]   Failed: 0
+[2026-03-04 12:29:52] [INFO] ============================================================
+[2026-03-04 12:38:51] [INFO] 
+============================================================
+[2026-03-04 12:38:51] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 12:38:51] [INFO] ============================================================
+[2026-03-04 12:38:51] [INFO] Found 1 unsynced invoices
+[2026-03-04 12:38:51] [INFO] Syncing invoice #DA-1 (company: SHREYAA ENTERPRISES, customer: AJ HOSPITAL)...
+[2026-03-04 12:38:51] [INFO] Using default filling station ID: 24
+[2026-03-04 12:38:51] [INFO] Payload Details:
+[2026-03-04 12:38:51] [INFO]   Filling Station ID: 24
+[2026-03-04 12:38:54] [INFO] API sync successful: created
+[2026-03-04 12:38:54] [INFO] SUCCESS: Invoice #DA-1 synced as DC (DC No=DA-1, Catalytics ID=4683, Status=created)
+[2026-03-04 12:38:54] [INFO] 
+------------------------------------------------------------
+[2026-03-04 12:38:54] [INFO] INVOICE TO DC SYNC (SIMPLE) SUMMARY
+[2026-03-04 12:38:54] [INFO] ------------------------------------------------------------
+[2026-03-04 12:38:54] [INFO] Total: 1
+[2026-03-04 12:38:54] [INFO] API Synced: 1
+[2026-03-04 12:38:54] [INFO] Verified: 1
+[2026-03-04 12:38:54] [INFO] Failed: 0
+[2026-03-04 12:38:54] [INFO] Success Rate: 100.0%
+[2026-03-04 12:38:54] [INFO] ------------------------------------------------------------
+[2026-03-04 12:52:43] [INFO] 
+============================================================
+[2026-03-04 12:52:43] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 12:52:43] [INFO] ============================================================
+[2026-03-04 12:52:43] [INFO] Found 0 unsynced products
+[2026-03-04 12:52:43] [INFO] No products to sync
+[2026-03-04 12:52:57] [INFO] 
+============================================================
+[2026-03-04 12:52:57] [INFO] ARASAN GAS - COMPLETE SYNC CYCLE
+[2026-03-04 12:52:57] [INFO] Started at: 2026-03-04 12:52:57
+[2026-03-04 12:52:57] [INFO] ============================================================
+[2026-03-04 12:52:57] [INFO] 
+============================================================
+[2026-03-04 12:52:57] [INFO] CUSTOMER SYNC
+[2026-03-04 12:52:57] [INFO] ============================================================
+[2026-03-04 12:52:57] [INFO] Found 0 unsynced customers (batching disabled)
+[2026-03-04 12:52:57] [INFO] No customers to sync
+[2026-03-04 12:52:57] [INFO] 
+============================================================
+[2026-03-04 12:52:57] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 12:52:57] [INFO] ============================================================
+[2026-03-04 12:52:57] [INFO] Found 1 unsynced products
+[2026-03-04 12:52:57] [INFO] Syncing product 'ARGON 7CUM (CYL)' (company: Surya Air System)...
+[2026-03-04 12:52:57] [INFO]   Payload: product=ARGON, variant=7 CUM, unit=CUM, type=CYL(CYLINDER), HSN=, GST=0.0%
+[2026-03-04 12:52:59] [INFO] API sync successful: Created=0, Updated=1
+[2026-03-04 12:52:59] [INFO] SUCCESS: Product 'ARGON 7CUM (CYL)' synced (SQLite ID=14, Catalytics ID=None, Status=updated)
+[2026-03-04 12:52:59] [INFO] 
+------------------------------------------------------------
+[2026-03-04 12:52:59] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 12:52:59] [INFO] ------------------------------------------------------------
+[2026-03-04 12:52:59] [INFO] Total: 1
+[2026-03-04 12:52:59] [INFO] API Synced: 1
+[2026-03-04 12:52:59] [INFO] Verified: 1
+[2026-03-04 12:52:59] [INFO] Failed: 0
+[2026-03-04 12:52:59] [INFO] Success Rate: 100.0%
+[2026-03-04 12:52:59] [INFO] ------------------------------------------------------------
+[2026-03-04 12:52:59] [INFO] 
+============================================================
+[2026-03-04 12:52:59] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 12:52:59] [INFO] ============================================================
+[2026-03-04 12:52:59] [INFO] Found 0 unsynced invoices
+[2026-03-04 12:52:59] [INFO] No invoices to sync
+[2026-03-04 12:52:59] [INFO] 
+============================================================
+[2026-03-04 12:52:59] [INFO] OVERALL SYNC SUMMARY
+[2026-03-04 12:52:59] [INFO] ============================================================
+[2026-03-04 12:52:59] [INFO] 
+CUSTOMERS:
+[2026-03-04 12:52:59] [INFO]   Total: 0
+[2026-03-04 12:52:59] [INFO]   Verified: 0
+[2026-03-04 12:52:59] [INFO]   Failed: 0
+[2026-03-04 12:52:59] [INFO] 
+PRODUCTS:
+[2026-03-04 12:52:59] [INFO]   Total: 1
+[2026-03-04 12:52:59] [INFO]   Verified: 1
+[2026-03-04 12:52:59] [INFO]   Failed: 0
+[2026-03-04 12:52:59] [INFO] 
+INVOICES:
+[2026-03-04 12:52:59] [INFO]   Total: 0
+[2026-03-04 12:52:59] [INFO]   Verified: 0
+[2026-03-04 12:52:59] [INFO]   Failed: 0
+[2026-03-04 12:52:59] [INFO] ============================================================
+[2026-03-04 12:53:05] [INFO] 
+============================================================
+[2026-03-04 12:53:05] [INFO] ARASAN GAS - COMPLETE SYNC CYCLE
+[2026-03-04 12:53:05] [INFO] Started at: 2026-03-04 12:53:05
+[2026-03-04 12:53:05] [INFO] ============================================================
+[2026-03-04 12:53:05] [INFO] 
+============================================================
+[2026-03-04 12:53:05] [INFO] CUSTOMER SYNC
+[2026-03-04 12:53:05] [INFO] ============================================================
+[2026-03-04 12:53:05] [INFO] Found 0 unsynced customers (batching disabled)
+[2026-03-04 12:53:05] [INFO] No customers to sync
+[2026-03-04 12:53:05] [INFO] 
+============================================================
+[2026-03-04 12:53:05] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 12:53:05] [INFO] ============================================================
+[2026-03-04 12:53:05] [INFO] Found 1 unsynced products
+[2026-03-04 12:53:05] [INFO] Syncing product 'CO2 1.5 CUM  (CYL)' (company: Surya Air System)...
+[2026-03-04 12:53:05] [INFO]   Payload: product=CO2, variant=1.5 CUM, unit=CUM, type=CYL(CYLINDER), HSN=, GST=0.0%
+[2026-03-04 12:53:07] [INFO] API sync successful: Created=0, Updated=1
+[2026-03-04 12:53:07] [INFO] SUCCESS: Product 'CO2 1.5 CUM  (CYL)' synced (SQLite ID=15, Catalytics ID=None, Status=updated)
+[2026-03-04 12:53:07] [INFO] 
+------------------------------------------------------------
+[2026-03-04 12:53:07] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 12:53:07] [INFO] ------------------------------------------------------------
+[2026-03-04 12:53:07] [INFO] Total: 1
+[2026-03-04 12:53:07] [INFO] API Synced: 1
+[2026-03-04 12:53:07] [INFO] Verified: 1
+[2026-03-04 12:53:07] [INFO] Failed: 0
+[2026-03-04 12:53:07] [INFO] Success Rate: 100.0%
+[2026-03-04 12:53:07] [INFO] ------------------------------------------------------------
+[2026-03-04 12:53:07] [INFO] 
+============================================================
+[2026-03-04 12:53:07] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 12:53:07] [INFO] ============================================================
+[2026-03-04 12:53:07] [INFO] Found 0 unsynced invoices
+[2026-03-04 12:53:07] [INFO] No invoices to sync
+[2026-03-04 12:53:07] [INFO] 
+============================================================
+[2026-03-04 12:53:07] [INFO] OVERALL SYNC SUMMARY
+[2026-03-04 12:53:07] [INFO] ============================================================
+[2026-03-04 12:53:07] [INFO] 
+CUSTOMERS:
+[2026-03-04 12:53:07] [INFO]   Total: 0
+[2026-03-04 12:53:07] [INFO]   Verified: 0
+[2026-03-04 12:53:07] [INFO]   Failed: 0
+[2026-03-04 12:53:07] [INFO] 
+PRODUCTS:
+[2026-03-04 12:53:07] [INFO]   Total: 1
+[2026-03-04 12:53:07] [INFO]   Verified: 1
+[2026-03-04 12:53:07] [INFO]   Failed: 0
+[2026-03-04 12:53:07] [INFO] 
+INVOICES:
+[2026-03-04 12:53:07] [INFO]   Total: 0
+[2026-03-04 12:53:07] [INFO]   Verified: 0
+[2026-03-04 12:53:07] [INFO]   Failed: 0
+[2026-03-04 12:53:07] [INFO] ============================================================
+[2026-03-04 12:53:22] [INFO] 
+============================================================
+[2026-03-04 12:53:22] [INFO] ARASAN GAS - COMPLETE SYNC CYCLE
+[2026-03-04 12:53:22] [INFO] Started at: 2026-03-04 12:53:22
+[2026-03-04 12:53:22] [INFO] ============================================================
+[2026-03-04 12:53:22] [INFO] 
+============================================================
+[2026-03-04 12:53:22] [INFO] CUSTOMER SYNC
+[2026-03-04 12:53:22] [INFO] ============================================================
+[2026-03-04 12:53:22] [INFO] Found 0 unsynced customers (batching disabled)
+[2026-03-04 12:53:22] [INFO] No customers to sync
+[2026-03-04 12:53:22] [INFO] 
+============================================================
+[2026-03-04 12:53:22] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 12:53:22] [INFO] ============================================================
+[2026-03-04 12:53:22] [INFO] Found 1 unsynced products
+[2026-03-04 12:53:22] [INFO] Syncing product 'CO2 7.5CUM  (CYL)' (company: Surya Air System)...
+[2026-03-04 12:53:22] [INFO]   Payload: product=CO2, variant=7.5 CUM, unit=CUM, type=CYL(CYLINDER), HSN=, GST=0.0%
+[2026-03-04 12:53:25] [INFO] API sync successful: Created=0, Updated=1
+[2026-03-04 12:53:25] [INFO] SUCCESS: Product 'CO2 7.5CUM  (CYL)' synced (SQLite ID=16, Catalytics ID=None, Status=updated)
+[2026-03-04 12:53:25] [INFO] 
+------------------------------------------------------------
+[2026-03-04 12:53:25] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 12:53:25] [INFO] ------------------------------------------------------------
+[2026-03-04 12:53:25] [INFO] Total: 1
+[2026-03-04 12:53:25] [INFO] API Synced: 1
+[2026-03-04 12:53:25] [INFO] Verified: 1
+[2026-03-04 12:53:25] [INFO] Failed: 0
+[2026-03-04 12:53:25] [INFO] Success Rate: 100.0%
+[2026-03-04 12:53:25] [INFO] ------------------------------------------------------------
+[2026-03-04 12:53:25] [INFO] 
+============================================================
+[2026-03-04 12:53:25] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 12:53:25] [INFO] ============================================================
+[2026-03-04 12:53:25] [INFO] Found 0 unsynced invoices
+[2026-03-04 12:53:25] [INFO] No invoices to sync
+[2026-03-04 12:53:25] [INFO] 
+============================================================
+[2026-03-04 12:53:25] [INFO] OVERALL SYNC SUMMARY
+[2026-03-04 12:53:25] [INFO] ============================================================
+[2026-03-04 12:53:25] [INFO] 
+CUSTOMERS:
+[2026-03-04 12:53:25] [INFO]   Total: 0
+[2026-03-04 12:53:25] [INFO]   Verified: 0
+[2026-03-04 12:53:25] [INFO]   Failed: 0
+[2026-03-04 12:53:25] [INFO] 
+PRODUCTS:
+[2026-03-04 12:53:25] [INFO]   Total: 1
+[2026-03-04 12:53:25] [INFO]   Verified: 1
+[2026-03-04 12:53:25] [INFO]   Failed: 0
+[2026-03-04 12:53:25] [INFO] 
+INVOICES:
+[2026-03-04 12:53:25] [INFO]   Total: 0
+[2026-03-04 12:53:25] [INFO]   Verified: 0
+[2026-03-04 12:53:25] [INFO]   Failed: 0
+[2026-03-04 12:53:25] [INFO] ============================================================
+[2026-03-04 12:57:43] [INFO] 
+============================================================
+[2026-03-04 12:57:43] [INFO] ARASAN GAS - COMPLETE SYNC CYCLE
+[2026-03-04 12:57:43] [INFO] Started at: 2026-03-04 12:57:43
+[2026-03-04 12:57:43] [INFO] ============================================================
+[2026-03-04 12:57:43] [INFO] 
+============================================================
+[2026-03-04 12:57:43] [INFO] CUSTOMER SYNC
+[2026-03-04 12:57:43] [INFO] ============================================================
+[2026-03-04 12:57:43] [INFO] Found 0 unsynced customers (batching disabled)
+[2026-03-04 12:57:43] [INFO] No customers to sync
+[2026-03-04 12:57:43] [INFO] 
+============================================================
+[2026-03-04 12:57:43] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 12:57:43] [INFO] ============================================================
+[2026-03-04 12:57:43] [INFO] Found 1 unsynced products
+[2026-03-04 12:57:43] [INFO] Syncing product 'ARGON 7CUM (CYL)' (company: Surya Air System)...
+[2026-03-04 12:57:43] [INFO]   Payload: product=ARGON, variant=7 CUM, unit=CUM, type=CYL(CYLINDER), HSN=, GST=0.0%
+[2026-03-04 12:57:46] [INFO] API sync successful: Created=0, Updated=1
+[2026-03-04 12:57:46] [INFO] SUCCESS: Product 'ARGON 7CUM (CYL)' synced (SQLite ID=14, Catalytics ID=None, Status=updated)
+[2026-03-04 12:57:46] [INFO] 
+------------------------------------------------------------
+[2026-03-04 12:57:46] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 12:57:46] [INFO] ------------------------------------------------------------
+[2026-03-04 12:57:46] [INFO] Total: 1
+[2026-03-04 12:57:46] [INFO] API Synced: 1
+[2026-03-04 12:57:46] [INFO] Verified: 1
+[2026-03-04 12:57:46] [INFO] Failed: 0
+[2026-03-04 12:57:46] [INFO] Success Rate: 100.0%
+[2026-03-04 12:57:46] [INFO] ------------------------------------------------------------
+[2026-03-04 12:57:46] [INFO] 
+============================================================
+[2026-03-04 12:57:46] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 12:57:46] [INFO] ============================================================
+[2026-03-04 12:57:46] [INFO] Found 0 unsynced invoices
+[2026-03-04 12:57:46] [INFO] No invoices to sync
+[2026-03-04 12:57:46] [INFO] 
+============================================================
+[2026-03-04 12:57:46] [INFO] OVERALL SYNC SUMMARY
+[2026-03-04 12:57:46] [INFO] ============================================================
+[2026-03-04 12:57:46] [INFO] 
+CUSTOMERS:
+[2026-03-04 12:57:46] [INFO]   Total: 0
+[2026-03-04 12:57:46] [INFO]   Verified: 0
+[2026-03-04 12:57:46] [INFO]   Failed: 0
+[2026-03-04 12:57:46] [INFO] 
+PRODUCTS:
+[2026-03-04 12:57:46] [INFO]   Total: 1
+[2026-03-04 12:57:46] [INFO]   Verified: 1
+[2026-03-04 12:57:46] [INFO]   Failed: 0
+[2026-03-04 12:57:46] [INFO] 
+INVOICES:
+[2026-03-04 12:57:46] [INFO]   Total: 0
+[2026-03-04 12:57:46] [INFO]   Verified: 0
+[2026-03-04 12:57:46] [INFO]   Failed: 0
+[2026-03-04 12:57:46] [INFO] ============================================================
+[2026-03-04 13:06:06] [INFO] 
+============================================================
+[2026-03-04 13:06:06] [INFO] ARASAN GAS - COMPLETE SYNC CYCLE
+[2026-03-04 13:06:06] [INFO] Started at: 2026-03-04 13:06:06
+[2026-03-04 13:06:06] [INFO] ============================================================
+[2026-03-04 13:06:06] [INFO] 
+============================================================
+[2026-03-04 13:06:06] [INFO] CUSTOMER SYNC
+[2026-03-04 13:06:06] [INFO] ============================================================
+[2026-03-04 13:06:06] [INFO] Found 0 unsynced customers (batching disabled)
+[2026-03-04 13:06:06] [INFO] No customers to sync
+[2026-03-04 13:06:06] [INFO] 
+============================================================
+[2026-03-04 13:06:06] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 13:06:06] [INFO] ============================================================
+[2026-03-04 13:06:06] [INFO] Found 1 unsynced products
+[2026-03-04 13:06:06] [INFO] Syncing product 'CO2 1.5 CUM  (CYL)' (company: Surya Air System)...
+[2026-03-04 13:06:06] [INFO]   Payload: product=CO2, variant=1.5 CUM, unit=CUM, type=CYL(CYLINDER), HSN=, GST=0.0%
+[2026-03-04 13:06:08] [INFO] API sync successful: Created=0, Updated=1
+[2026-03-04 13:06:08] [INFO] SUCCESS: Product 'CO2 1.5 CUM  (CYL)' synced (SQLite ID=15, Catalytics ID=None, Status=updated)
+[2026-03-04 13:06:08] [INFO] 
+------------------------------------------------------------
+[2026-03-04 13:06:08] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 13:06:08] [INFO] ------------------------------------------------------------
+[2026-03-04 13:06:08] [INFO] Total: 1
+[2026-03-04 13:06:08] [INFO] API Synced: 1
+[2026-03-04 13:06:08] [INFO] Verified: 1
+[2026-03-04 13:06:08] [INFO] Failed: 0
+[2026-03-04 13:06:08] [INFO] Success Rate: 100.0%
+[2026-03-04 13:06:08] [INFO] ------------------------------------------------------------
+[2026-03-04 13:06:08] [INFO] 
+============================================================
+[2026-03-04 13:06:08] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 13:06:08] [INFO] ============================================================
+[2026-03-04 13:06:08] [INFO] Found 0 unsynced invoices
+[2026-03-04 13:06:08] [INFO] No invoices to sync
+[2026-03-04 13:06:08] [INFO] 
+============================================================
+[2026-03-04 13:06:08] [INFO] OVERALL SYNC SUMMARY
+[2026-03-04 13:06:08] [INFO] ============================================================
+[2026-03-04 13:06:08] [INFO] 
+CUSTOMERS:
+[2026-03-04 13:06:08] [INFO]   Total: 0
+[2026-03-04 13:06:08] [INFO]   Verified: 0
+[2026-03-04 13:06:08] [INFO]   Failed: 0
+[2026-03-04 13:06:08] [INFO] 
+PRODUCTS:
+[2026-03-04 13:06:08] [INFO]   Total: 1
+[2026-03-04 13:06:08] [INFO]   Verified: 1
+[2026-03-04 13:06:08] [INFO]   Failed: 0
+[2026-03-04 13:06:08] [INFO] 
+INVOICES:
+[2026-03-04 13:06:08] [INFO]   Total: 0
+[2026-03-04 13:06:08] [INFO]   Verified: 0
+[2026-03-04 13:06:08] [INFO]   Failed: 0
+[2026-03-04 13:06:08] [INFO] ============================================================
+[2026-03-04 13:07:01] [INFO] 
+============================================================
+[2026-03-04 13:07:01] [INFO] ARASAN GAS - COMPLETE SYNC CYCLE
+[2026-03-04 13:07:01] [INFO] Started at: 2026-03-04 13:07:01
+[2026-03-04 13:07:01] [INFO] ============================================================
+[2026-03-04 13:07:01] [INFO] 
+============================================================
+[2026-03-04 13:07:01] [INFO] CUSTOMER SYNC
+[2026-03-04 13:07:01] [INFO] ============================================================
+[2026-03-04 13:07:01] [INFO] Found 0 unsynced customers (batching disabled)
+[2026-03-04 13:07:01] [INFO] No customers to sync
+[2026-03-04 13:07:01] [INFO] 
+============================================================
+[2026-03-04 13:07:01] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 13:07:01] [INFO] ============================================================
+[2026-03-04 13:07:01] [INFO] Found 1 unsynced products
+[2026-03-04 13:07:01] [INFO] Syncing product 'LIQUID NITROGEN  250 LTR  (CON)' (company: SHREYAA ENTERPRISES)...
+[2026-03-04 13:07:01] [INFO]   Payload: product=LIQUID NITROGEN, variant=250 LTR, unit=LTR, type=CON(CONTAINER), HSN=, GST=0.0%
+[2026-03-04 13:07:03] [INFO] API sync successful: Created=0, Updated=1
+[2026-03-04 13:07:03] [INFO] SUCCESS: Product 'LIQUID NITROGEN  250 LTR  (CON)' synced (SQLite ID=13, Catalytics ID=None, Status=updated)
+[2026-03-04 13:07:03] [INFO] 
+------------------------------------------------------------
+[2026-03-04 13:07:03] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 13:07:03] [INFO] ------------------------------------------------------------
+[2026-03-04 13:07:03] [INFO] Total: 1
+[2026-03-04 13:07:03] [INFO] API Synced: 1
+[2026-03-04 13:07:03] [INFO] Verified: 1
+[2026-03-04 13:07:03] [INFO] Failed: 0
+[2026-03-04 13:07:03] [INFO] Success Rate: 100.0%
+[2026-03-04 13:07:03] [INFO] ------------------------------------------------------------
+[2026-03-04 13:07:03] [INFO] 
+============================================================
+[2026-03-04 13:07:03] [INFO] INVOICE TO DC SYNC (SIMPLE API)
+[2026-03-04 13:07:03] [INFO] ============================================================
+[2026-03-04 13:07:03] [INFO] Found 0 unsynced invoices
+[2026-03-04 13:07:03] [INFO] No invoices to sync
+[2026-03-04 13:07:03] [INFO] 
+============================================================
+[2026-03-04 13:07:03] [INFO] OVERALL SYNC SUMMARY
+[2026-03-04 13:07:03] [INFO] ============================================================
+[2026-03-04 13:07:03] [INFO] 
+CUSTOMERS:
+[2026-03-04 13:07:03] [INFO]   Total: 0
+[2026-03-04 13:07:03] [INFO]   Verified: 0
+[2026-03-04 13:07:03] [INFO]   Failed: 0
+[2026-03-04 13:07:03] [INFO] 
+PRODUCTS:
+[2026-03-04 13:07:03] [INFO]   Total: 1
+[2026-03-04 13:07:03] [INFO]   Verified: 1
+[2026-03-04 13:07:03] [INFO]   Failed: 0
+[2026-03-04 13:07:03] [INFO] 
+INVOICES:
+[2026-03-04 13:07:03] [INFO]   Total: 0
+[2026-03-04 13:07:03] [INFO]   Verified: 0
+[2026-03-04 13:07:03] [INFO]   Failed: 0
+[2026-03-04 13:07:03] [INFO] ============================================================
+[2026-03-04 13:08:23] [INFO] 
+============================================================
+[2026-03-04 13:08:23] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 13:08:23] [INFO] ============================================================
+[2026-03-04 13:08:23] [INFO] Found 0 unsynced products
+[2026-03-04 13:08:23] [INFO] No products to sync
+[2026-03-04 13:14:08] [INFO] 
+============================================================
+[2026-03-04 13:14:08] [INFO] PRODUCT SYNC (tally-product_name-payload)
+[2026-03-04 13:14:08] [INFO] ============================================================
+[2026-03-04 13:14:08] [INFO] Found 2 unsynced products
+[2026-03-04 13:14:08] [INFO] Syncing product 'LIQUID NITROGEN  250 LTR  (CON)' (company: SHREYAA ENTERPRISES)...
+[2026-03-04 13:14:08] [INFO]   Payload: product=LIQUID NITROGEN, variant=250 LTR, unit=LTR, type=CON(CONTAINER), HSN=, GST=0.0%
+[2026-03-04 13:14:11] [INFO] API sync successful: Created=0, Updated=1
+[2026-03-04 13:14:11] [INFO] Product ID from API: 63
+[2026-03-04 13:14:11] [INFO] SUCCESS: Product 'LIQUID NITROGEN  250 LTR  (CON)' synced (SQLite ID=13, Catalytics ID=63, Status=updated)
+[2026-03-04 13:14:11] [INFO] Syncing product 'CO2 1.5 CUM  (CYL)' (company: Surya Air System)...
+[2026-03-04 13:14:11] [INFO]   Payload: product=CO2, variant=1.5 CUM, unit=CUM, type=CYL(CYLINDER), HSN=, GST=0.0%
+[2026-03-04 13:14:13] [INFO] API sync successful: Created=0, Updated=1
+[2026-03-04 13:14:13] [INFO] Product ID from API: 65
+[2026-03-04 13:14:13] [INFO] SUCCESS: Product 'CO2 1.5 CUM  (CYL)' synced (SQLite ID=15, Catalytics ID=65, Status=updated)
+[2026-03-04 13:14:13] [INFO] 
+------------------------------------------------------------
+[2026-03-04 13:14:13] [INFO] PRODUCT SYNC SUMMARY
+[2026-03-04 13:14:13] [INFO] ------------------------------------------------------------
+[2026-03-04 13:14:13] [INFO] Total: 2
+[2026-03-04 13:14:13] [INFO] API Synced: 2
+[2026-03-04 13:14:13] [INFO] Verified: 2
+[2026-03-04 13:14:13] [INFO] Failed: 0
+[2026-03-04 13:14:13] [INFO] Success Rate: 100.0%
+[2026-03-04 13:14:13] [INFO] ------------------------------------------------------------

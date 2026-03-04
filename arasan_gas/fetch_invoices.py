@@ -6,9 +6,10 @@ Fetch invoices from multiple Tally companies with enhanced change detection.
 - Filters by config start date (from-date onward) and delivery information
 """
 import logging
+from pathlib import Path
 from datetime import datetime
 
-from config import config
+from config import config, BASE_DIR
 from db import Database, json_dumps, json_loads, sha256_text
 from tally_client import TallyClient
 
@@ -26,6 +27,38 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+def _attach_invoice_fetch_file_handler():
+    """Log invoice fetch operations to a dedicated file."""
+    log_path = Path(BASE_DIR) / 'logs' / 'invoice_fetch.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'invoice_fetch_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'invoice_fetch_file'
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+_attach_invoice_fetch_file_handler()
+
+def _attach_invoice_fetch_error_handler():
+    """Log invoice fetch errors to a dedicated file."""
+    log_path = Path(BASE_DIR) / 'logs' / 'invoice_fetch_errors.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'invoice_fetch_error_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'invoice_fetch_error_file'
+    fh.setLevel(logging.ERROR)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+_attach_invoice_fetch_error_handler()
 
 def log_message(message):
     """Log to both terminal and dashboard"""
@@ -279,10 +312,30 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                     ledger_cache_key = f"{company_name}::{customer_name}"
                     if ledger_cache_key not in ledger_cache:
                         try:
-                            ld = tally.get_ledger_by_name(company_name, customer_name)
+                            import tally_client
+                            ld = tally_client.get_ledger_by_name(company_name, customer_name, tally.url)
                             ledger_cache[ledger_cache_key] = ld
+                            
+                            # Auto-save missing customer to SQL for sync
+                            if ld and not db.customer_exists(customer_name):
+                                cust_data = {
+                                    'tally_guid': ld.get("GUID", ""),
+                                    'name': ld.get("NAME", customer_name),
+                                    'tally_company': company_name,
+                                    'gstin': ld.get("GSTIN", "") or ld.get("PARTYGSTIN", "") or ld.get("GSTREGISTRATION", ""),
+                                    'pan': ld.get("INCOMETAXNUMBER", "") or ld.get("PANNUMBER", ""),
+                                    'address': ld.get("PRIMARY_ADDRESS", "") or (", ".join(ld.get("ADDRESSES", [])) if ld.get("ADDRESSES") else ""),
+                                    'state': ld.get("STATE", "") or ld.get("STATENAME", "") or ld.get("PRIORSTATENAME", ""),
+                                    'city': "",
+                                    'pincode': ld.get("PINCODE", ""),
+                                    'phone': ld.get("MOBILE", "") or ld.get("LEDGERMOBILE", ""),
+                                    'email': ld.get("EMAIL", "") or ld.get("LEDGEREMAIL", ""),
+                                    'data_json': json_dumps(ld)
+                                }
+                                db.insert_customer(cust_data)
+                                logger.info(f"[NEW CUSTOMER] '{customer_name}' added from invoice fetch")
                         except Exception as e:
-                            logger.debug(f"Could not fetch ledger for '{customer_name}': {e}")
+                            logger.debug(f"Could not fetch/save ledger for '{customer_name}': {e}")
                             ledger_cache[ledger_cache_key] = None
                     ledger_data = ledger_cache[ledger_cache_key]
                     ledger_data_json = json_dumps(ledger_data) if ledger_data else None
@@ -297,15 +350,87 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                         stock_cache_key = f"{company_name}::{item_name}"
                         if stock_cache_key not in stock_cache:
                             try:
-                                sd = tally.get_stock_item_by_name(company_name, item_name)
+                                import tally_client
+                                sd = tally_client.get_stock_item_by_name(company_name, item_name, tally.url)
                                 stock_cache[stock_cache_key] = sd
+                                
+                                # Auto-save missing product to SQL for sync
+                                if sd and not db.product_exists(item_name):
+                                    prod_data = {
+                                        'tally_guid': sd.get("GUID", ""),
+                                        'name': item_name,
+                                        'tally_company': company_name,
+                                        'hsn_code': sd.get("HSNCODE", ""),
+                                        'unit': sd.get("BASEUNITS", ""),
+                                        'rate': tally._parse_rate(sd.get("STANDARDPRICE", "0")),
+                                        'description': sd.get("PARENT", ""),
+                                        'data_json': json_dumps(sd),
+                                        'gst_applicable': sd.get("GSTAPPLICABLE", ""),
+                                        'gst_rate': sd.get("GST_RATE", 0.0),
+                                        'igst_rate': sd.get("IGST_RATE", 0.0),
+                                        'cgst_rate': sd.get("CGST_RATE", 0.0),
+                                        'sgst_rate': sd.get("SGST_RATE", 0.0),
+                                    }
+                                    db.insert_product(prod_data)
+                                    logger.info(f"[NEW PRODUCT] '{item_name}' added from invoice fetch")
                             except Exception as e:
-                                logger.debug(f"Could not fetch stock item '{item_name}': {e}")
+                                logger.debug(f"Could not fetch/save stock item '{item_name}': {e}")
                                 stock_cache[stock_cache_key] = None
                         if stock_cache[stock_cache_key]:
                             stock_items_map[item_name] = stock_cache[stock_cache_key]
 
                     stock_items_json = json_dumps(stock_items_map) if stock_items_map else None
+
+                    # Enrich stored voucher JSON with ledger + stock item GST details
+                    enriched_voucher = dict(full_voucher_payload) if isinstance(full_voucher_payload, dict) else {}
+                    if ledger_data:
+                        enriched_voucher['LEDGERDATA'] = ledger_data
+                    if stock_items_map:
+                        enriched_voucher['STOCKITEMS'] = stock_items_map
+
+                        # Enrich inventory lines with GST metadata (best-effort)
+                        inv_lines = enriched_voucher.get('INVENTORY') or []
+                        if isinstance(inv_lines, list):
+                            for inv in inv_lines:
+                                if not isinstance(inv, dict):
+                                    continue
+                                stock_name = inv.get('STOCKITEMNAME') or inv.get('ITEMNAME') or ''
+                                stock_name = str(stock_name).strip()
+                                if not stock_name:
+                                    continue
+                                stock_data = stock_items_map.get(stock_name) or {}
+                                if not isinstance(stock_data, dict):
+                                    continue
+
+                                # Attach raw GST fields if present
+                                for key in ('GST_RATE', 'IGST_RATE', 'CGST_RATE', 'SGST_RATE', 'HSNCODE'):
+                                    if key in stock_data and key not in inv:
+                                        inv[key] = stock_data.get(key)
+
+                                # Compute estimated tax amount from rate (if available)
+                                try:
+                                    qty_val = float(str(inv.get('BILLEDQTY') or inv.get('ACTUALQTY') or '0').split()[0].replace(',', ''))
+                                except Exception:
+                                    qty_val = 0.0
+                                try:
+                                    rate_val = float(str(inv.get('RATE') or '0').replace(',', ''))
+                                except Exception:
+                                    rate_val = 0.0
+                                try:
+                                    amount_val = float(str(inv.get('AMOUNT') or '0').replace(',', ''))
+                                except Exception:
+                                    amount_val = qty_val * rate_val
+
+                                gst_rate = stock_data.get('GST_RATE')
+                                try:
+                                    gst_rate_val = float(gst_rate) if gst_rate is not None else 0.0
+                                except Exception:
+                                    gst_rate_val = 0.0
+
+                                if gst_rate_val and 'EST_TAX_AMOUNT' not in inv:
+                                    inv['TAX_RATE_TOTAL'] = gst_rate_val
+                                    inv['EST_TAX_AMOUNT'] = round(amount_val * (gst_rate_val / 100.0), 2)
+                    data_json = json_dumps(enriched_voucher)
 
                     # Compute payload hash (like CO_middleware)
                     payload_hash = _compute_payload_hash(

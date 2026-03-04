@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 
 <head>
@@ -1651,7 +1651,7 @@
     <div class="container">
         <!-- Header -->
         <div class="header">
-            <h1>ðŸ”¥ {{ entity_name }} Middleware Dashboard</h1>
+            <h1>{{ entity_name }} Middleware Dashboard</h1>
             <p>Entity ID: {{ entity_id }} | Real-time monitoring and control</p>
         </div>
 
@@ -1694,7 +1694,7 @@
         <div class="grid">
             <!-- Customers -->
             <div class="card">
-                <h2>ðŸ‘¥ Customers</h2>
+                <h2>Customers</h2>
                 <div class="stat-item">
                     <span class="stat-label">Total</span>
                     <span class="stat-value" id="customers-total">-</span>
@@ -1715,7 +1715,7 @@
 
             <!-- Products -->
             <div class="card">
-                <h2>ðŸ“¦ Products</h2>
+                <h2>Products</h2>
                 <div class="stat-item">
                     <span class="stat-label">Total</span>
                     <span class="stat-value" id="products-total">-</span>
@@ -1736,7 +1736,7 @@
 
             <!-- Invoices -->
             <div class="card">
-                <h2>ðŸ“„ Invoices</h2>
+                <h2>Invoices</h2>
                 <div class="stat-item">
                     <span class="stat-label">Total</span>
                     <span class="stat-value" id="invoices-total">-</span>
@@ -1759,7 +1759,7 @@
 
             <!-- Duplicates -->
             <div class="card">
-                <h2>âš ï¸ Duplicates</h2>
+                <h2>Duplicates</h2>
                 <div class="stat-item">
                     <span class="stat-label">Total Duplicates</span>
                     <span class="stat-value" id="duplicates-total">-</span>
@@ -1985,7 +1985,7 @@
                             <button class="product-tab-btn sync-only" onclick="triggerProductSyncOnly()">Full Product
                                 Sync</button>
                             <button class="product-tab-btn" onclick="debugProductTally()"
-                                style="background:#7c3aed;color:#fff;border-color:#7c3aed;">🔍 Debug Fetch</button>
+                                style="background:#7c3aed;color:#fff;border-color:#7c3aed;"> Debug Fetch</button>
                             <select id="products-sync-filter" class="filter-select" onchange="applyFilters('products')">
                                 <option value="all">All Status</option>
                                 <option value="synced">Synced</option>
@@ -2070,7 +2070,7 @@
 
         <!-- Manual Actions -->
         <div class="card">
-            <h2>âš¡ Manual Actions</h2>
+            <h2>Manual Actions</h2>
             <div class="action-buttons">
                 <button class="action-button" onclick="triggerFetch('customers')">Fetch Customers</button>
                 <button class="action-button" onclick="triggerFetch('products')">Fetch Products</button>
@@ -2083,7 +2083,7 @@
 
         <!-- Terminal Output -->
         <div class="card">
-            <h2>🖥️ Terminal Output</h2>
+            <h2>Terminal Output</h2>
             <p style="color: #666; margin-bottom: 10px;">Live terminal output from fetch and sync operations</p>
 
             <div id="terminal-output" style="
@@ -2107,17 +2107,17 @@
             <div style="display: flex; gap: 10px;">
 
                 <button class="btn btn-secondary" onclick="refreshTerminalOutput()" style="flex: 1;">
-                    ðŸ”„ Refresh Logs
+                     Refresh Logs
                 </button>
                 <button class="btn btn-danger" onclick="clearTerminalLogs()" style="flex: 1;">
-                    ðŸ—‘ï¸ Clear Logs
+                     Clear Logs
                 </button>
             </div>
         </div>
 
         <!-- Automation Controls -->
         <div class="card">
-            <h2>âš™ï¸ Automation Controls</h2>
+            <h2>Automation Controls</h2>
 
             <!-- Status Indicator -->
             <div class="automation-status" id="automationStatus">
@@ -2128,19 +2128,19 @@
             <!-- Control Buttons -->
             <div class="control-buttons">
                 <button class="btn btn-success" id="btnStart" onclick="startAutomation()">
-                    â–¶ï¸ Start
+                     Start
                 </button>
                 <button class="btn btn-danger" id="btnStop" onclick="stopAutomation()">
-                    â¹ï¸ Stop
+                     Stop
                 </button>
                 <button class="btn btn-secondary" id="btnRestart" onclick="restartAutomation()">
-                    ðŸ”„ Restart
+                     Restart
                 </button>
             </div>
 
             <!-- Interval Configuration -->
             <div class="interval-config">
-                <h3>â±ï¸ Intervals</h3>
+                <h3>Intervals</h3>
                 <div class="interval-grid">
                     <div class="interval-item">
                         <label for="intervalMaster">Master Data (seconds):</label>
@@ -2158,19 +2158,19 @@
                         <span class="interval-countdown" id="countdownSync">-</span>
                     </div>
                 </div>
-                <button class="btn btn-primary" onclick="updateIntervals()">ðŸ’¾ Apply Intervals</button>
+                <button class="btn btn-primary" onclick="updateIntervals()"> Apply Intervals</button>
             </div>
         </div>
 
         <!-- Data Verification -->
         <div class="card">
-            <h2>ðŸ” Data Verification</h2>
+            <h2>Data Verification</h2>
             <p style="color: #666; margin-bottom: 20px;">Verify data consistency between SQLite and Catalytics</p>
 
             <!-- Verification Button -->
             <div style="margin-bottom: 20px;">
                 <button class="btn btn-primary" onclick="runDataMatcher()" id="btnVerifyData" style="width: 100%;">
-                    ðŸ” Verify Data Matching
+                     Verify Data Matching
                 </button>
             </div>
 
@@ -2182,13 +2182,13 @@
 
         <!-- Diagnostics -->
         <div class="card">
-            <h2>ðŸ¥ System Diagnostics</h2>
+            <h2>System Diagnostics</h2>
             <p style="color: #666; margin-bottom: 20px;">System health check and statistics</p>
 
             <!-- Refresh Button -->
             <div style="margin-bottom: 20px;">
                 <button class="btn btn-secondary" onclick="fetchDiagnostics()" id="btnDiagnostics" style="width: 100%;">
-                    ðŸ”„ Refresh Diagnostics
+                     Refresh Diagnostics
                 </button>
             </div>
 
@@ -2200,7 +2200,7 @@
 
         <!-- Activity Timeline -->
         <div class="card">
-            <h2>ðŸ“‹ Recent Activity</h2>
+            <h2>Recent Activity</h2>
             <div class="activity-container" id="activityContainer">
                 <div style="text-align: center; padding: 40px; color: #999;">Loading activity...</div>
             </div>
@@ -2208,12 +2208,12 @@
 
         <!-- Data Mapping Info -->
         <div class="card">
-            <h2>ðŸ“Š Data Mapping: Tally â†’ Catalytics</h2>
+            <h2>Data Mapping: Tally  Catalytics</h2>
             <p style="color: #666; margin-bottom: 20px;">Fields fetched from Tally and synced to Catalytics backend</p>
 
             <!-- Customer Data Mapping -->
             <div class="data-mapping-section">
-                <h3>ðŸ‘¥ Customer Data</h3>
+                <h3>Customer Data</h3>
                 <div class="mapping-flow">
                     <div class="mapping-box">
                         <h4>From Tally</h4>
@@ -2228,7 +2228,7 @@
                             <li><code>EMAIL</code> - Email address</li>
                         </ul>
                     </div>
-                    <div class="mapping-arrow">â†’</div>
+                    <div class="mapping-arrow"></div>
                     <div class="mapping-box">
                         <h4>SQLite Middleware</h4>
                         <ul class="field-list">
@@ -2238,7 +2238,7 @@
                             <li>Error logging</li>
                         </ul>
                     </div>
-                    <div class="mapping-arrow">â†’</div>
+                    <div class="mapping-arrow"></div>
                     <div class="mapping-box">
                         <h4>To Catalytics</h4>
                         <ul class="field-list">
@@ -2253,7 +2253,7 @@
 
             <!-- Product Data Mapping -->
             <div class="data-mapping-section">
-                <h3>ðŸ“¦ Product Data</h3>
+                <h3>Product Data</h3>
                 <div class="mapping-flow">
                     <div class="mapping-box">
                         <h4>From Tally</h4>
@@ -2265,7 +2265,7 @@
                             <li><code>PARENT</code> - Category</li>
                         </ul>
                     </div>
-                    <div class="mapping-arrow">â†’</div>
+                    <div class="mapping-arrow"></div>
                     <div class="mapping-box">
                         <h4>SQLite Middleware</h4>
                         <ul class="field-list">
@@ -2275,7 +2275,7 @@
                             <li>Error logging</li>
                         </ul>
                     </div>
-                    <div class="mapping-arrow">â†’</div>
+                    <div class="mapping-arrow"></div>
                     <div class="mapping-box">
                         <h4>To Catalytics</h4>
                         <ul class="field-list">
@@ -2290,7 +2290,7 @@
 
             <!-- Invoice Data Mapping -->
             <div class="data-mapping-section">
-                <h3>ðŸ§¾ Invoice Data</h3>
+                <h3>Invoice Data</h3>
                 <div class="mapping-flow">
                     <div class="mapping-box">
                         <h4>From Tally</h4>
@@ -2303,7 +2303,7 @@
                             <li>Total & Tax calculated</li>
                         </ul>
                     </div>
-                    <div class="mapping-arrow">â†’</div>
+                    <div class="mapping-arrow"></div>
                     <div class="mapping-box">
                         <h4>SQLite Middleware</h4>
                         <ul class="field-list">
@@ -2313,7 +2313,7 @@
                             <li>Per-company storage</li>
                         </ul>
                     </div>
-                    <div class="mapping-arrow">â†’</div>
+                    <div class="mapping-arrow"></div>
                     <div class="mapping-box">
                         <h4>To Catalytics</h4>
                         <ul class="field-list">
@@ -2328,7 +2328,7 @@
 
             <div
                 style="margin-top: 20px; padding: 16px; background: #f0f9ff; border-left: 4px solid #3b82f6; border-radius: 6px;">
-                <strong>ðŸ“˜ Complete Documentation:</strong>
+                <strong> Complete Documentation:</strong>
                 <a href="/DATA_MAPPING.md" target="_blank" style="color: #3b82f6; margin-left: 8px;">View
                     DATA_MAPPING.md</a>
                 <span style="margin-left: 16px; color: #666;">| Comparison with CO_middleware included</span>
@@ -2338,7 +2338,7 @@
         <!-- Logs -->
         <div class="logs-container">
             <div class="logs-header">
-                <h2>ðŸ“‹ Live Logs</h2>
+                <h2>Live Logs</h2>
                 <div class="logs-tabs">
                     <button class="log-tab active" onclick="switchLogTab('main')">Main</button>
                     <button class="log-tab" onclick="switchLogTab('fetch_master')">Master Data</button>
@@ -2360,7 +2360,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h2 id="modalTitle">Record Details</h2>
-                <button class="modal-close" onclick="closeModal()">Ã—</button>
+                <button class="modal-close" onclick="closeModal()"></button>
             </div>
             <div class="modal-body" id="modalBody">
                 Loading...
@@ -2386,13 +2386,13 @@
     <script>
         let currentLogType = 'main';
 
-        // Parse Tally date strings â€” Tally stores dates as YYYYMMDD (no dashes).
+        // Parse Tally date strings  Tally stores dates as YYYYMMDD (no dashes).
         // JS Date() needs YYYY-MM-DD; insert dashes if the string is 8 raw digits.
         function formatTallyDate(dateStr) {
             if (!dateStr) return '-';
             const s = String(dateStr).trim();
             if (/^\d{8}$/.test(s)) {
-                // YYYYMMDD â†’ YYYY-MM-DD
+                // YYYYMMDD  YYYY-MM-DD
                 return new Date(`${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6)}`).toLocaleDateString();
             }
             const d = new Date(s);
@@ -2768,7 +2768,7 @@
         async function debugProductTally() {
             const btn = event.currentTarget;
             const orig = btn.textContent;
-            btn.textContent = '⏳ Checking...';
+            btn.textContent = ' Checking...';
             btn.disabled = true;
 
 
@@ -2781,12 +2781,12 @@
                 let html = `<div style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center;" onclick="this.remove()">
                     <div onclick="event.stopPropagation()" style="background:#fff;border-radius:16px;padding:28px;max-width:780px;width:95%;max-height:85vh;overflow-y:auto;box-shadow:0 25px 60px rgba(0,0,0,.4);">
                       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
-                        <h2 style="margin:0;font-size:18px;">🔍 Tally Product Fetch Diagnostic</h2>
-                        <button onclick="this.closest('[style*=fixed]').remove()" style="background:#f1f5f9;border:none;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:14px;">✕ Close</button>
+                        <h2 style="margin:0;font-size:18px;"> Tally Product Fetch Diagnostic</h2>
+                        <button onclick="this.closest('[style*=fixed]').remove()" style="background:#f1f5f9;border:none;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:14px;"> Close</button>
                       </div>
                       <div style="background:#f8fafc;border-radius:8px;padding:12px;margin-bottom:16px;font-size:13px;">
                         <strong>Active Companies:</strong> ${data.active_companies.join(', ')}<br>
-                        <strong>Product Type Map:</strong> ${Object.entries(data.product_type_map).map(([k, v]) => `${k}→${v}`).join(', ')}
+                        <strong>Product Type Map:</strong> ${Object.entries(data.product_type_map).map(([k, v]) => `${k}${v}`).join(', ')}
                       </div>`;
 
                 for (const [company, cr] of Object.entries(data.companies)) {
@@ -2795,10 +2795,10 @@
                         ? Math.round(cr.count_matched / cr.total_from_tally * 100) : 0;
 
                     html += `<div style="border:1px solid #e2e8f0;border-radius:10px;padding:16px;margin-bottom:16px;">
-                        <div style="font-weight:700;font-size:15px;margin-bottom:12px;">🏢 ${company}</div>`;
+                        <div style="font-weight:700;font-size:15px;margin-bottom:12px;"> ${company}</div>`;
 
                     if (cr.error) {
-                        html += `<div style="background:#fee2e2;border-radius:8px;padding:12px;color:#991b1b;font-size:13px;">❌ Error: ${cr.error}</div>`;
+                        html += `<div style="background:#fee2e2;border-radius:8px;padding:12px;color:#991b1b;font-size:13px;"> Error: ${cr.error}</div>`;
                     } else {
                         html += `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px;">
                             ${[
@@ -2814,31 +2814,31 @@
 
                         if (cr.total_from_tally === 0) {
                             html += `<div style="background:#fee2e2;border-radius:8px;padding:12px;color:#991b1b;font-size:13px;">
-                                ⚠️ <strong>Tally returned 0 items for this company.</strong><br>
+                                 <strong>Tally returned 0 items for this company.</strong><br>
                                 This usually means the company is <strong>not open in Tally</strong> at the moment, or the company name in .env does not exactly match what's open in Tally (case-sensitive).
                             </div>`;
                         } else if (cr.count_matched === 0 && cr.count_no_type > 0) {
                             html += `<div style="background:#fef3c7;border-radius:8px;padding:12px;color:#92400e;font-size:13px;">
-                                ⚠️ Tally returned ${cr.total_from_tally} items but <strong>NONE matched the product type map</strong>.<br>
+                                 Tally returned ${cr.total_from_tally} items but <strong>NONE matched the product type map</strong>.<br>
                                 Check that your <code>PRODUCT_TYPE_MAP</code> codes match the suffixes in the product names below.
                             </div>`;
                         }
 
                         if (cr.sample_names && cr.sample_names.length > 0) {
                             html += `<div style="margin-top:12px;">
-                                <div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:6px;">📋 First ${cr.sample_names.length} item names from Tally:</div>
+                                <div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:6px;"> First ${cr.sample_names.length} item names from Tally:</div>
                                 <div style="background:#0f172a;border-radius:8px;padding:12px;max-height:160px;overflow-y:auto;">
                                 ${cr.sample_names.map((n, i) =>
                                 `<div style="font-family:monospace;font-size:12px;color:${cr.matched.some(m => m.name === n) ? '#4ade80' : cr.skipped_duplicate && cr.skipped_duplicate.some && cr.skipped_duplicate.find && cr.skipped_duplicate.find(d => d.name === n) ? '#c084fc' : '#fbbf24'};margin-bottom:3px;">${i + 1}. ${n}</div>`
                             ).join('')}
                                 </div>
-                                <div style="font-size:11px;color:#94a3b8;margin-top:4px;">🟢 matched &nbsp; 🟡 no type code &nbsp; 🟣 duplicate</div>
+                                <div style="font-size:11px;color:#94a3b8;margin-top:4px;"> matched &nbsp;  no type code &nbsp;  duplicate</div>
                             </div>`;
                         }
 
                         if (cr.skipped_duplicate && cr.skipped_duplicate.length > 0) {
                             html += `<div style="margin-top:12px;">
-                                <div style="font-size:12px;font-weight:600;color:#7c3aed;margin-bottom:6px;">🟣 Duplicates (already owned by another company):</div>
+                                <div style="font-size:12px;font-weight:600;color:#7c3aed;margin-bottom:6px;"> Duplicates (already owned by another company):</div>
                                 <div style="background:#f5f3ff;border-radius:8px;padding:10px;max-height:100px;overflow-y:auto;">
                                 ${cr.skipped_duplicate.slice(0, 10).map(d =>
                                 `<div style="font-size:12px;color:#5b21b6;">${d.name} <span style="color:#94a3b8;">(owned by: ${d.owned_by})</span></div>`
@@ -2948,12 +2948,12 @@
                 if (data.success) {
                     const terminal = document.getElementById('terminal-output');
                     terminal.textContent = 'Logs cleared. Waiting for operations...';
-                    alert('âœ… Logs cleared successfully');
+                    alert('Logs cleared successfully');
                 } else {
-                    alert('âŒ Error: ' + data.error);
+                    alert('Error: ' + data.error);
                 }
             } catch (error) {
-                alert('âŒ Error clearing logs: ' + error.message);
+                alert('Error clearing logs: ' + error.message);
             }
         }
 
@@ -3095,12 +3095,12 @@
                     <td><span class="status-badge-small fetched">${p.tally_company.substring(0, 15)}</span></td>
                     <td>${p.hsn_code || '-'}</td>
                     <td>${p.unit || '-'}</td>
-                    <td>â‚¹${p.rate ? parseFloat(p.rate).toFixed(2) : '0.00'}</td>
+                    <td>${p.rate ? parseFloat(p.rate).toFixed(2) : '0.00'}</td>
                     <td><span class="status-badge-small fetched">Fetched</span></td>
                     <td><span class="status-badge-small ${p.is_synced ? 'synced' : 'pending'}">${p.is_synced ? 'Synced' : 'Pending'}</span></td>
                     <td>
-                        <button class="action-btn small" onclick="productRefetch(${p.id})" title="Refetch from Tally">ðŸ”„ Refetch</button>
-                        <button class="action-btn small" onclick="productResync(${p.id})" title="Resync to Catalytics">âš™ï¸ Resync</button>
+                        <button class="action-btn small" onclick="productRefetch(${p.id})" title="Refetch from Tally"> Refetch</button>
+                        <button class="action-btn small" onclick="productResync(${p.id})" title="Resync to Catalytics"> Resync</button>
                     </td>
                     <td>${p.last_sync_at ? new Date(p.last_sync_at).toLocaleString() : '-'}</td>
                 </tr>
@@ -3122,7 +3122,7 @@
                     <td><span class="status-badge-small fetched">${inv.tally_company.substring(0, 15)}</span></td>
                     <td>${formatTallyDate(inv.voucher_date)}</td>
                     <td>${inv.customer_name}</td>
-                    <td>â‚¹${parseFloat(inv.total_amount).toFixed(2)}</td>
+                    <td>${parseFloat(inv.total_amount).toFixed(2)}</td>
                     <td>${inv.dc_no}</td>
                     <td><span class="status-badge-small fetched">Fetched</span></td>
                     <td><span class="status-badge-small ${inv.is_synced ? 'synced' : 'pending'}">${inv.is_synced ? 'Synced' : 'Pending'}</span></td>
@@ -3148,7 +3148,7 @@
                 if (syncFilter === 'pending' && item.is_synced) return false;
 
                 // Company filter
-                const itemCompany = item.tally_company || '';
+                const itemCompany = item.tally_company || '-';
                 if (companyFilter !== 'all' && itemCompany !== companyFilter) return false;
 
                 // Search filter
@@ -3212,7 +3212,7 @@
             const sortedHeader = table.querySelector(`th[onclick*="${column}"]`);
             if (sortedHeader) {
                 const indicator = sortedHeader.querySelector('.sort-indicator');
-                indicator.textContent = currentSort.direction === 'asc' ? 'â–²' : 'â–¼';
+                indicator.textContent = currentSort.direction === 'asc' ? '^' : 'v';
             }
 
             // Re-apply filters (which includes sorting)
@@ -3383,46 +3383,64 @@
                 const hasError = !!c.last_sync_error;
 
                 document.getElementById('modalTitle').innerHTML =
-                    `👤 ${c.name} &nbsp;<span style="font-size:13px;font-weight:400;padding:3px 10px;border-radius:12px;background:${isSynced ? '#d1fae5' : '#fee2e2'};color:${isSynced ? '#065f46' : '#991b1b'}">${isSynced ? '✅ Synced' : '⏳ Pending'}</span>`;
+                    ` ${c.name} &nbsp;<span style="font-size:13px;font-weight:400;padding:3px 10px;border-radius:12px;background:${isSynced ? '#d1fae5' : '#fee2e2'};color:${isSynced ? '#065f46' : '#991b1b'}">${isSynced ? ' Synced' : ' Pending'}</span>`;
 
                 const pretty = (raw) => { if (!raw) return null; try { return JSON.stringify(typeof raw === 'string' ? JSON.parse(raw) : raw, null, 2); } catch { return String(raw); } };
                 const fetchDataText = pretty(c.data_json);
                 const syncRespText = pretty(c.last_response_json);
                 const syncError = c.last_sync_error || null;
+                const fetchLogLines = c.fetch_log || [];
+                const syncLogLines = c.sync_log || [];
+
+                const logHtml = (() => {
+                    const renderBlock = (title, lines, accent) => {
+                        if (!lines || lines.length === 0) return '';
+                        const body = lines.map(l => l.replace(/</g,'&lt;').replace(/>/g,'&gt;')).join('\n');
+                        return `<div style="background:${accent};border-radius:8px;padding:12px;margin-bottom:10px;"><div style="font-size:12px;font-weight:700;color:#0f172a;margin-bottom:6px;">${title}</div><pre style="margin:0;color:#0f172a;font-size:12px;line-height:1.6;white-space:pre-wrap;">${body}</pre></div>`;
+                    };
+                    const blocks = [];
+                    blocks.push(renderBlock('Customer Fetch Log (latest entries)', fetchLogLines, '#e2e8f0'));
+                    blocks.push(renderBlock('Customer Sync Log (latest entries)', syncLogLines, '#e2e8f0'));
+                    const combined = blocks.filter(Boolean).join('');
+                    if (combined) return combined;
+                    return `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px;">No log lines yet for this customer.<br><small>Run fetch or sync to generate log entries.</small></div>`;
+                })();
 
                 const overviewHtml = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
-                    ${[['🏢 Company', c.tally_company || '—'], ['📋 GSTIN', c.gstin || '—'], ['📞 Phone', c.phone || '—'], ['📧 Email', c.email || '—'],
-                    ['🏙 City', c.city || '—'], ['📌 State', c.state || '—'], ['🆔 Catalytics ID', c.catalytics_id || '—'],
-                    ['🔁 Sync Attempts', c.sync_attempts ?? '—'], ['📥 First Fetched', c.first_fetched_at ? new Date(c.first_fetched_at).toLocaleString() : '—'],
-                    ['✅ Last Synced', c.last_sync_at ? new Date(c.last_sync_at).toLocaleString() : '—']]
+                    ${[['Company', c.tally_company || '-'], ['GSTIN', c.gstin || '-'], ['Phone', c.phone || '-'], ['Email', c.email || '-'],
+                    ['City', c.city || '-'], ['State', c.state || '-'], ['Catalytics ID', c.catalytics_id || '-'],
+                    ['Sync Attempts', c.sync_attempts ?? '-'], ['First Fetched', c.first_fetched_at ? new Date(c.first_fetched_at).toLocaleString() : ''],
+                    ['Last Synced', c.last_sync_at ? new Date(c.last_sync_at).toLocaleString() : '']]
                         .map(([l, v]) => `<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px"><div style="font-size:11px;color:#64748b;margin-bottom:4px">${l}</div><div style="font-size:13px;font-weight:600;color:#1e293b;word-break:break-all">${v}</div></div>`).join('')}
                 </div>`;
 
                 const fetchHtml = fetchDataText
                     ? `<div style="background:#0f172a;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><pre style="margin:0;color:#a5f3fc;font-size:12px;line-height:1.6;white-space:pre-wrap">${fetchDataText}</pre></div>`
-                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px">📭 No fetch data stored yet.<br><small>Run "Refetch" to pull latest data from Tally.</small></div>`;
+                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px"> No fetch data stored yet.<br><small>Run "Refetch" to pull latest data from Tally.</small></div>`;
 
                 const syncHtml = isSynced && syncRespText
-                    ? `<div style="background:#052e16;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#4ade80;font-size:12px;font-weight:600;margin-bottom:10px">✅ Sync Successful — Catalytics Response</div><pre style="margin:0;color:#bbf7d0;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncRespText}</pre></div>`
+                    ? `<div style="background:#052e16;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#4ade80;font-size:12px;font-weight:600;margin-bottom:10px"> Sync Successful  Catalytics Response</div><pre style="margin:0;color:#bbf7d0;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncRespText}</pre></div>`
                     : syncRespText
-                        ? `<div style="background:#1c1917;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#fbbf24;font-size:12px;font-weight:600;margin-bottom:10px">⚠️ Last Sync Response (Not Accepted)</div><pre style="margin:0;color:#fde68a;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncRespText}</pre></div>`
-                        : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px">📭 No sync response yet.</div>`;
+                        ? `<div style="background:#1c1917;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#fbbf24;font-size:12px;font-weight:600;margin-bottom:10px"> Last Sync Response (Not Accepted)</div><pre style="margin:0;color:#fde68a;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncRespText}</pre></div>`
+                        : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px"> No sync response yet.</div>`;
 
                 const errorHtml = hasError
-                    ? `<div style="background:#450a0a;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#f87171;font-size:12px;font-weight:600;margin-bottom:10px">❌ Last Sync Error &nbsp;·&nbsp; ${c.sync_attempts} attempt${c.sync_attempts !== 1 ? 's' : ''}</div><pre style="margin:0;color:#fecaca;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncError}</pre></div>`
-                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px">✅ No errors recorded.</div>`;
+                    ? `<div style="background:#450a0a;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#f87171;font-size:12px;font-weight:600;margin-bottom:10px"> Last Sync Error &nbsp;&nbsp; ${c.sync_attempts} attempt${c.sync_attempts !== 1 ? 's' : ''}</div><pre style="margin:0;color:#fecaca;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncError}</pre></div>`
+                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px"> No errors recorded.</div>`;
 
                 document.getElementById('modalBody').innerHTML = `
                     <style>.pd-tabs{display:flex;gap:0;border-bottom:2px solid #e2e8f0;margin-bottom:16px}.pd-tab{padding:8px 18px;font-size:13px;font-weight:600;cursor:pointer;color:#64748b;border-bottom:3px solid transparent;margin-bottom:-2px;transition:all .2s;background:none;border-top:none;border-left:none;border-right:none}.pd-tab:hover{color:#4f46e5}.pd-tab.active{color:#4f46e5;border-bottom-color:#4f46e5}.pd-tab.error-tab.has-error{color:#dc2626}.pd-tab.error-tab.has-error.active{border-bottom-color:#dc2626}.pd-panel{display:none}.pd-panel.active{display:block}</style>
                     <div class="pd-tabs">
-                        <button class="pd-tab active" onclick="pdSwitchTab(event,'pd-overview')">📋 Overview</button>
-                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-fetch')">📥 Fetch Data</button>
-                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-sync')">📤 Sync Response</button>
-                        <button class="pd-tab error-tab ${hasError ? 'has-error' : ''}" onclick="pdSwitchTab(event,'pd-error')">${hasError ? '❌' : '✅'} Error Log ${hasError ? `<span style="background:#dc2626;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px">${c.sync_attempts}</span>` : ''}</button>
+                        <button class="pd-tab active" onclick="pdSwitchTab(event,'pd-overview')"> Overview</button>
+                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-fetch')"> Fetch Data</button>
+                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-sync')"> Sync Response</button>
+                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-logs')">- Logs</button>
+                        <button class="pd-tab error-tab ${hasError ? 'has-error' : ''}" onclick="pdSwitchTab(event,'pd-error')">Error Log ${hasError ? `<span style="background:#dc2626;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px">${c.sync_attempts}</span>` : ''}</button>
                     </div>
                     <div id="pd-overview" class="pd-panel active">${overviewHtml}</div>
                     <div id="pd-fetch" class="pd-panel">${fetchHtml}</div>
                     <div id="pd-sync" class="pd-panel">${syncHtml}</div>
+                    <div id="pd-logs" class="pd-panel">${logHtml}</div>
                     <div id="pd-error" class="pd-panel">${errorHtml}</div>`;
 
                 document.getElementById('recordModal').classList.add('active');
@@ -3443,9 +3461,9 @@
                 const hasError = !!product.last_sync_error;
 
                 document.getElementById('modalTitle').innerHTML =
-                    `ðŸ“¦ ${product.name} &nbsp;<span style="font-size:13px;font-weight:400;padding:3px 10px;border-radius:12px;background:${isSynced ? '#d1fae5' : '#fee2e2'};color:${isSynced ? '#065f46' : '#991b1b'};">${isSynced ? 'âœ… Synced' : 'â³ Pending'}</span>`;
+                    ` ${product.name} &nbsp;<span style="font-size:13px;font-weight:400;padding:3px 10px;border-radius:12px;background:${isSynced ? '#d1fae5' : '#fee2e2'};color:${isSynced ? '#065f46' : '#991b1b'};">${isSynced ? ' Synced' : ' Pending'}</span>`;
 
-                // â”€â”€ safe JSON pretty print â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                //  safe JSON pretty print 
                 const pretty = (raw) => {
                     if (!raw) return null;
                     try { return JSON.stringify(typeof raw === 'string' ? JSON.parse(raw) : raw, null, 2); }
@@ -3455,20 +3473,37 @@
                 const fetchDataText = pretty(product.data_json);
                 const syncRespText = pretty(product.last_response_json);
                 const syncError = product.last_sync_error || null;
+                const fetchLogLines = product.fetch_log || [];
+                const syncLogLines = product.sync_log || [];
 
-                // â”€â”€ build tab content â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                const logHtml = (() => {
+                    const renderBlock = (title, lines, accent) => {
+                        if (!lines || lines.length === 0) return '';
+                        const body = lines.map(l => l.replace(/</g,'&lt;').replace(/>/g,'&gt;')).join('\n');
+                        return `<div style="background:${accent};border-radius:8px;padding:12px;margin-bottom:10px;"><div style="font-size:12px;font-weight:700;color:#0f172a;margin-bottom:6px;">${title}</div><pre style="margin:0;color:#0f172a;font-size:12px;line-height:1.6;white-space:pre-wrap;">${body}</pre></div>`;
+                    };
+                    const blocks = [];
+                    blocks.push(renderBlock('Product Fetch Log (latest entries)', fetchLogLines, '#e2e8f0'));
+                    blocks.push(renderBlock('Product Sync Log (latest entries)', syncLogLines, '#e2e8f0'));
+                    const combined = blocks.filter(Boolean).join('');
+                    if (combined) return combined;
+                    return `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px;">No log lines yet for this product.<br><small>Run fetch or sync to generate log entries.</small></div>`;
+                })();
+
+
+                //  build tab content 
                 const overviewHtml = `
                     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:6px;">
                         ${[
-                        ['ðŸ¢ Company', product.tally_company || 'â€”'],
-                        ['ðŸ”– HSN Code', product.hsn_code || 'â€”'],
-                        ['ðŸ“ Unit', product.unit || 'â€”'],
-                        ['ðŸ’° Rate', product.rate != null ? 'INR ' + parseFloat(product.rate).toFixed(2) : 'â€”'],
-                        ['ðŸ†” Catalytics ID', product.catalytics_id || 'â€”'],
-                        ['ðŸ” Sync Attempts', product.sync_attempts ?? 'â€”'],
-                        ['ðŸ“¥ First Fetched', product.first_fetched_at ? new Date(product.first_fetched_at).toLocaleString() : 'â€”'],
-                        ['ðŸ”„ Last Updated', product.last_updated_at ? new Date(product.last_updated_at).toLocaleString() : 'â€”'],
-                        ['âœ… Last Synced', product.last_sync_at ? new Date(product.last_sync_at).toLocaleString() : 'â€”'],
+                        ['Company', product.tally_company || '-'],
+                        ['HSN Code', product.hsn_code || '-'],
+                        ['Unit', product.unit || '-'],
+                        ['Rate', product.rate != null ? 'INR ' + parseFloat(product.rate).toFixed(2) : ''],
+                        ['Catalytics ID', product.catalytics_id || '-'],
+                        ['Sync Attempts', product.sync_attempts ?? '-'],
+                        ['First Fetched', product.first_fetched_at ? new Date(product.first_fetched_at).toLocaleString() : ''],
+                        ['Last Updated', product.last_updated_at ? new Date(product.last_updated_at).toLocaleString() : ''],
+                        ['Last Synced', product.last_sync_at ? new Date(product.last_sync_at).toLocaleString() : ''],
                     ].map(([lbl, val]) => `
                             <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;">
                                 <div style="font-size:11px;color:#64748b;margin-bottom:4px;">${lbl}</div>
@@ -3481,38 +3516,38 @@
                            <pre style="margin:0;color:#a5f3fc;font-size:12px;line-height:1.6;white-space:pre-wrap;">${fetchDataText}</pre>
                        </div>`
                     : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px;">
-                           ðŸ“­ No fetch data stored yet.<br><small>Run "Refetch" to pull latest data from Tally.</small></div>`;
+                            No fetch data stored yet.<br><small>Run "Refetch" to pull latest data from Tally.</small></div>`;
 
                 const syncHtml = (() => {
                     if (isSynced && syncRespText) {
                         return `<div style="background:#052e16;border-radius:8px;padding:16px;overflow:auto;max-height:420px;">
-                                    <div style="color:#4ade80;font-size:12px;font-weight:600;margin-bottom:10px;">âœ… Sync Successful â€” Catalytics Response</div>
+                                    <div style="color:#4ade80;font-size:12px;font-weight:600;margin-bottom:10px;"> Sync Successful  Catalytics Response</div>
                                     <pre style="margin:0;color:#bbf7d0;font-size:12px;line-height:1.6;white-space:pre-wrap;">${syncRespText}</pre>
                                 </div>`;
                     } else if (!isSynced && syncRespText) {
                         return `<div style="background:#1c1917;border-radius:8px;padding:16px;overflow:auto;max-height:420px;">
-                                    <div style="color:#fbbf24;font-size:12px;font-weight:600;margin-bottom:10px;">âš ï¸ Last Sync Response (Not Yet Accepted)</div>
+                                    <div style="color:#fbbf24;font-size:12px;font-weight:600;margin-bottom:10px;"> Last Sync Response (Not Yet Accepted)</div>
                                     <pre style="margin:0;color:#fde68a;font-size:12px;line-height:1.6;white-space:pre-wrap;">${syncRespText}</pre>
                                 </div>`;
                     }
                     return `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px;">
-                                ðŸ“­ No sync response yet.<br><small>Sync this product to Catalytics to see the response.</small></div>`;
+                                 No sync response yet.<br><small>Sync this product to Catalytics to see the response.</small></div>`;
                 })();
 
                 const errorHtml = (() => {
                     if (!hasError) {
                         return `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px;">
-                                    âœ… No errors recorded for this product.</div>`;
+                                     No errors recorded for this product.</div>`;
                     }
                     return `<div style="background:#450a0a;border-radius:8px;padding:16px;overflow:auto;max-height:420px;">
                                 <div style="color:#f87171;font-size:12px;font-weight:600;margin-bottom:10px;">
-                                    âŒ Last Sync Error &nbsp;Â·&nbsp; ${product.sync_attempts} attempt${product.sync_attempts !== 1 ? 's' : ''}
+                                     Last Sync Error &nbsp;&nbsp; ${product.sync_attempts} attempt${product.sync_attempts !== 1 ? 's' : ''}
                                 </div>
                                 <pre style="margin:0;color:#fecaca;font-size:12px;line-height:1.6;white-space:pre-wrap;">${syncError}</pre>
                             </div>`;
                 })();
 
-                // â”€â”€ render tabbed modal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                //  render tabbed modal 
                 document.getElementById('modalBody').innerHTML = `
                     <style>
                         .pd-tabs { display:flex; gap:0; border-bottom:2px solid #e2e8f0; margin-bottom:16px; }
@@ -3527,11 +3562,11 @@
                         .pd-panel.active { display:block; }
                     </style>
                     <div class="pd-tabs">
-                        <button class="pd-tab active"   onclick="pdSwitchTab(event,'pd-overview')">ðŸ“‹ Overview</button>
-                        <button class="pd-tab"          onclick="pdSwitchTab(event,'pd-fetch')">ðŸ“¥ Fetch Data</button>
-                        <button class="pd-tab"          onclick="pdSwitchTab(event,'pd-sync')">ðŸ“¤ Sync Response</button>
+                        <button class="pd-tab active"   onclick="pdSwitchTab(event,'pd-overview')"> Overview</button>
+                        <button class="pd-tab"          onclick="pdSwitchTab(event,'pd-fetch')"> Fetch Data</button>
+                        <button class="pd-tab"          onclick="pdSwitchTab(event,'pd-sync')"> Sync Response</button>
                         <button class="pd-tab error-tab ${hasError ? 'has-error' : ''}" onclick="pdSwitchTab(event,'pd-error')">
-                            ${hasError ? 'âŒ' : 'âœ…'} Error Log ${hasError ? `<span style="background:#dc2626;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">${product.sync_attempts}</span>` : ''}
+                            Error Log ${hasError ? `<span style="background:#dc2626;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">${product.sync_attempts}</span>` : ''}
                         </button>
                     </div>
                     <div id="pd-overview" class="pd-panel active">${overviewHtml}</div>
@@ -3595,42 +3630,42 @@
                 const syncError = invoice.last_sync_error || null;
 
                 document.getElementById('modalTitle').innerHTML =
-                    `🧾 ${invoice.voucher_no} &nbsp;<span style="font-size:13px;font-weight:400;padding:3px 10px;border-radius:12px;background:${isSynced ? '#d1fae5' : '#fee2e2'};color:${isSynced ? '#065f46' : '#991b1b'}">${isSynced ? '✅ Synced' : '⏳ Pending'}</span>`;
+                    ` ${invoice.voucher_no} &nbsp;<span style="font-size:13px;font-weight:400;padding:3px 10px;border-radius:12px;background:${isSynced ? '#d1fae5' : '#fee2e2'};color:${isSynced ? '#065f46' : '#991b1b'}">${isSynced ? ' Synced' : ' Pending'}</span>`;
 
                 const overviewHtml = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
-                    ${[['🏢 Company', invoice.tally_company || '—'], ['📅 Date', invoice.voucher_date || '—'], ['👤 Customer', invoice.customer_name || '—'],
-                    ['💰 Amount', 'INR ' + (invoice.total_amount ?? '—')], ['🧾 DC No', invoice.dc_no || '—'], ['🆔 Catalytics DC', invoice.catalytics_dc_id || '—'],
-                    ['🔁 Attempts', invoice.sync_attempts ?? '—'], ['📥 First Fetched', invoice.first_fetched_at ? new Date(invoice.first_fetched_at).toLocaleString() : '—'],
-                    ['✅ Last Synced', invoice.last_sync_at ? new Date(invoice.last_sync_at).toLocaleString() : '—']]
+                    ${[['Company', invoice.tally_company || '-'], ['Date', invoice.voucher_date || '-'], ['Customer', invoice.customer_name || '-'],
+                    ['Amount', 'INR ' + (invoice.total_amount ?? '-')], ['DC No', invoice.dc_no || '-'], ['Catalytics DC', invoice.catalytics_dc_id || '-'],
+                    ['Attempts', invoice.sync_attempts ?? '-'], ['First Fetched', invoice.first_fetched_at ? new Date(invoice.first_fetched_at).toLocaleString() : ''],
+                    ['Last Synced', invoice.last_sync_at ? new Date(invoice.last_sync_at).toLocaleString() : '']]
                         .map(([l, v]) => `<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px"><div style="font-size:11px;color:#64748b;margin-bottom:4px">${l}</div><div style="font-size:13px;font-weight:600;color:#1e293b;word-break:break-all">${v}</div></div>`).join('')}
                 </div>`;
 
                 const fetchHtml = fetchDataText
                     ? `<div style="background:#0f172a;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><pre style="margin:0;color:#a5f3fc;font-size:12px;line-height:1.6;white-space:pre-wrap">${fetchDataText}</pre></div>`
-                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px">📭 No fetch data stored yet.</div>`;
+                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px"> No fetch data stored yet.</div>`;
 
                 const itemsHtml = itemsText
                     ? `<div style="background:#0d1b2a;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><pre style="margin:0;color:#93c5fd;font-size:12px;line-height:1.6;white-space:pre-wrap">${itemsText}</pre></div>`
-                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px">📭 No items saved.</div>`;
+                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px"> No items saved.</div>`;
 
                 const syncHtml = isSynced && syncRespText
-                    ? `<div style="background:#052e16;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#4ade80;font-size:12px;font-weight:600;margin-bottom:10px">✅ Sync Successful — Catalytics Response</div><pre style="margin:0;color:#bbf7d0;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncRespText}</pre></div>`
+                    ? `<div style="background:#052e16;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#4ade80;font-size:12px;font-weight:600;margin-bottom:10px"> Sync Successful  Catalytics Response</div><pre style="margin:0;color:#bbf7d0;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncRespText}</pre></div>`
                     : syncRespText
-                        ? `<div style="background:#1c1917;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#fbbf24;font-size:12px;font-weight:600;margin-bottom:10px">⚠️ Last Sync Response (Not Accepted)</div><pre style="margin:0;color:#fde68a;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncRespText}</pre></div>`
-                        : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px">📭 No sync response yet.</div>`;
+                        ? `<div style="background:#1c1917;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#fbbf24;font-size:12px;font-weight:600;margin-bottom:10px"> Last Sync Response (Not Accepted)</div><pre style="margin:0;color:#fde68a;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncRespText}</pre></div>`
+                        : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px"> No sync response yet.</div>`;
 
                 const errorHtml = hasError
-                    ? `<div style="background:#450a0a;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#f87171;font-size:12px;font-weight:600;margin-bottom:10px">❌ Last Sync Error &nbsp;·&nbsp; ${invoice.sync_attempts} attempt${invoice.sync_attempts !== 1 ? 's' : ''}</div><pre style="margin:0;color:#fecaca;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncError}</pre></div>`
-                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px">✅ No errors recorded.</div>`;
+                    ? `<div style="background:#450a0a;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><div style="color:#f87171;font-size:12px;font-weight:600;margin-bottom:10px"> Last Sync Error &nbsp;&nbsp; ${invoice.sync_attempts} attempt${invoice.sync_attempts !== 1 ? 's' : ''}</div><pre style="margin:0;color:#fecaca;font-size:12px;line-height:1.6;white-space:pre-wrap">${syncError}</pre></div>`
+                    : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px"> No errors recorded.</div>`;
 
                 document.getElementById('modalBody').innerHTML = `
                     <style>.pd-tabs{display:flex;gap:0;border-bottom:2px solid #e2e8f0;margin-bottom:16px}.pd-tab{padding:8px 18px;font-size:13px;font-weight:600;cursor:pointer;color:#64748b;border-bottom:3px solid transparent;margin-bottom:-2px;transition:all .2s;background:none;border-top:none;border-left:none;border-right:none}.pd-tab:hover{color:#4f46e5}.pd-tab.active{color:#4f46e5;border-bottom-color:#4f46e5}.pd-tab.error-tab.has-error{color:#dc2626}.pd-tab.error-tab.has-error.active{border-bottom-color:#dc2626}.pd-panel{display:none}.pd-panel.active{display:block}</style>
                     <div class="pd-tabs">
-                        <button class="pd-tab active" onclick="pdSwitchTab(event,'pd-overview')">📋 Overview</button>
-                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-fetch')">📥 Fetch Data</button>
-                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-items')">📦 Items</button>
-                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-sync')">📤 Sync Response</button>
-                        <button class="pd-tab error-tab ${hasError ? 'has-error' : ''}" onclick="pdSwitchTab(event,'pd-error')">${hasError ? '❌' : '✅'} Error Log ${hasError ? `<span style="background:#dc2626;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px">${invoice.sync_attempts}</span>` : ''}</button>
+                        <button class="pd-tab active" onclick="pdSwitchTab(event,'pd-overview')"> Overview</button>
+                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-fetch')"> Fetch Data</button>
+                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-items')"> Items</button>
+                        <button class="pd-tab" onclick="pdSwitchTab(event,'pd-sync')"> Sync Response</button>
+                        <button class="pd-tab error-tab ${hasError ? 'has-error' : ''}" onclick="pdSwitchTab(event,'pd-error')">Error Log ${hasError ? `<span style="background:#dc2626;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px">${invoice.sync_attempts}</span>` : ''}</button>
                     </div>
                     <div id="pd-overview" class="pd-panel active">${overviewHtml}</div>
                     <div id="pd-fetch" class="pd-panel">${fetchHtml}</div>
@@ -3766,16 +3801,16 @@
                         const data = await response.json();
 
                         if (data.success) {
-                            alert(`âœ… ${data.message}`);
+                            alert(` ${data.message}`);
                             selectedSet.clear();
                             updateSelectionUI(type);
                             await fetchDataTables();
                             await fetchActivity();
                         } else {
-                            alert(`âŒ Error: ${data.error}`);
+                            alert(` Error: ${data.error}`);
                         }
                     } catch (error) {
-                        alert(`âŒ Error: ${error.message}`);
+                        alert(` Error: ${error.message}`);
                     }
                 }
             );
@@ -3803,16 +3838,16 @@
                         const data = await response.json();
 
                         if (data.success) {
-                            alert(`âœ… ${data.message}`);
+                            alert(` ${data.message}`);
                             selectedSet.clear();
                             updateSelectionUI(type);
                             await fetchDataTables();
                             await fetchActivity();
                         } else {
-                            alert(`âŒ Error: ${data.error}`);
+                            alert(` Error: ${data.error}`);
                         }
                     } catch (error) {
-                        alert(`âŒ Error: ${error.message}`);
+                        alert(` Error: ${error.message}`);
                     }
                 },
                 true // isDanger
@@ -4013,7 +4048,7 @@
             const container = document.getElementById('diagnosticsContainer');
 
             btn.disabled = true;
-            btn.textContent = 'â³ Loading...';
+            btn.textContent = ' Loading...';
             container.innerHTML = '<div style="text-align: center; padding: 20px; color: #999;">Loading diagnostics...</div>';
 
             try {
@@ -4021,15 +4056,15 @@
                 const data = await response.json();
 
                 if (data.error) {
-                    container.innerHTML = `<div class="match-overall warning"><h3>âŒ Error</h3><p>${data.error}</p></div>`;
+                    container.innerHTML = `<div class="match-overall warning"><h3>Error</h3><p>${data.error}</p></div>`;
                 } else {
                     displayDiagnostics(data);
                 }
             } catch (error) {
-                container.innerHTML = `<div class="match-overall warning"><h3>âŒ Error</h3><p>${error.message}</p></div>`;
+                container.innerHTML = `<div class="match-overall warning"><h3>Error</h3><p>${error.message}</p></div>`;
             } finally {
                 btn.disabled = false;
-                btn.textContent = 'ðŸ”„ Refresh Diagnostics';
+                btn.textContent = ' Refresh Diagnostics';
             }
         }
 
@@ -4044,14 +4079,14 @@
 
             // Connections
             html += `<div class="diag-section">`;
-            html += `<h3>ðŸ”Œ Connections</h3>`;
+            html += `<h3>Connections</h3>`;
             html += `<div class="diag-grid">`;
 
             // Tally
             const tallyStatus = data.connections.tally.status;
             html += `<div class="diag-item ${tallyStatus === 'online' ? 'success' : 'error'}">`;
             html += `<div class="diag-label">Tally Server</div>`;
-            html += `<div class="diag-value">${tallyStatus === 'online' ? 'ðŸŸ¢ Online' : 'ðŸ”´ Offline'}</div>`;
+            html += `<div class="diag-value">${tallyStatus === 'online' ? ' Online' : ' Offline'}</div>`;
             if (tallyStatus === 'online') {
                 html += `<div class="diag-detail">${data.connections.tally.response_time_ms}ms</div>`;
             } else {
@@ -4063,7 +4098,7 @@
             const catStatus = data.connections.catalytics.status;
             html += `<div class="diag-item ${catStatus === 'online' ? 'success' : 'error'}">`;
             html += `<div class="diag-label">Catalytics Backend</div>`;
-            html += `<div class="diag-value">${catStatus === 'online' ? 'ðŸŸ¢ Online' : 'ðŸ”´ Offline'}</div>`;
+            html += `<div class="diag-value">${catStatus === 'online' ? ' Online' : ' Offline'}</div>`;
             if (catStatus === 'online') {
                 html += `<div class="diag-detail">${data.connections.catalytics.response_time_ms}ms</div>`;
             } else {
@@ -4075,7 +4110,7 @@
 
             // Database Stats
             html += `<div class="diag-section">`;
-            html += `<h3>ðŸ’¾ Database Statistics</h3>`;
+            html += `<h3>Database Statistics</h3>`;
             html += `<div class="diag-stat-row">`;
             html += `<span>Database Size:</span><strong>${data.database.size_mb} MB</strong>`;
             html += `</div>`;
@@ -4106,7 +4141,7 @@
 
             // Last Sync
             html += `<div class="diag-section">`;
-            html += `<h3>ðŸ•’ Last Sync Times</h3>`;
+            html += `<h3>Last Sync Times</h3>`;
             html += `<div class="diag-stat-row"><span>Customers:</span><strong>${data.last_sync.customers}</strong></div>`;
             html += `<div class="diag-stat-row"><span>Products:</span><strong>${data.last_sync.products}</strong></div>`;
             html += `<div class="diag-stat-row"><span>Invoices:</span><strong>${data.last_sync.invoices}</strong></div>`;
@@ -4115,7 +4150,7 @@
             // Errors
             if (data.errors.recent_count > 0) {
                 html += `<div class="diag-section">`;
-                html += `<h3>âš ï¸ Recent Errors (${data.errors.recent_count})</h3>`;
+                html += `<h3>Recent Errors (${data.errors.recent_count})</h3>`;
                 for (const err of data.errors.items.slice(0, 5)) {
                     html += `<div class="diag-error">`;
                     html += `<div class="diag-error-header">`;
@@ -4129,7 +4164,7 @@
                 html += `</div>`;
             } else {
                 html += `<div class="diag-section">`;
-                html += `<h3>âœ… No Recent Errors</h3>`;
+                html += `<h3>No Recent Errors</h3>`;
                 html += `<p style="color: #10b981;">All syncs completed successfully!</p>`;
                 html += `</div>`;
             }
@@ -4146,7 +4181,7 @@
 
             // Disable button and show loading
             btn.disabled = true;
-            btn.textContent = 'â³ Verifying Data...';
+            btn.textContent = ' Verifying Data...';
             container.style.display = 'block';
             resultsDiv.innerHTML = '<div style="text-align: center; padding: 40px; color: #999;">Running data verification...</div>';
 
@@ -4161,13 +4196,13 @@
                     displayMatchResults(data.results);
                     await fetchActivity();
                 } else {
-                    resultsDiv.innerHTML = `<div class="match-overall warning"><h3>âŒ Verification Failed</h3><p>${data.error}</p></div>`;
+                    resultsDiv.innerHTML = `<div class="match-overall warning"><h3>Verification Failed</h3><p>${data.error}</p></div>`;
                 }
             } catch (error) {
-                resultsDiv.innerHTML = `<div class="match-overall warning"><h3>âŒ Error</h3><p>${error.message}</p></div>`;
+                resultsDiv.innerHTML = `<div class="match-overall warning"><h3>Error</h3><p>${error.message}</p></div>`;
             } finally {
                 btn.disabled = false;
-                btn.textContent = 'ðŸ” Verify Data Matching';
+                btn.textContent = ' Verify Data Matching';
             }
         }
 
@@ -4179,7 +4214,7 @@
 
             // Overall summary
             html += `<div class="match-overall ${overallMatch ? 'success' : 'warning'}">`;
-            html += `<h3>${overallMatch ? 'âœ… All Data Matches!' : 'âš ï¸ Mismatches Detected'}</h3>`;
+            html += `<h3>${overallMatch ? ' All Data Matches!' : ' Mismatches Detected'}</h3>`;
             html += `<p>Verification completed at ${new Date(results.timestamp).toLocaleString()}</p>`;
             html += `</div>`;
 
@@ -4190,8 +4225,8 @@
             if (results.customers) {
                 const cMatch = results.customers.count_match;
                 html += `<div class="match-card ${cMatch ? 'match' : 'mismatch'}">`;
-                html += `<h3>ðŸ‘¥ Customers</h3>`;
-                html += `<div class="count">${cMatch ? 'âœ…' : 'âš ï¸'}</div>`;
+                html += `<h3>Customers</h3>`;
+                html += `<div class="count">${cMatch ? '' : ''}</div>`;
                 html += `<div class="detail">SQLite: ${results.customers.sqlite_synced}</div>`;
                 html += `<div class="detail">Catalytics: ${results.customers.catalytics_total}</div>`;
                 if (!cMatch) {
@@ -4204,8 +4239,8 @@
             if (results.products) {
                 const pMatch = results.products.count_match;
                 html += `<div class="match-card ${pMatch ? 'match' : 'mismatch'}">`;
-                html += `<h3>ðŸ“¦ Products</h3>`;
-                html += `<div class="count">${pMatch ? 'âœ…' : 'âš ï¸'}</div>`;
+                html += `<h3>Products</h3>`;
+                html += `<div class="count">${pMatch ? '' : ''}</div>`;
                 html += `<div class="detail">SQLite: ${results.products.sqlite_synced}</div>`;
                 html += `<div class="detail">Catalytics: ${results.products.catalytics_total}</div>`;
                 if (!pMatch) {
@@ -4218,8 +4253,8 @@
             if (results.invoices) {
                 const iMatch = results.invoices.count_match;
                 html += `<div class="match-card ${iMatch ? 'match' : 'mismatch'}">`;
-                html += `<h3>ðŸ§¾ Invoices</h3>`;
-                html += `<div class="count">${iMatch ? 'âœ…' : 'âš ï¸'}</div>`;
+                html += `<h3>Invoices</h3>`;
+                html += `<div class="count">${iMatch ? '' : ''}</div>`;
                 html += `<div class="detail">SQLite: ${results.invoices.sqlite_synced}</div>`;
                 html += `<div class="detail">Catalytics: ${results.invoices.catalytics_total}</div>`;
                 if (!iMatch) {
@@ -4232,7 +4267,7 @@
 
             // Detailed table
             html += `<div class="match-details">`;
-            html += `<h4>ðŸ“‹ Detailed Breakdown</h4>`;
+            html += `<h4>Detailed Breakdown</h4>`;
             html += `<table class="match-table">`;
             html += `<thead><tr><th>Entity</th><th>SQLite Total</th><th>SQLite Synced</th><th>Catalytics Total</th><th>Status</th></tr></thead>`;
             html += `<tbody>`;
@@ -4244,7 +4279,7 @@
                 html += `<td>${c.sqlite_total}</td>`;
                 html += `<td>${c.sqlite_synced}</td>`;
                 html += `<td>${c.catalytics_total}</td>`;
-                html += `<td>${c.count_match ? '<span style="color: #10b981;">âœ… Match</span>' : '<span style="color: #ef4444;">âš ï¸ Mismatch</span>'}</td>`;
+                html += `<td>${c.count_match ? '<span style="color: #10b981;"> Match</span>' : '<span style="color: #ef4444;"> Mismatch</span>'}</td>`;
                 html += `</tr>`;
             }
 
@@ -4255,7 +4290,7 @@
                 html += `<td>${p.sqlite_total}</td>`;
                 html += `<td>${p.sqlite_synced}</td>`;
                 html += `<td>${p.catalytics_total}</td>`;
-                html += `<td>${p.count_match ? '<span style="color: #10b981;">âœ… Match</span>' : '<span style="color: #ef4444;">âš ï¸ Mismatch</span>'}</td>`;
+                html += `<td>${p.count_match ? '<span style="color: #10b981;"> Match</span>' : '<span style="color: #ef4444;"> Mismatch</span>'}</td>`;
                 html += `</tr>`;
             }
 
@@ -4266,7 +4301,7 @@
                 html += `<td>${i.sqlite_total}</td>`;
                 html += `<td>${i.sqlite_synced}</td>`;
                 html += `<td>${i.catalytics_total}</td>`;
-                html += `<td>${i.count_match ? '<span style="color: #10b981;">âœ… Match</span>' : '<span style="color: #ef4444;">âš ï¸ Mismatch</span>'}</td>`;
+                html += `<td>${i.count_match ? '<span style="color: #10b981;"> Match</span>' : '<span style="color: #ef4444;"> Mismatch</span>'}</td>`;
                 html += `</tr>`;
             }
 
@@ -4276,7 +4311,7 @@
             // Action recommendations
             if (!overallMatch) {
                 html += `<div style="margin-top: 20px; padding: 16px; background: #fef3c7; border-left: 4px solid #f59e0b; border-radius: 6px;">`;
-                html += `<strong>âš¡ Recommended Actions:</strong>`;
+                html += `<strong> Recommended Actions:</strong>`;
                 html += `<ul style="margin-top: 8px; margin-left: 20px; font-size: 13px;">`;
                 html += `<li>Check sync logs for errors</li>`;
                 html += `<li>Verify Catalytics API connectivity</li>`;
@@ -4363,14 +4398,14 @@
                 const data = await response.json();
 
                 if (data.success) {
-                    alert('âœ… ' + data.message);
+                    alert('' + data.message);
                     await fetchAutomationStatus();
                     await fetchActivity();
                 } else {
-                    alert('âš ï¸ ' + data.message);
+                    alert('' + data.message);
                 }
             } catch (error) {
-                alert('âŒ Error starting automation: ' + error.message);
+                alert('Error starting automation: ' + error.message);
             }
         }
 
@@ -4384,14 +4419,14 @@
                 const data = await response.json();
 
                 if (data.success) {
-                    alert('âœ… ' + data.message);
+                    alert('' + data.message);
                     await fetchAutomationStatus();
                     await fetchActivity();
                 } else {
-                    alert('âš ï¸ ' + data.message);
+                    alert('' + data.message);
                 }
             } catch (error) {
-                alert('âŒ Error stopping automation: ' + error.message);
+                alert('Error stopping automation: ' + error.message);
             }
         }
 
@@ -4405,14 +4440,14 @@
                 const data = await response.json();
 
                 if (data.success) {
-                    alert('âœ… ' + data.message);
+                    alert('' + data.message);
                     await fetchAutomationStatus();
                     await fetchActivity();
                 } else {
-                    alert('âš ï¸ ' + data.message);
+                    alert('' + data.message);
                 }
             } catch (error) {
-                alert('âŒ Error restarting automation: ' + error.message);
+                alert('Error restarting automation: ' + error.message);
             }
         }
 
@@ -4425,7 +4460,7 @@
 
             // Validate
             if (intervals.fetch_master < 30 || intervals.fetch_invoices < 30 || intervals.sync < 30) {
-                alert('âš ï¸ All intervals must be at least 30 seconds');
+                alert('All intervals must be at least 30 seconds');
                 return;
             }
 
@@ -4443,14 +4478,14 @@
                 const data = await response.json();
 
                 if (data.success) {
-                    alert('âœ… ' + data.message);
+                    alert('' + data.message);
                     await fetchAutomationStatus();
                     await fetchActivity();
                 } else {
-                    alert('âš ï¸ ' + data.message);
+                    alert('' + data.message);
                 }
             } catch (error) {
-                alert('âŒ Error updating intervals: ' + error.message);
+                alert('Error updating intervals: ' + error.message);
             }
         }
 

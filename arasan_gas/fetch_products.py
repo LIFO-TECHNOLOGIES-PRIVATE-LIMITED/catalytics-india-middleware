@@ -14,8 +14,9 @@ Type codes configured via PRODUCT_TYPE_MAP in .env:
 import re
 import json
 import logging
+from pathlib import Path
 from datetime import datetime
-from config import config
+from config import config, BASE_DIR
 from db import Database
 from tally_client import TallyClient
 
@@ -25,6 +26,25 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+def _attach_product_fetch_file_handler():
+    """Ensure product fetch logs also go to a dedicated file."""
+    log_path = Path(BASE_DIR) / 'logs' / 'product_fetch.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'product_fetch_file':
+            return
+
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    file_handler.name = 'product_fetch_file'
+    logger.addHandler(file_handler)
+
+
+_attach_product_fetch_file_handler()
 
 # Regex: <PRODUCT NAME> <QTY> <UNIT> (<TYPE_CODE>)
 # Examples:

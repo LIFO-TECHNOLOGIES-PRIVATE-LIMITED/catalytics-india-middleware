@@ -228,6 +228,9 @@ def parse_ledgers(response_xml: str):
                 for child in ledger:
                     if child.tag.endswith(".LIST"):
                         continue
+                    # Skip NAME child element - we already got it from the attribute
+                    if child.tag.upper() == "NAME":
+                        continue
                     # Handle special character encoding in PARENT
                     if child.tag == "PARENT" and child.text:
                         # Clean up special characters like &#4;
@@ -261,6 +264,9 @@ def parse_ledgers(response_xml: str):
             for child in ledger:
                 if child.tag.endswith(".LIST"):
                     continue
+                # Skip NAME child element - we already got it from the attribute
+                if child.tag.upper() == "NAME":
+                    continue
                 data[child.tag.upper()] = (child.text or "").strip()
 
             # Correct way to read addresses
@@ -279,12 +285,13 @@ def parse_ledgers(response_xml: str):
 
 
 
-def get_sundry_debtors(company_name: str, url: Optional[str] = None):
+def get_sundry_debtors(company_name: str, url: Optional[str] = None, group_name: str = "Sundry Debtors"):
     """Fetch only Sundry Debtors ledgers (including sub-groups) from Tally.
     Uses CHILDOF + BELONGSTO to filter at Tally level — much more efficient
     than fetching all ledgers and filtering in Python."""
     from xml.sax.saxutils import escape as xml_escape
     safe_company = xml_escape(company_name)
+    safe_group = xml_escape(group_name or "Sundry Debtors")
     xml = f"""
 <ENVELOPE>
   <HEADER>
@@ -302,7 +309,7 @@ def get_sundry_debtors(company_name: str, url: Optional[str] = None):
         <TDLMESSAGE>
           <COLLECTION ISMODIFY="No" ISFIXED="No" ISINITIALIZE="Yes" ISOPTION="No" ISINTERNAL="No" NAME="SundryDebtorLedgers">
             <TYPE>Ledger</TYPE>
-            <CHILDOF>Sundry Debtors</CHILDOF>
+            <CHILDOF>{safe_group}</CHILDOF>
             <BELONGSTO>Yes</BELONGSTO>
             <NATIVEMETHOD>Name</NATIVEMETHOD>
             <NATIVEMETHOD>GUID</NATIVEMETHOD>
@@ -330,6 +337,25 @@ def get_sundry_debtors(company_name: str, url: Optional[str] = None):
 """
     resp = send_request(xml, url)
     return parse_ledgers(resp)
+
+def get_customer_ledgers(company_name: str, url: Optional[str] = None, group_names: Optional[List[str]] = None):
+    """Fetch customer ledgers from one or more Tally groups."""
+    groups = [g.strip() for g in (group_names or []) if g and g.strip()]
+    if not groups:
+        groups = ["Sundry Debtors"]
+
+    seen = {}
+    for group in groups:
+        ledgers = get_sundry_debtors(company_name, url, group_name=group)
+        for ledger in ledgers:
+            key = ledger.get("GUID") or ledger.get("NAME") or ""
+            if not key:
+                continue
+            if key in seen:
+                continue
+            seen[key] = ledger
+
+    return list(seen.values())
 
 
 def get_ledgers(company_name: str, url: Optional[str] = None):
@@ -526,10 +552,9 @@ def parse_stock_items_full(response_xml: str) -> List[Dict]:
         for stock in collection:
             if stock.tag == "STOCKITEM":
                 data = {}
+                # Try to get NAME from attribute first
                 item_name = stock.get("NAME", "")
-                if item_name:
-                    data["NAME"] = item_name
-
+                
                 # Parse all children including nested lists
                 for child in stock:
                     tag = child.tag.upper()
@@ -542,6 +567,10 @@ def parse_stock_items_full(response_xml: str) -> List[Dict]:
                             data[list_name].append(list_item)
                     else:
                         data[tag] = (child.text or "").strip()
+
+                # Set NAME from attribute if not already set by child element
+                if not data.get("NAME") and item_name:
+                    data["NAME"] = item_name
 
                 _extract_hsn_and_gst(data)
 
@@ -557,9 +586,8 @@ def parse_stock_items_full(response_xml: str) -> List[Dict]:
     if not items:
         for stock in root.findall(".//STOCKITEM"):
             data = {}
+            # Try to get NAME from attribute first
             item_name = stock.get("NAME", "")
-            if item_name:
-                data["NAME"] = item_name
 
             for child in stock:
                 tag = child.tag.upper()
@@ -572,6 +600,10 @@ def parse_stock_items_full(response_xml: str) -> List[Dict]:
                         data[list_name].append(list_item)
                 else:
                     data[tag] = (child.text or "").strip()
+
+            # Set NAME from attribute if not already set by child element
+            if not data.get("NAME") and item_name:
+                data["NAME"] = item_name
 
             _extract_hsn_and_gst(data)
 
@@ -1333,27 +1365,42 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
     return vouchers
 
 
-def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: str = "20240101", to_date: str = "20991231"):
+def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: str = "20240101", to_date: str = "20991231") -> List[Dict]:
     """
-    Fetch Sales Invoices from Tally company using Collection object export.
-
-    Strategy:
-      1. Fetch all active voucher types whose parent is Sales, then query each
-         voucher type with exact match (supports custom sales voucher types).
-      2. Fall back to CONTAINS "Invoice" and CONTAINS "Sales" filters.
-
-    The old "Export Data / Voucher Register" approach is NOT used here because
-    it returns a tabular report (not VOUCHER objects), so parse_delivery_notes
-    cannot reliably parse voucher objects.
+    Fetch sales/invoice vouchers (including custom types like IO-) via a broad Voucher
+    Collection, then normalize to middleware invoice schema. This bypasses prior
+    parse issues with Voucher Register exports.
     """
-    def _collection_xml(filter_formula: str) -> str:
-        return f"""
+    def _pqty(val):
+        try:
+            return float(str(val).split()[0].replace(',', ''))
+        except Exception:
+            return 0.0
+
+    def _prate(val):
+        try:
+            s = str(val).replace(',', '').strip()
+            if '/' in s:
+                s = s.split('/')[0].strip()
+            if s:
+                s = s.split()[0]
+            return float(s)
+        except Exception:
+            return 0.0
+
+    allowed_exact = {'io-', 'io'}
+    try:
+        allowed_sales_types = {v.lower() for v in get_sales_voucher_types(company_name, url)}
+    except Exception:
+        allowed_sales_types = set()
+
+    collection_xml = f"""
 <ENVELOPE>
   <HEADER>
     <VERSION>1</VERSION>
     <TALLYREQUEST>Export</TALLYREQUEST>
     <TYPE>Collection</TYPE>
-    <ID>SalesVouchers</ID>
+    <ID>SalesVouchersAll</ID>
   </HEADER>
   <BODY>
     <DESC>
@@ -1364,118 +1411,139 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
       </STATICVARIABLES>
       <TDL>
         <TDLMESSAGE>
-          <COLLECTION ISMODIFY="No" NAME="SalesVouchers">
+          <COLLECTION ISMODIFY="No" NAME="SalesVouchersAll">
             <TYPE>Voucher</TYPE>
-            <FILTERS>InvFilter</FILTERS>
-            <FETCH>*</FETCH>
-            <FETCH>INVENTORYENTRIES.STOCKITEMNAME</FETCH>
-            <FETCH>INVENTORYENTRIES.RATE</FETCH>
-            <FETCH>INVENTORYENTRIES.AMOUNT</FETCH>
-            <FETCH>INVENTORYENTRIES.ACTUALQTY</FETCH>
+            <FETCH>GUID</FETCH>
+            <FETCH>VoucherNumber</FETCH>
+            <FETCH>VouchertypeName</FETCH>
+            <FETCH>Date</FETCH>
+            <FETCH>PartyLedgerName</FETCH>
+            <FETCH>Reference</FETCH>
+            <FETCH>VoucherReference</FETCH>
+            <FETCH>OtherReference</FETCH>
+            <FETCH>PartyOrderNo</FETCH>
+            <FETCH>PartyOrderDate</FETCH>
+            <FETCH>PONumber</FETCH>
+            <FETCH>DispatchedThrough</FETCH>
+            <FETCH>MotorVehicleNo</FETCH>
+            <FETCH>BasicShippedBy</FETCH>
+            <FETCH>TermsOfDelivery</FETCH>
+            <FETCH>Narration</FETCH>
+            <FETCH>Consignee.Name</FETCH>
+            <FETCH>Consignee.Address</FETCH>
+            <FETCH>BasicBuyerName</FETCH>
+            <FETCH>BasicBuyerPartyName</FETCH>
+            <FETCH>DSPVCHNUMBER</FETCH>
+            <FETCH>DSPVCHNO</FETCH>
             <FETCH>ALLINVENTORYENTRIES.STOCKITEMNAME</FETCH>
+            <FETCH>ALLINVENTORYENTRIES.ACTUALQTY</FETCH>
             <FETCH>ALLINVENTORYENTRIES.RATE</FETCH>
             <FETCH>ALLINVENTORYENTRIES.AMOUNT</FETCH>
-            <FETCH>ALLINVENTORYENTRIES.ACTUALQTY</FETCH>
             <FETCH>LEDGERENTRIES.LEDGERNAME</FETCH>
             <FETCH>LEDGERENTRIES.AMOUNT</FETCH>
-            <FETCH>LEDGERENTRIES.ISDEEMEDPOSITIVE</FETCH>
-            <FETCH>ALLLEDGERENTRIES.LEDGERNAME</FETCH>
-            <FETCH>ALLLEDGERENTRIES.AMOUNT</FETCH>
-            <FETCH>ALLLEDGERENTRIES.ISDEEMEDPOSITIVE</FETCH>
           </COLLECTION>
-          <SYSTEM TYPE="Formulae" NAME="InvFilter">{filter_formula}</SYSTEM>
         </TDLMESSAGE>
       </TDL>
     </DESC>
   </BODY>
 </ENVELOPE>
 """
-
-    def _dedupe_merge(base: List[Dict], new_rows: List[Dict]) -> List[Dict]:
-        seen = {
-            (
-                (r.get("GUID") or "").strip(),
-                (r.get("VOUCHERNUMBER") or "").strip(),
-                (r.get("DATE") or "").strip(),
-                (r.get("PARTYLEDGERNAME") or "").strip(),
-            )
-            for r in base
-        }
-        for r in new_rows:
-            key = (
-                (r.get("GUID") or "").strip(),
-                (r.get("VOUCHERNUMBER") or "").strip(),
-                (r.get("DATE") or "").strip(),
-                (r.get("PARTYLEDGERNAME") or "").strip(),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            base.append(r)
-        return base
-
-    collected: List[Dict] = []
-
-    # Method 1: dynamic exact match for all active Sales voucher types.
-    # NOTE: Do NOT add $$IsBetween here. Tally Collection type=Voucher already
-    # respects SVFROMDATE/SVTODATE set in STATICVARIABLES.
-    dynamic_types: List[str] = []
     try:
-        dynamic_types = get_sales_voucher_types(company_name, url)
-        if dynamic_types:
-            logger.info(
-                "Detected %d active Sales voucher types for company '%s': %s",
-                len(dynamic_types), company_name, ", ".join(dynamic_types)
-            )
-    except Exception as exc:
-        logger.warning("Could not fetch dynamic Sales voucher types for '%s': %s", company_name, exc)
+        resp = send_request(collection_xml, url)
+        root = ET.fromstring(_clean_invalid_char_refs(resp))
+        vouchers: List[Dict] = []
+        for vch in root.findall('.//VOUCHER'):
+            data: Dict[str, any] = {}
+            for k, v in vch.attrib.items():
+                data[k.upper()] = v.strip() if isinstance(v, str) else v
+            for child in vch:
+                if child.tag.endswith('.LIST'):
+                    continue
+                data[child.tag.upper()] = (child.text or '').strip()
 
-    # Safe fallback list if dynamic fetch fails/returns empty.
-    if not dynamic_types:
-        dynamic_types = ["Sales Invoice", "Tax Invoice", "Sales"]
+            vt = (data.get('VOUCHERTYPENAME') or data.get('VOUCHERTYPE') or '').strip()
+            if not vt:
+                vt = (vch.get('VOUCHERTYPENAME') or vch.get('VOUCHERTYPE') or '').strip()
+            vt_lower = vt.lower()
+            if not (
+                ('sale' in vt_lower)
+                or ('invoice' in vt_lower)
+                or (vt_lower in allowed_exact)
+                or (allowed_sales_types and vt_lower in allowed_sales_types)
+            ):
+                continue
+            # collect inventory
+            inventory = []
+            for inv in vch.findall('.//ALLINVENTORYENTRIES.LIST'):
+                item = {ch.tag.upper(): (ch.text or '').strip() for ch in inv if not ch.tag.endswith('.LIST')}
+                if item:
+                    inventory.append(item)
+            data['INVENTORY'] = inventory
+            # ledger entries
+            ledgers = []
+            for le in vch.findall('.//LEDGERENTRIES.LIST'):
+                item = {ch.tag.upper(): (ch.text or '').strip() for ch in le if not ch.tag.endswith('.LIST')}
+                if item:
+                    ledgers.append(item)
+            data['LEDGERENTRIES'] = ledgers
+            vouchers.append(data)
 
-    for voucher_type in dynamic_types:
-        formula = f'$VoucherTypeName = "{voucher_type}"'
-        try:
-            resp = send_request(_collection_xml(formula), url)
-            logger.debug("Sales invoices response (type=%s, company=%s): %s",
-                         voucher_type, company_name, resp[:500])
-            vouchers = parse_delivery_notes(resp)
-            if vouchers:
-                logger.info("Found %d invoices for company '%s' using exact type '%s'",
-                            len(vouchers), company_name, voucher_type)
-                collected = _dedupe_merge(collected, vouchers)
-        except Exception as exc:
-            logger.warning("Fetch failed for type '%s' company '%s': %s",
-                           voucher_type, company_name, exc)
-
-    # Method 2: CONTAINS fallback (catches edge/custom naming).
-    for term in ("Invoice", "Sales"):
-        formula = f'$VoucherTypeName CONTAINS "{term}"'
-        try:
-            resp = send_request(_collection_xml(formula), url)
-            logger.debug("Sales invoices response (CONTAINS '%s', company=%s): %s",
-                         term, company_name, resp[:500])
-            vouchers = parse_delivery_notes(resp)
-            if vouchers:
-                logger.info("Found %d invoices for company '%s' using CONTAINS '%s'",
-                            len(vouchers), company_name, term)
-                collected = _dedupe_merge(collected, vouchers)
-        except Exception as exc:
-            logger.warning("CONTAINS '%s' fetch failed for company '%s': %s",
-                           term, company_name, exc)
-
-    if collected:
-        logger.info("Returning %d merged invoices for company '%s'", len(collected), company_name)
-        return collected
-
-    logger.warning(
-        "No invoices found for company '%s' between %s and %s. "
-        "Check that Tally is running and the company name matches exactly.",
-        company_name, from_date, to_date,
-    )
-    return []
-
+        normalized: List[Dict] = []
+        for v in vouchers:
+            vno = (v.get('VOUCHERNUMBER') or v.get('VOUCHERNO') or v.get('VCHNUMBER') or v.get('DSPVCHNUMBER') or v.get('DSPVCHNO') or v.get('NUMBER') or '').strip()
+            if not vno:
+                vno = (v.get('VCHKEY') or v.get('GUID') or f"VCH-{len(normalized)+1}")
+            cust = (v.get('PARTYLEDGERNAME') or v.get('PARTYNAME') or v.get('BASICBUYERNAME') or v.get('BASICBUYERPARTYNAME') or '').strip()
+            if not cust and v.get('LEDGERENTRIES'):
+                # Find the customer ledger (skip tax ledgers like CGST, SGST, IGST, GST, Output GST, etc.)
+                for ledger_entry in v.get('LEDGERENTRIES', []):
+                    ledger_name = (ledger_entry.get('LEDGERNAME') or '').strip()
+                    ledger_name_upper = ledger_name.upper()
+                    # Skip tax-related ledgers
+                    if any(tax_keyword in ledger_name_upper for tax_keyword in ['CGST', 'SGST', 'IGST', 'GST', 'TAX', 'CESS', 'DUTY', 'OUTPUT', 'INPUT']):
+                        continue
+                    # Skip numeric-only names (like "7")
+                    if ledger_name.isdigit():
+                        continue
+                    # This is likely the customer ledger
+                    cust = ledger_name
+                    break
+                if not cust:
+                    cust = 'UNKNOWN'
+            inv: Dict[str, any] = {
+                'guid': v.get('GUID', ''),
+                'voucher_no': vno,
+                'voucher_date': v.get('DATE', '') or v.get('VOUCHERDATE', ''),
+                'customer_name': cust or 'UNKNOWN',
+                'customer_guid': '',
+                'billing_address': '',
+                'delivery_address': '',
+                'total_amount': 0.0,
+                'tax_amount': 0.0,
+                'items': [],
+                'raw_voucher': dict(v),
+            }
+            for it in v.get('INVENTORY', []) or []:
+                inv['items'].append({
+                    'item_name': it.get('STOCKITEMNAME', ''),
+                    'quantity': _pqty(it.get('ACTUALQTY', '0')),
+                    'rate': _prate(it.get('RATE', '0')),
+                    'amount': _prate(it.get('AMOUNT', '0')),
+                })
+            for le in v.get('LEDGERENTRIES', []) or []:
+                name = (le.get('LEDGERNAME') or '').upper()
+                amt = _prate(le.get('AMOUNT', '0'))
+                if any(t in name for t in ['CGST','SGST','IGST','GST']):
+                    inv['tax_amount'] += abs(amt)
+                elif amt:
+                    inv['total_amount'] = max(inv['total_amount'], abs(amt))
+            if inv['total_amount'] == 0.0 and inv['items']:
+                inv['total_amount'] = sum(abs(x.get('amount',0)) for x in inv['items'])
+            normalized.append(inv)
+        return normalized
+    except Exception:
+        logger.exception("Failed to fetch sales invoices for %s", company_name)
+        return []
 
 # ============================================================================
 # TallyClient Class Wrapper for Arasan Gas Middleware
@@ -1492,8 +1560,9 @@ class TallyClient:
     
     def get_customers(self, company_name: str) -> List[Dict]:
         """
-        Fetch customers (Sundry Debtors + all sub-groups) from Tally company.
-        Uses CHILDOF + BELONGSTO to fetch only Sundry Debtors at Tally XML level.
+        Fetch customers from Tally company.
+        Defaults to Sundry Debtors, but can include multiple groups via
+        CUSTOMER_LEDGER_GROUPS env var (comma-separated).
 
         Args:
             company_name: Tally company name
@@ -1501,7 +1570,10 @@ class TallyClient:
         Returns:
             List of customer dictionaries with normalized fields
         """
-        ledgers = get_sundry_debtors(company_name, self.url)
+        import os
+        groups_env = os.getenv("CUSTOMER_LEDGER_GROUPS", "Sundry Debtors")
+        group_names = [g.strip() for g in groups_env.replace(";", ",").split(",") if g.strip()]
+        ledgers = get_customer_ledgers(company_name, self.url, group_names)
 
         customers = []
         for ledger in ledgers:
@@ -1544,7 +1616,7 @@ class TallyClient:
                 'name': item.get("NAME", ""),
                 'hsn_code': item.get("HSNCODE", ""),
                 'unit': item.get("BASEUNITS", ""),
-                'rate': self._parse_rate(item.get("STANDARDPRICE", "0")),
+                'rate': self._prate(item.get("STANDARDPRICE", "0")),
                 'gst_applicable': item.get("GSTAPPLICABLE", ""),
                 'gst_rate': item.get("GST_RATE", 0.0),
                 'igst_rate': item.get("IGST_RATE", 0.0),
@@ -1556,7 +1628,7 @@ class TallyClient:
 
         return products
     
-    def _parse_rate(self, rate_str: str) -> float:
+    def _prate(self, rate_str: str) -> float:
         """Parse rate string to float.
         Handles Tally formats: "500.00", "-1000.00", "500.00/Cyl", "1,000.00/Nos"
         """
@@ -1585,6 +1657,7 @@ class TallyClient:
         Returns:
             List of invoice dictionaries
         """
+        return get_sales_invoices(company_name, self.url, from_date, to_date)
         # Call the module-level function
         vouchers = get_sales_invoices(company_name, self.url, from_date, to_date)
         
@@ -1610,16 +1683,16 @@ class TallyClient:
             for inv_item in voucher.get("INVENTORY", []):
                 item = {
                     'item_name': inv_item.get("STOCKITEMNAME", ""),
-                    'quantity': self._parse_quantity(inv_item.get("ACTUALQTY", "0")),
-                    'rate': self._parse_rate(inv_item.get("RATE", "0")),
-                    'amount': self._parse_rate(inv_item.get("AMOUNT", "0"))
+                    'quantity': self._pqty(inv_item.get("ACTUALQTY", "0")),
+                    'rate': self._prate(inv_item.get("RATE", "0")),
+                    'amount': self._prate(inv_item.get("AMOUNT", "0"))
                 }
                 invoice['items'].append(item)
             
             # Calculate totals from ledger entries
             for ledger_entry in voucher.get("LEDGERENTRIES", []):
                 amount_str = ledger_entry.get("AMOUNT", "0")
-                amount = self._parse_rate(amount_str)
+                amount = self._prate(amount_str)
 
                 ledger_name = ledger_entry.get("LEDGERNAME", "").upper()
                 if any(tax in ledger_name for tax in ["CGST", "SGST", "IGST", "GST"]):
@@ -1637,7 +1710,7 @@ class TallyClient:
         
         return invoices
     
-    def _parse_quantity(self, qty_str: str) -> float:
+    def _pqty(self, qty_str: str) -> float:
         """Parse quantity string to float"""
         try:
             # Remove units and commas

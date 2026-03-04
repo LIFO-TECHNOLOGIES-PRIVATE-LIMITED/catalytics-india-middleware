@@ -7,6 +7,7 @@ import os
 import sys
 import io
 import sqlite3
+from pathlib import Path
 import logging
 import requests
 import webbrowser
@@ -68,14 +69,28 @@ def check_catalytics_connection():
 def get_recent_file_logs(log_file, lines=20):
     """Get recent lines from a log file"""
     try:
-        log_path = str(BASE_DIR / 'logs' / log_file)
-        if not os.path.exists(log_path):
+        log_path = Path(BASE_DIR) / 'logs' / log_file
+        if not log_path.exists():
             return []
-
         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
             all_lines = f.readlines()
             return [line.strip() for line in all_lines[-lines:]]
-    except:
+    except Exception:
+        return []
+
+
+def get_log_excerpt_by_keyword(log_file, keyword, lines=80):
+    """Return up to `lines` log lines containing keyword; fallback to tail if none."""
+    try:
+        log_path = Path(BASE_DIR) / 'logs' / log_file
+        if not log_path.exists():
+            return []
+        data = log_path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        keyword_lower = (keyword or '').lower()
+        matched = [ln for ln in data if keyword_lower in ln.lower()] if keyword_lower else []
+        source = matched if matched else data
+        return source[-lines:]
+    except Exception:
         return []
 
 @app.route('/')
@@ -685,7 +700,7 @@ def trigger_sync_customers():
 
 @app.route('/api/trigger/sync_invoices', methods=['POST'])
 def trigger_sync_invoices():
-    """Manually trigger invoice-only sync to Catalytics (as DCs)"""
+    """Manually trigger invoice-only sync to Catalytics (as DCs) using lightweight API"""
     try:
         from sync_to_catalytics import CatalyticsSyncer
 
@@ -696,10 +711,10 @@ def trigger_sync_invoices():
                 'status': 'started'
             })
 
-        dashboard_logger.write_log("=== INVOICE SYNC TO CATALYTICS STARTED ===")
+        dashboard_logger.write_log("=== INVOICE SYNC TO CATALYTICS STARTED (LIGHTWEIGHT API) ===")
 
         syncer = CatalyticsSyncer()
-        success, output = _run_with_dashboard_capture(syncer.sync_invoices_to_dc)
+        success, output = _run_with_dashboard_capture(syncer.sync_invoices_simple)
 
         dashboard_logger.write_log(
             f"=== INVOICE SYNC TO CATALYTICS {'COMPLETED' if success else 'FAILED'} ==="
@@ -767,7 +782,7 @@ def api_customer_detail(customer_id):
                state, city, pincode, phone, email,
                is_synced, catalytics_id, sync_attempts, last_sync_error,
                first_fetched_at, last_updated_at, last_sync_at,
-               data_json, last_response_json
+               data_json, sync_request_json, last_response_json
         FROM customers
         WHERE id = ?
     ''', (customer_id,))
@@ -800,7 +815,10 @@ def api_customer_detail(customer_id):
             'last_updated_at': row[17],
             'last_sync_at': row[18],
             'data_json': row[19],
-            'last_response_json': row[20]
+            'sync_request_json': row[20],
+            'last_response_json': row[21],
+            'fetch_log': get_log_excerpt_by_keyword('customer_fetch.log', row[1]),
+            'sync_log': get_log_excerpt_by_keyword('customer_sync.log', row[1])
         }
     })
 
@@ -843,7 +861,9 @@ def api_product_detail(product_id):
             'last_updated_at': row[13],
             'last_sync_at': row[14],
             'data_json': row[15],
-            'last_response_json': row[16]
+            'last_response_json': row[16],
+            'fetch_log': get_log_excerpt_by_keyword('product_fetch.log', row[1]),
+            'sync_log': get_log_excerpt_by_keyword('product_sync.log', row[1])
         }
     })
 
@@ -859,7 +879,7 @@ def api_invoice_detail(invoice_id):
                total_amount, tax_amount, items_json, dc_no,
                is_synced, catalytics_dc_id, sync_attempts, last_sync_error,
                first_fetched_at, last_updated_at, last_sync_at,
-               data_json, last_response_json
+               data_json, sync_request_json, last_response_json
         FROM invoices
         WHERE id = ?
     ''', (invoice_id,))
