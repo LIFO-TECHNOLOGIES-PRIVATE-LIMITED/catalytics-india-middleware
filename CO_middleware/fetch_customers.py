@@ -76,7 +76,19 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     )
 
     ledgers = tally_api.get_ledgers(company_name, config.tally_url)
-    logger.info("Fetched %d ledgers from Tally", len(ledgers))
+    logger.info("Fetched %d total ledgers from Tally", len(ledgers))
+    
+    # Filter for customer ledgers (Sundry Debtors group)
+    # Check multiple possible group names
+    customer_groups = ["sundry debtors", "debtors", "sundry debtors (current)", "receivables"]
+    customer_ledgers = []
+    for ledger in ledgers:
+        parent = (ledger.get("PARENT") or "").strip().lower()
+        if any(group in parent for group in customer_groups):
+            customer_ledgers.append(ledger)
+    
+    ledgers = customer_ledgers
+    logger.info("Filtered to %d customer ledgers (Sundry Debtors)", len(ledgers))
 
     created = 0
     updated = 0
@@ -88,24 +100,11 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             skipped += 1
             continue
 
-        parent = (ledger.get("PARENT") or ledger.get("PARENTNAME") or "").strip()
+        # Ledger is already filtered as Sundry Debtor by Tally
         ledger_data = ledger
 
-        # If parent unknown, do a full fetch to determine the parent group
-        if not parent or parent.strip().casefold() != "sundry debtors":
-            if config.fetch_full:
-                full = tally_api.get_ledger_by_name(company_name, name, config.tally_url)
-                if full:
-                    ledger_data = full
-                    parent = (ledger_data.get("PARENT") or ledger_data.get("PARENTNAME") or "").strip()
-
-        # Only keep Party Ledgers where Ledger Group = Sundry Debtors (Customers)
-        if not parent or parent.strip().casefold() != "sundry debtors":
-            skipped += 1
-            continue
-
         # Always do a full fetch for Sundry Debtors to get delivery addresses, GST, PAN etc.
-        if config.fetch_full and ledger_data is ledger:
+        if config.fetch_full:
             full = tally_api.get_ledger_by_name(company_name, name, config.tally_url)
             if full:
                 ledger_data = full
@@ -140,13 +139,12 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             )
 
     # --- Delete detection ---
-    # Collect all Sundry Debtor names from Tally response
+    # Collect all Sundry Debtor names from Tally response (already filtered by get_sundry_debtors)
     deleted = 0
     tally_names = set()
     for ledger in ledgers:
         name = (ledger.get("NAME") or ledger.get("LEDGERNAME") or "").strip()
-        parent = (ledger.get("PARENT") or ledger.get("PARENTNAME") or "").strip()
-        if name and parent and parent.casefold() == "sundry debtors":
+        if name:
             tally_names.add(name)
 
     # Safety: only detect deletions if Tally returned >0 Sundry Debtor names
@@ -167,11 +165,9 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
         names_to_delete = []
         for row in sqlite_ledgers:
-            row_data = db.json_loads(row["data_json"]) if row["data_json"] else {}
-            row_parent = (row_data.get("PARENT") or row_data.get("PARENTNAME") or "").strip()
-            if row_parent and row_parent.casefold() == "sundry debtors":
-                if row["name"] not in tally_names:
-                    names_to_delete.append(row["name"])
+            # All ledgers in our DB should be Sundry Debtors (we only fetch those)
+            if row["name"] not in tally_names:
+                names_to_delete.append(row["name"])
 
         if names_to_delete:
             deleted = db.mark_records_deleted(conn, "ledgers", company_id, names_to_delete)

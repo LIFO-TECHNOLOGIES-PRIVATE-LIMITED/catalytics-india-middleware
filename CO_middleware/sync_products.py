@@ -185,7 +185,7 @@ def _sync_deleted_products(
     if not deleted_items:
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-product-delete/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-product-delete/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
@@ -322,7 +322,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("No unsynced stock items found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-product-payload/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-product-payload/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key

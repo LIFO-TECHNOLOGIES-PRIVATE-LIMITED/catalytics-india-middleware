@@ -112,13 +112,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     conn = db.connect(config.db_path)
     db.init_db(conn)
 
-    from_date, to_date = _default_date_range(config.days_back)
-    if config.from_date:
-        from_date = config.from_date
-    if config.to_date:
-        to_date = config.to_date
-
-    logger.info("Using date range %s to %s", from_date, to_date)
+    # Get company
     companies = tally_api.get_companies(config.tally_url)
     available = [c.get("name") for c in companies]
     company_match = None
@@ -139,8 +133,18 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         tally_url=config.tally_url,
     )
 
-    vouchers = tally_api.get_sales_invoices(company_name, config.tally_url, from_date, to_date)
-    logger.info("Fetched %d sales invoices from Tally", len(vouchers))
+    # Get date range
+    if config.from_date and config.to_date:
+        from_date = config.from_date
+        to_date = config.to_date
+        logger.info("Using user-specified date range %s to %s", from_date, to_date)
+    else:
+        # Use default range (days_back or financial year)
+        from_date, to_date = _default_date_range(config.days_back)
+        logger.info("Using default date range %s to %s", from_date, to_date)
+
+    vouchers = tally_api.get_delivery_notes(company_name, config.tally_url, from_date, to_date)
+    logger.info("Fetched %d delivery notes (DCs) from Tally", len(vouchers))
 
     created = 0
     updated = 0
@@ -184,8 +188,10 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         inventory_items = voucher.get("INVENTORY") or []
         db.replace_delivery_note_items(conn, delivery_note_id=dn_id, items=inventory_items)
 
+        # Only fetch ledger and stock items if fetch_stock is enabled
+        # This speeds up DC fetch significantly (avoids 10+ second cooldowns per fetch)
         ledger_data = None
-        if party_name:
+        if config.fetch_stock and party_name:
             ledger_data = tally_api.get_ledger_by_name(company_name, party_name, config.tally_url)
             if ledger_data:
                 db.upsert_json_row(
@@ -317,6 +323,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         ledgers_fetched,
         stock_items_fetched,
     )
+    
     return {"created": created, "updated": updated, "skipped": skipped, "deleted": deleted}
 
 

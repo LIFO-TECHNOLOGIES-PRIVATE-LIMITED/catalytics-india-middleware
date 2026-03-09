@@ -63,13 +63,7 @@ def _fetch_unsynced(
         """,
         tuple(params),
     ).fetchall()
-    filtered: List[Dict[str, Any]] = []
-    for row in rows:
-        data_json = row["data_json"]
-        ledger_data = db.json_loads(data_json) if data_json else {}
-        if _is_sundry_debtor(ledger_data):
-            filtered.append(dict(row))
-    return filtered
+    return [dict(row) for row in rows]
 
 
 def _build_payload_for_ledger(
@@ -222,7 +216,7 @@ def _sync_deleted_customers(
     if not deleted_ledgers:
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-customer-delete/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-customer-delete/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
@@ -359,10 +353,16 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("No unsynced ledgers found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-customer-payload/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-customer-payload/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
+    
+    logger.info(f"=== SYNC CUSTOMERS TO CATALYTICS ===")
+    logger.info(f"Endpoint: {endpoint}")
+    logger.info(f"Headers: X-API-Key={'SET' if config.api_key else 'NOT SET'}")
+    logger.info(f"Entity ID: {config.entity_id}")
+    logger.info(f"Found {len(ledgers)} unsynced customers")
 
     total_sent = 0
     total_ok = 0
@@ -422,7 +422,11 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             continue
 
         try:
+            logger.info(f"POST {endpoint}")
+            logger.info(f"Headers: {headers}")
+            logger.info(f"Payload: entity_id={batch_payload.get('entity_id')}, items={len(ledger_payloads)}")
             resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
+            logger.info(f"Response: {resp.status_code} - {resp.text[:200]}")
             total_sent += len(ledger_payloads)
         except Exception as exc:
             logger.exception("API request failed")

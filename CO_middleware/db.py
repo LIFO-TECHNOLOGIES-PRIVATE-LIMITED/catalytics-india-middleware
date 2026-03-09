@@ -93,6 +93,18 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     error_text TEXT
 );
 
+CREATE TABLE IF NOT EXISTS fetch_metadata (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL,
+    data_type TEXT NOT NULL,
+    last_fetch_date TEXT,
+    last_fetch_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(company_id, data_type),
+    FOREIGN KEY(company_id) REFERENCES companies(id)
+);
+
 CREATE TABLE IF NOT EXISTS ledger_sync_status (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ledger_id INTEGER NOT NULL UNIQUE,
@@ -174,10 +186,11 @@ def sha256_text(value: str) -> str:
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30.0)  # 30 second timeout for locks
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA journal_mode = WAL")  # Write-Ahead Logging for better concurrency
+    conn.execute("PRAGMA busy_timeout = 30000")  # 30 second busy timeout
     return conn
 
 
@@ -474,3 +487,49 @@ def ensure_stock_sync_status(
         """,
         (stock_item_id, is_synced, payload_hash, ts, ts),
     )
+
+
+def get_last_fetch_date(conn: sqlite3.Connection, company_id: int, data_type: str) -> Optional[str]:
+    """
+    Get the last fetch date for a specific data type (e.g., 'delivery_notes')
+    
+    Returns:
+        Date string in YYYYMMDD format, or None if never fetched
+    """
+    row = conn.execute(
+        "SELECT last_fetch_date FROM fetch_metadata WHERE company_id = ? AND data_type = ?",
+        (company_id, data_type)
+    ).fetchone()
+    
+    return row["last_fetch_date"] if row else None
+
+
+def update_last_fetch_date(conn: sqlite3.Connection, company_id: int, data_type: str, fetch_date: str):
+    """
+    Update the last fetch date for a specific data type
+    
+    Args:
+        company_id: Company ID
+        data_type: Type of data (e.g., 'delivery_notes', 'ledgers', 'stock_items')
+        fetch_date: Date in YYYYMMDD format
+    """
+    now = utcnow()
+    
+    existing = conn.execute(
+        "SELECT id FROM fetch_metadata WHERE company_id = ? AND data_type = ?",
+        (company_id, data_type)
+    ).fetchone()
+    
+    if existing:
+        conn.execute(
+            """UPDATE fetch_metadata 
+               SET last_fetch_date = ?, last_fetch_at = ?, updated_at = ?
+               WHERE company_id = ? AND data_type = ?""",
+            (fetch_date, now, now, company_id, data_type)
+        )
+    else:
+        conn.execute(
+            """INSERT INTO fetch_metadata (company_id, data_type, last_fetch_date, last_fetch_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (company_id, data_type, fetch_date, now, now, now)
+        )

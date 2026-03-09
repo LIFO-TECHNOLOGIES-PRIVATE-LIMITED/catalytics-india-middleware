@@ -233,7 +233,7 @@ def _sync_deleted_dcs(
     if not deleted_notes:
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-delivery-challan-delete/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-delete/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
@@ -360,7 +360,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("No unsynced delivery notes found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-delivery-challan-payload/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-payload/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
