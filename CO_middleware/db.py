@@ -186,11 +186,11 @@ def sha256_text(value: str) -> str:
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=30.0)  # 30 second timeout for locks
+    conn = sqlite3.connect(db_path, timeout=120.0)  # 120 second timeout for locks (increased for product sync)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")  # Write-Ahead Logging for better concurrency
-    conn.execute("PRAGMA busy_timeout = 30000")  # 30 second busy timeout
+    conn.execute("PRAGMA busy_timeout = 120000")  # 120 second busy timeout
     return conn
 
 

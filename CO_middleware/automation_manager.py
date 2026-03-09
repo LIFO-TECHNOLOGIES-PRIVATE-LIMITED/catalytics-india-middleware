@@ -38,15 +38,15 @@ STATE_FILE = Path(ROOT_DIR) / 'automation_state.json'
 
 # Default intervals (in seconds)
 DEFAULT_INTERVALS = {
-    'fetch_invoices': 120,  # 2 minutes - DCs (reduced from 5 minutes)
-    'sync': 60,  # 60 seconds (1 minute) - reduced from 5s to avoid database locks
-    'fetch_master': 600,  # 10 minutes - products + customers (reduced from 30 minutes)
+    'fetch_invoices': 120,  # 2 minutes - DCs
+    'sync': 60,  # 60 seconds (1 minute)
+    'fetch_master': 1800,  # 30 minutes - products + customers (INCREASED to reduce Tally load)
 }
 
 INITIAL_DELAYS = {
-    'fetch_master': 10,  # Products + Customers start at 0:10
-    'fetch_invoices': 60,  # DCs start at 1:00 (then every 2 min: 3:00, 5:00, 7:00...)
-    'sync': 100,  # Sync starts at 1:40 (then every 1 min: 2:40, 3:40, 4:40...) - offset to avoid clash
+    'fetch_master': 10,  # Products + Customers start at 0:10 (customers skip full fetch if already have details)
+    'fetch_invoices': 120,  # DCs start at 2:00 (safe timing)
+    'sync': 180,  # Sync starts at 3:00
 }
 
 
@@ -308,7 +308,7 @@ class AutomationManager:
                     tally_url=cfg.get_env("TALLY_URL"),
                     company=cfg.get_env("TALLY_COMPANY"),
                     entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
-                    fetch_full=cfg.get_env_bool("TALLY_FETCH_FULL_CUSTOMERS", False),
+                    fetch_full=True,  # Fetch full details only for customers that don't have them
                     log_level=cfg.get_env("LOG_LEVEL", "INFO"),
                     log_json=cfg.get_env_bool("LOG_JSON", False),
                     log_file=None
@@ -385,11 +385,11 @@ class AutomationManager:
                     tally_url=cfg.get_env("TALLY_URL"),
                     company=cfg.get_env("TALLY_COMPANY"),
                     entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
-                    from_date=None,  # Use default date range
-                    to_date=None,
-                    days_back=None,  # Required by build_config
-                    fetch_stock=False,  # Required by build_config
-                    dry_run=False,  # Required by build_config
+                    from_date=cfg.get_env("TALLY_FROM_DATE"),  # Read from .env
+                    to_date=cfg.get_env("TALLY_TO_DATE"),  # Read from .env
+                    days_back=cfg.get_env_int("TALLY_DAYS_BACK"),  # Read from .env (CRITICAL FIX)
+                    fetch_stock=False,  # Don't fetch stock details for DCs (too slow)
+                    dry_run=False,
                     log_level=cfg.get_env("LOG_LEVEL", "INFO"),
                     log_json=cfg.get_env_bool("LOG_JSON", False),
                     log_file=None

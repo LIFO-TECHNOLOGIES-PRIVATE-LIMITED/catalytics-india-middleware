@@ -17,7 +17,7 @@ from logging_utils import setup_logging
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
 
-logger = logging.getLogger("tally_sync_customers")
+logger = logging.getLogger("tally_sync_products")
 
 
 @dataclass
@@ -46,19 +46,19 @@ def _fetch_unsynced(
     params: List[Any] = [max_attempts]
     where_company = ""
     if company_id:
-        where_company = "AND l.company_id = ?"
+        where_company = "AND s.company_id = ?"
         params.append(company_id)
     params.append(limit)
     rows = conn.execute(
         f"""
-        SELECT l.*, ls.is_synced, ls.attempts, ls.payload_hash
-        FROM ledgers l
-        LEFT JOIN ledger_sync_status ls ON ls.ledger_id = l.id
-        WHERE COALESCE(ls.is_synced, 0) = 0
-          AND COALESCE(ls.attempts, 0) < ?
-          AND COALESCE(l.is_deleted, 0) = 0
+        SELECT s.*, ss.is_synced, ss.attempts, ss.payload_hash
+        FROM stock_items s
+        LEFT JOIN stock_sync_status ss ON ss.stock_item_id = s.id
+        WHERE COALESCE(ss.is_synced, 0) = 0
+          AND COALESCE(ss.attempts, 0) < ?
+          AND COALESCE(s.is_deleted, 0) = 0
           {where_company}
-        ORDER BY l.updated_at ASC
+        ORDER BY s.updated_at ASC
         LIMIT ?
         """,
         tuple(params),
@@ -66,91 +66,14 @@ def _fetch_unsynced(
     return [dict(row) for row in rows]
 
 
-def _build_payload_for_ledger(
-    ledger_row: Dict[str, Any],
+def _build_payload_for_item(
+    item_row: Dict[str, Any],
     *,
     entity_id: Optional[int],
     company_name: Optional[str],
 ) -> Dict[str, Any]:
-    ledger = db.json_loads(ledger_row["data_json"]) or {}
-    
-    # Extract key fields for easier access by Catalytics
-    # GST Number
-    gstin = ""
-    gst_details_list = ledger.get("GSTDETAILS_LIST") or []
-    if gst_details_list and isinstance(gst_details_list, list):
-        gstin = gst_details_list[0].get("GSTIN", "")
-    if not gstin:
-        gstin = ledger.get("GSTIN", "")
-    
-    # PAN Number
-    pan = (
-        ledger.get("PAN")
-        or ledger.get("INCOMETAXNUMBER")
-        or ledger.get("LEDGERPANNUMBER")
-        or ledger.get("PANNUMBER")
-        or ""
-    )
-    
-    # Address, PIN, State, Country from mailing details
-    pincode = ""
-    state = ""
-    country = ""
-    address = ""
-    
-    mailing_list = ledger.get("LEDMAILINGDETAILS_LIST") or ledger.get("LEDGERMAILINGDETAILS_LIST") or []
-    if mailing_list and isinstance(mailing_list, list):
-        mailing = mailing_list[0]
-        pincode = mailing.get("PINCODE", "")
-        state = mailing.get("STATE", "")
-        country = mailing.get("COUNTRY", "")
-        # Try to get address from mailing details
-        address_list = mailing.get("ADDRESS_LIST", [])
-        if address_list and isinstance(address_list, list):
-            # Join all address lines
-            address_lines = []
-            for addr_item in address_list:
-                if isinstance(addr_item, dict):
-                    addr_text = addr_item.get("ADDRESS", "")
-                    if addr_text:
-                        address_lines.append(addr_text)
-            address = ", ".join(address_lines)
-    
-    # Fallback to top-level fields
-    if not pincode:
-        pincode = ledger.get("PINCODE", "")
-    if not state:
-        state = ledger.get("STATE", "")
-    if not country:
-        country = ledger.get("COUNTRY", "")
-    
-    # Mobile and Email
-    mobile = ledger.get("MOBILE", "")
-    email = ledger.get("EMAIL") or ledger.get("EMAILID") or ledger.get("LEDGEREMAILID") or ""
-    
-    # GUID for unique identification
-    guid = (
-        ledger.get("GUID")
-        or ledger.get("MASTERID")
-        or ledger.get("ALTERID")
-        or ledger.get("REMOTEALTGUID")
-        or ledger.get("REMOTEID")
-        or ""
-    )
-    
-    payload: Dict[str, Any] = {
-        "ledger": ledger,  # Full Tally data
-        # Extracted fields for easy access
-        "guid": str(guid).strip(),
-        "gstin": str(gstin).strip(),
-        "pan": str(pan).strip(),
-        "pincode": str(pincode).strip(),
-        "state": str(state).strip(),
-        "country": str(country).strip(),
-        "address": str(address).strip(),
-        "mobile": str(mobile).strip(),
-        "email": str(email).strip(),
-    }
+    stock_item = db.json_loads(item_row["data_json"]) or {}
+    payload: Dict[str, Any] = {"stock_item": stock_item}
     if entity_id:
         payload["entity_id"] = entity_id
     if company_name:
@@ -161,32 +84,7 @@ def _build_payload_for_ledger(
 def _norm_name(value: Any) -> str:
     if value is None:
         return ""
-    # Collapse whitespace and normalize case
     return " ".join(str(value).split()).strip().casefold()
-
-
-def _is_sundry_debtor(ledger_data: Dict[str, Any]) -> bool:
-    parent = (ledger_data.get("PARENT") or ledger_data.get("PARENTNAME") or "").strip()
-    return bool(parent) and parent.casefold() == "sundry debtors"
-
-
-def _status_is_success(status_val: Optional[str]) -> bool:
-    return status_val in ("created", "updated", "skipped")
-
-
-def _response_indicates_success(response_json: Optional[Dict[str, Any]]) -> bool:
-    if not response_json or response_json.get("status") != "success":
-        return False
-    data = response_json.get("data") or {}
-    errors = data.get("errors")
-    if isinstance(errors, int):
-        return errors == 0
-    # Fall back to presence of created/updated counts
-    created = data.get("created")
-    updated = data.get("updated")
-    if isinstance(created, int) or isinstance(updated, int):
-        return (created or 0) + (updated or 0) > 0
-    return True
 
 
 def _clean_error_text(text: Optional[str]) -> Optional[str]:
@@ -202,7 +100,7 @@ def _clean_error_text(text: Optional[str]) -> Optional[str]:
 def _update_sync_status(
     conn,
     *,
-    ledger_id: int,
+    stock_item_id: int,
     success: bool,
     payload_hash: str,
     response_json: Optional[Dict[str, Any]],
@@ -211,13 +109,13 @@ def _update_sync_status(
     ts = db.now_ts()
     conn.execute(
         """
-        INSERT INTO ledger_sync_status
-            (ledger_id, is_synced, attempts, last_attempt_at, synced_at,
+        INSERT INTO stock_sync_status
+            (stock_item_id, is_synced, attempts, last_attempt_at, synced_at,
              last_error, last_response_json, payload_hash, created_at, updated_at)
         VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(ledger_id) DO UPDATE SET
+        ON CONFLICT(stock_item_id) DO UPDATE SET
             is_synced = excluded.is_synced,
-            attempts = ledger_sync_status.attempts + 1,
+            attempts = stock_sync_status.attempts + 1,
             last_attempt_at = excluded.last_attempt_at,
             synced_at = excluded.synced_at,
             last_error = excluded.last_error,
@@ -226,7 +124,7 @@ def _update_sync_status(
             updated_at = excluded.updated_at
         """,
         (
-            ledger_id,
+            stock_item_id,
             1 if success else 0,
             ts,
             ts if success else None,
@@ -246,54 +144,48 @@ def _fetch_deleted_unsynced(
     limit: int,
     max_attempts: int,
 ) -> List[Dict[str, Any]]:
-    """Fetch ledgers that are deleted but not yet synced to Catalytics."""
+    """Fetch stock items that are deleted but not yet synced to Catalytics."""
     params: List[Any] = [max_attempts]
     where_company = ""
     if company_id:
-        where_company = "AND l.company_id = ?"
+        where_company = "AND s.company_id = ?"
         params.append(company_id)
     params.append(limit)
     rows = conn.execute(
         f"""
-        SELECT l.*, ls.is_synced, ls.attempts, ls.payload_hash
-        FROM ledgers l
-        LEFT JOIN ledger_sync_status ls ON ls.ledger_id = l.id
-        WHERE COALESCE(l.is_deleted, 0) = 1
-          AND COALESCE(ls.is_synced, 0) = 0
-          AND COALESCE(ls.attempts, 0) < ?
+        SELECT s.*, ss.is_synced, ss.attempts, ss.payload_hash
+        FROM stock_items s
+        LEFT JOIN stock_sync_status ss ON ss.stock_item_id = s.id
+        WHERE COALESCE(s.is_deleted, 0) = 1
+          AND COALESCE(ss.is_synced, 0) = 0
+          AND COALESCE(ss.attempts, 0) < ?
           {where_company}
-        ORDER BY l.updated_at ASC
+        ORDER BY s.updated_at ASC
         LIMIT ?
         """,
         tuple(params),
     ).fetchall()
-    filtered: List[Dict[str, Any]] = []
-    for row in rows:
-        data_json = row["data_json"]
-        ledger_data = db.json_loads(data_json) if data_json else {}
-        if _is_sundry_debtor(ledger_data):
-            filtered.append(dict(row))
-    return filtered
+    return [dict(row) for row in rows]
 
 
-def _sync_deleted_customers(
+def _sync_deleted_products(
     conn,
     *,
     config: "SyncConfig",
     company_id: Optional[int],
     company_name: Optional[str],
 ) -> Dict[str, int]:
-    """Sync deleted customer records to Catalytics delete endpoint."""
-    deleted_ledgers = _fetch_deleted_unsynced(
+    """Sync deleted product records to Catalytics delete endpoint."""
+    deleted_items = _fetch_deleted_unsynced(
         conn,
         company_id=company_id,
         limit=config.limit,
         max_attempts=config.max_attempts,
     )
-    if not deleted_ledgers:
+    if not deleted_items:
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/tally-customer-delete/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-product-delete/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
@@ -302,28 +194,28 @@ def _sync_deleted_customers(
     total_ok = 0
     total_fail = 0
 
-    for i in range(0, len(deleted_ledgers), config.batch_size):
-        batch = deleted_ledgers[i : i + config.batch_size]
+    for i in range(0, len(deleted_items), config.batch_size):
+        batch = deleted_items[i : i + config.batch_size]
         delete_items = []
         for row in batch:
-            ledger_data = db.json_loads(row["data_json"]) or {}
+            stock_data = db.json_loads(row["data_json"]) or {}
             guid = (
-                ledger_data.get("GUID")
-                or ledger_data.get("MASTERID")
-                or ledger_data.get("REMOTEALTGUID")
-                or ledger_data.get("REMOTEID")
+                stock_data.get("GUID")
+                or stock_data.get("MASTERID")
+                or stock_data.get("REMOTEALTGUID")
+                or stock_data.get("REMOTEID")
                 or ""
             )
             delete_items.append({"name": row["name"], "guid": str(guid).strip()})
 
-        batch_payload: Dict[str, Any] = {"delete_customers": delete_items}
+        batch_payload: Dict[str, Any] = {"delete_products": delete_items}
         if config.entity_id:
             batch_payload["entity_id"] = config.entity_id
         if company_name:
             batch_payload["company_name"] = company_name
 
         if config.dry_run:
-            logger.info("Dry-run: would delete %d customers", len(delete_items))
+            logger.info("Dry-run: would delete %d products", len(delete_items))
             continue
 
         try:
@@ -334,7 +226,7 @@ def _sync_deleted_customers(
             for row in batch:
                 _update_sync_status(
                     conn,
-                    ledger_id=row["id"],
+                    stock_item_id=row["id"],
                     success=False,
                     payload_hash="DELETED",
                     response_json=None,
@@ -367,7 +259,7 @@ def _sync_deleted_customers(
                 error_text = (res or {}).get("message") or response_json.get("message") or "delete_sync_failed"
             _update_sync_status(
                 conn,
-                ledger_id=row["id"],
+                stock_item_id=row["id"],
                 success=success,
                 payload_hash="DELETED",
                 response_json=response_json,
@@ -380,7 +272,7 @@ def _sync_deleted_customers(
 
         conn.commit()
 
-    logger.info("Customer delete sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
+    logger.info("Product delete sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
     return {"sent": total_sent, "ok": total_ok, "failed": total_fail}
 
 
@@ -425,47 +317,41 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 config.entity_id = int(row["entity_id"])
             company_name = row["name"]
 
-    ledgers = _fetch_unsynced(conn, company_id=company_id, limit=config.limit, max_attempts=config.max_attempts)
-    if not ledgers:
-        logger.info("No unsynced ledgers found")
+    items = _fetch_unsynced(conn, company_id=company_id, limit=config.limit, max_attempts=config.max_attempts)
+    if not items:
+        logger.info("No unsynced stock items found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/tally-customer-payload/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-product_name-payload/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
-    
-    logger.info(f"=== SYNC CUSTOMERS TO CATALYTICS ===")
-    logger.info(f"Endpoint: {endpoint}")
-    logger.info(f"Headers: X-API-Key={'SET' if config.api_key else 'NOT SET'}")
-    logger.info(f"Entity ID: {config.entity_id}")
-    logger.info(f"Found {len(ledgers)} unsynced customers")
 
     total_sent = 0
     total_ok = 0
     total_fail = 0
 
-    for i in range(0, len(ledgers), config.batch_size):
-        batch = ledgers[i : i + config.batch_size]
+    for i in range(0, len(items), config.batch_size):
+        batch = items[i : i + config.batch_size]
         payload_hashes: Dict[str, str] = {}
-        ledger_payloads: List[Dict[str, Any]] = []
+        item_payloads: List[Dict[str, Any]] = []
 
         for row in batch:
             name_key = _norm_name(row.get("name"))
             if not name_key:
-                logger.warning("Skipping ledger id=%s with empty name", row.get("id"))
+                logger.warning("Skipping stock item id=%s with empty name", row.get("id"))
                 continue
             try:
-                payload = _build_payload_for_ledger(
+                payload = _build_payload_for_item(
                     row,
                     entity_id=config.entity_id,
                     company_name=company_name,
                 )
             except Exception as exc:
-                logger.exception("Failed to build payload for ledger id=%s name=%s", row.get("id"), row.get("name"))
+                logger.exception("Failed to build payload for stock item id=%s name=%s", row.get("id"), row.get("name"))
                 _update_sync_status(
                     conn,
-                    ledger_id=row["id"],
+                    stock_item_id=row["id"],
                     success=False,
                     payload_hash="",
                     response_json=None,
@@ -473,23 +359,23 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 )
                 total_fail += 1
                 continue
-            ledger_data = payload["ledger"]
-            ledger_payloads.append(ledger_data)
+            item_data = payload["stock_item"]
+            item_payloads.append(item_data)
             payload_hashes[name_key] = db.sha256_text(db.json_dumps(payload))
 
-        batch_payload = {"ledgers": ledger_payloads}
+        batch_payload = {"stock_items": item_payloads}
         if config.entity_id:
             batch_payload["entity_id"] = config.entity_id
         if company_name:
             batch_payload["company_name"] = company_name
 
         if config.dry_run:
-            logger.info("Dry-run: would send %d ledgers", len(ledger_payloads))
+            logger.info("Dry-run: would send %d stock items", len(item_payloads))
             for row in batch:
                 payload_hash = payload_hashes.get(_norm_name(row.get("name")), "")
                 _update_sync_status(
                     conn,
-                    ledger_id=row["id"],
+                    stock_item_id=row["id"],
                     success=False,
                     payload_hash=payload_hash,
                     response_json={"dry_run": True},
@@ -499,19 +385,15 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             continue
 
         try:
-            logger.info(f"POST {endpoint}")
-            logger.info(f"Headers: {headers}")
-            logger.info(f"Payload: entity_id={batch_payload.get('entity_id')}, items={len(ledger_payloads)}")
             resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
-            logger.info(f"Response: {resp.status_code} - {resp.text[:200]}")
-            total_sent += len(ledger_payloads)
+            total_sent += len(item_payloads)
         except Exception as exc:
             logger.exception("API request failed")
             for row in batch:
                 payload_hash = payload_hashes.get(_norm_name(row.get("name")), "")
                 _update_sync_status(
                     conn,
-                    ledger_id=row["id"],
+                    stock_item_id=row["id"],
                     success=False,
                     payload_hash=payload_hash,
                     response_json=None,
@@ -529,45 +411,29 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             response_json = {"status": "error", "message": message, "raw_preview": (resp.text or "")[:500]}
 
         results = (response_json.get("data") or {}).get("results") or []
-        results_map: Dict[str, Dict[str, Any]] = {}
+        results_map = {}
         for r in results:
             if not isinstance(r, dict):
                 continue
-            key = _norm_name(r.get("name") or r.get("ledger_name") or r.get("NAME"))
+            key = _norm_name(r.get("name") or r.get("stock_name"))
             if key:
                 results_map[key] = r
-        index_results: Optional[List[Dict[str, Any]]] = None
-        dict_results = [r for r in results if isinstance(r, dict)]
-        if dict_results and len(dict_results) == len(batch):
-            index_results = dict_results
 
-        for idx, row in enumerate(batch):
+        for row in batch:
             name_key = _norm_name(row.get("name"))
             res = results_map.get(name_key) if name_key else None
-            if res is None and index_results is not None:
-                res = index_results[idx]
             if res is None and len(results) == 1 and len(batch) == 1:
-                res = results[0] if isinstance(results[0], dict) else None
+                res = results[0]
             status_val = (res or {}).get("status")
-            success = _status_is_success(status_val)
-            if not success and res is None and _response_indicates_success(response_json):
-                # No per-item results but API reports success without errors
-                success = True
+            success = status_val in ("created", "updated")
             payload_hash = payload_hashes.get(name_key, "")
             error_text = None
             if not success:
-                raw_error = (res or {}).get("message")
-                if not raw_error:
-                    data = response_json.get("data") or {}
-                    errors = data.get("errors")
-                    if response_json.get("status") != "success" or (isinstance(errors, int) and errors > 0):
-                        raw_error = response_json.get("message") or "sync_failed"
-                    else:
-                        raw_error = "sync_failed"
+                raw_error = (res or {}).get("message") or response_json.get("message") or "sync_failed"
                 error_text = _clean_error_text(raw_error) or "sync_failed"
             _update_sync_status(
                 conn,
-                ledger_id=row["id"],
+                stock_item_id=row["id"],
                 success=success,
                 payload_hash=payload_hash,
                 response_json=response_json,
@@ -580,10 +446,10 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
 
         conn.commit()
 
-    logger.info("Customer sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
+    logger.info("Product sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
 
     # --- Delete sync phase ---
-    delete_stats = _sync_deleted_customers(
+    delete_stats = _sync_deleted_products(
         conn,
         config=config,
         company_id=company_id,
@@ -601,16 +467,16 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sync SQLite-staged customers to Catalytics.")
+    parser = argparse.ArgumentParser(description="Sync SQLite-staged products to Catalytics.")
     parser.add_argument("--config", help="Path to .env file")
     parser.add_argument("--db-path", help="SQLite database path")
     parser.add_argument("--api-base-url", help="Catalytics base URL (e.g. http://localhost:8000)")
     parser.add_argument("--api-key", help="API key for Catalytics (X-API-Key)")
     parser.add_argument("--entity-id", type=int, help="Catalytics entity id")
     parser.add_argument("--company", help="Company name for payload fallback")
-    parser.add_argument("--batch-size", type=int, default=10, help="Number of ledgers per API call")
-    parser.add_argument("--limit", type=int, default=200, help="Max ledgers per run")
-    parser.add_argument("--max-attempts", type=int, default=5, help="Max retry attempts per ledger")
+    parser.add_argument("--batch-size", type=int, default=10, help="Number of stock items per API call")
+    parser.add_argument("--limit", type=int, default=200, help="Max stock items per run")
+    parser.add_argument("--max-attempts", type=int, default=5, help="Max retry attempts per stock item")
     parser.add_argument("--dry-run", action="store_true", help="Build payloads but do not send")
     parser.add_argument("--log-level", help="Logging level")
     parser.add_argument("--log-json", action="store_true", help="JSON log output")
@@ -621,7 +487,7 @@ def main() -> int:
     try:
         run_once(config)
     except Exception:
-        logger.exception("Customer sync run failed")
+        logger.exception("Product sync run failed")
         return 1
     return 0
 

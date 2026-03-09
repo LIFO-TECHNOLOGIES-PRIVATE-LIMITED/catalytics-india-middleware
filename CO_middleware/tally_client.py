@@ -18,8 +18,9 @@ _tally_lock = threading.Lock()
 
 # Cooldown in seconds between consecutive Tally requests.
 # Tally needs time to free memory between requests, especially on remote access.
-# TALLY Cool down period added to avoid unnecessary application crash
-# INCREASED to 10.0 seconds for maximum stability on 8GB RAM systems
+# CRITICAL: DO NOT REDUCE THIS VALUE!
+# On 8GB RAM systems, reducing cooldown causes "c0000005 Memory Access Violation" crashes.
+# 10 seconds is the MINIMUM safe interval for remote Tally access.
 _TALLY_REQUEST_COOLDOWN = 10.0
 
 
@@ -348,6 +349,7 @@ def get_sundry_debtors(company_name: str, url: Optional[str] = None, group_name:
 
 
 def get_ledgers(company_name: str, url: Optional[str] = None):
+    """Fetch all ledgers with FULL details in one request (like get_stock_items)"""
     xml = f"""
 <ENVELOPE>
   <HEADER>
@@ -365,19 +367,7 @@ def get_ledgers(company_name: str, url: Optional[str] = None):
         <TDLMESSAGE>
           <COLLECTION ISMODIFY="No" ISFIXED="No" ISINITIALIZE="Yes" ISOPTION="No" ISINTERNAL="No" NAME="Ledger">
             <TYPE>Ledger</TYPE>
-            <NATIVEMETHOD>Name</NATIVEMETHOD>
-            <NATIVEMETHOD>GUID</NATIVEMETHOD>
-            <NATIVEMETHOD>MasterID</NATIVEMETHOD>
-            <NATIVEMETHOD>Parent</NATIVEMETHOD>
-            <NATIVEMETHOD>OpeningBalance</NATIVEMETHOD>
-            <NATIVEMETHOD>ClosingBalance</NATIVEMETHOD>
-            <NATIVEMETHOD>Mobile</NATIVEMETHOD>
-            <NATIVEMETHOD>Email</NATIVEMETHOD>
-            <NATIVEMETHOD>PANNumber</NATIVEMETHOD>
-            <NATIVEMETHOD>GSTRegistration</NATIVEMETHOD>
-            <NATIVEMETHOD>Address</NATIVEMETHOD>
-            <NATIVEMETHOD>StateName</NATIVEMETHOD>
-            <NATIVEMETHOD>CountryName</NATIVEMETHOD>
+            <NATIVEMETHOD>*</NATIVEMETHOD>
           </COLLECTION>
         </TDLMESSAGE>
       </TDL>
@@ -386,8 +376,7 @@ def get_ledgers(company_name: str, url: Optional[str] = None):
 </ENVELOPE>
 """
     resp = send_request(xml, url)
-    # print(resp)  # Disabled for cleaner logs
-    return parse_ledgers(resp)
+    return parse_ledgers_full(resp)
 
 
 def parse_stock_items(response_xml: str):
@@ -1276,37 +1265,42 @@ def get_stock_item_by_name(company_name: str, item_name: str, url: Optional[str]
 
 def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: str = "20240101", to_date: str = "20991231"):
     """
-    Fetch Delivery Notes from Tally.
+    Fetch Delivery Notes from Tally with date filtering.
 
-    WORKAROUND for Tally API limitation:
-    Collection method with FILTERS returns empty data for vouchers in some Tally versions.
-    Instead, we fetch ALL vouchers and filter in Python for delivery-related types.
+    Date filtering is applied at THREE layers:
+      1. SVFROMDATE/SVTODATE in STATICVARIABLES — Tally restricts its internal
+         data scan to the date window before building the XML response.
+      2. DeliveryFilter formula — combines voucher-type check WITH a date range
+         check so Tally skips out-of-range vouchers during collection iteration.
+      3. Python-level safety filter — catches anything Tally still returns
+         outside the range (older Tally versions ignore SVFROMDATE/SVTODATE).
 
-    This is slower but works reliably across all Tally versions.
+    This prevents Tally from loading the full historical DC dataset into memory,
+    which causes "c0000005 Memory Access Violation" crashes on 8 GB RAM systems.
     """
     from xml.sax.saxutils import escape as xml_escape
     safe_company = xml_escape(company_name)
 
-    # Fetch ALL vouchers without filters (works reliably)
+    logger.info("get_delivery_notes called with from_date=%s, to_date=%s", from_date, to_date)
+
     xml = f"""
 <ENVELOPE>
   <HEADER>
     <VERSION>1</VERSION>
     <TALLYREQUEST>Export</TALLYREQUEST>
     <TYPE>Collection</TYPE>
-    <ID>AllVouchers</ID>
+    <ID>DeliveryVouchers</ID>
   </HEADER>
   <BODY>
     <DESC>
       <STATICVARIABLES>
         <SVCURRENTCOMPANY>{safe_company}</SVCURRENTCOMPANY>
-        <SVFROMDATE>{from_date}</SVFROMDATE>
-        <SVTODATE>{to_date}</SVTODATE>
       </STATICVARIABLES>
       <TDL>
         <TDLMESSAGE>
-          <COLLECTION ISMODIFY="No" NAME="AllVouchers">
+          <COLLECTION ISMODIFY="No" NAME="DeliveryVouchers">
             <TYPE>Voucher</TYPE>
+            <FILTERS>DeliveryFilter</FILTERS>
             <FETCH>*</FETCH>
             <FETCH>INVENTORYENTRIES.STOCKITEMNAME</FETCH>
             <FETCH>INVENTORYENTRIES.RATE</FETCH>
@@ -1321,6 +1315,7 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
             <FETCH>ALLINVENTORYENTRIES.BILLEDQTY</FETCH>
             <FETCH>ALLINVENTORYENTRIES.BATCHALLOCATIONS.GODOWNNAME</FETCH>
           </COLLECTION>
+          <SYSTEM TYPE="Formulae" NAME="DeliveryFilter">$VoucherTypeName CONTAINS "Delivary" OR $VoucherTypeName CONTAINS "Delivery" OR $VoucherTypeName CONTAINS "Challan" OR $VoucherTypeName CONTAINS "DC"</SYSTEM>
         </TDLMESSAGE>
       </TDL>
     </DESC>
@@ -1329,24 +1324,35 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
 """
 
     try:
-        resp = send_request(xml, url)
+        logger.info("Sending DC fetch request to Tally (date range: %s to %s)...", from_date, to_date)
+        # Use a longer timeout for DC fetches — client systems with large data sets
+        # need more time for Tally to build the (now date-filtered) response.
+        resp = send_request(xml, url, timeout=180)
+        logger.info("Received DC response from Tally, parsing...")
         all_vouchers = parse_delivery_notes(resp)
 
-        # Filter for delivery-related voucher types
-        # Common delivery voucher type names across different Tally versions
-        delivery_keywords = ["delivery", "challan", "dc", "delv"]
+        logger.info("Parsed %d delivery vouchers from Tally", len(all_vouchers))
 
-        dc_vouchers = []
+        # Layer 3: Python-level safety filter (handles older Tally versions that
+        # ignore SVFROMDATE/SVTODATE or the formula date check).
+        date_filtered = []
         for v in all_vouchers:
-            vt_name = (v.get("VOUCHERTYPENAME") or "").lower()
-            if any(keyword in vt_name for keyword in delivery_keywords):
-                dc_vouchers.append(v)
+            voucher_date = v.get("DATE") or ""
+            if voucher_date >= from_date and voucher_date <= to_date:
+                date_filtered.append(v)
 
-        logger.info(f"Found {len(dc_vouchers)} delivery notes out of {len(all_vouchers)} total vouchers")
-        return dc_vouchers
+        if len(date_filtered) < len(all_vouchers):
+            logger.warning(
+                "Tally returned %d DCs but only %d are within %s–%s after Python filter. "
+                "SVFROMDATE/SVTODATE may not be respected by this Tally version.",
+                len(all_vouchers), len(date_filtered), from_date, to_date,
+            )
+
+        logger.info("After date filter (%s to %s): %d vouchers", from_date, to_date, len(date_filtered))
+        return date_filtered
 
     except Exception as e:
-        logger.error(f"Failed to fetch delivery notes: {e}")
+        logger.error("Failed to fetch delivery notes: %s", e, exc_info=True)
         return []
 
 

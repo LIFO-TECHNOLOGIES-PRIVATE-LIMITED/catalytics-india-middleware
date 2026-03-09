@@ -1,23 +1,29 @@
+"""
+Sync products to new Catalytics API format (TallyProductNamePayloadAPIView)
+This script transforms Tally stock items into the new format with:
+- product_master_name, unit_master_name, variant_name
+- product_type_code, product_type_name
+- hsn_code, rate, gst_rate, etc.
+"""
 import argparse
 from dataclasses import dataclass
 import logging
 from typing import Any, Dict, List, Optional
 import os
 import sys
+import re
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import requests
-
 import config as cfg
 import db
 from logging_utils import setup_logging
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
-
-logger = logging.getLogger("tally_sync_products")
+logger = logging.getLogger("tally_sync_products_new")
 
 
 @dataclass
@@ -34,6 +40,148 @@ class SyncConfig:
     log_level: str
     log_json: bool
     log_file: Optional[str]
+
+
+def _parse_product_name(stock_name: str) -> Dict[str, str]:
+    """
+    Parse Tally stock item name into components.
+    Example: "INDUSTRIAL OXYGEN 4 CUM (CYL)" ->
+        product_master_name: "INDUSTRIAL OXYGEN"
+        variant_name: "4 CUM"
+        product_type_code: "CYL"
+    """
+    stock_name = stock_name.strip()
+    
+    # Extract product_type_code from parentheses at end
+    product_type_code = ""
+    product_type_name = ""
+    type_match = re.search(r'\(([^)]+)\)\s*$', stock_name)
+    if type_match:
+        product_type_code = type_match.group(1).strip()
+        product_type_name = product_type_code
+        stock_name = stock_name[:type_match.start()].strip()
+    
+    # Try to extract variant (number + unit pattern)
+    variant_name = ""
+    variant_match = re.search(r'(\d+(?:\.\d+)?\s*[A-Z]+)\s*$', stock_name, re.IGNORECASE)
+    if variant_match:
+        variant_name = variant_match.group(1).strip()
+        product_master_name = stock_name[:variant_match.start()].strip()
+    else:
+        product_master_name = stock_name
+    
+    return {
+        "product_master_name": product_master_name,
+        "variant_name": variant_name,
+        "product_type_code": product_type_code,
+        "product_type_name": product_type_name,
+    }
+
+
+def _extract_unit(stock_data: Dict[str, Any]) -> str:
+    """Extract unit from Tally stock item data"""
+    return (
+        stock_data.get("BASEUNITS")
+        or stock_data.get("UNIT")
+        or stock_data.get("UOM")
+        or "Nos"
+    )
+
+
+def _extract_rates(stock_data: Dict[str, Any]) -> Dict[str, float]:
+    """Extract rate and GST rates from Tally data"""
+    rate = 0.0
+    try:
+        rate_str = stock_data.get("OPENINGRATE") or stock_data.get("RATE") or "0"
+        rate = float(str(rate_str).replace(",", ""))
+    except:
+        pass
+    
+    gst_rate = 0.0
+    igst_rate = 0.0
+    cgst_rate = 0.0
+    sgst_rate = 0.0
+    
+    # Try to extract GST from tax classifications
+    gst_details = stock_data.get("GSTDETAILS") or {}
+    if isinstance(gst_details, dict):
+        try:
+            gst_rate = float(gst_details.get("GSTRATE") or gst_details.get("TAXRATE") or "0")
+            igst_rate = gst_rate
+            cgst_rate = gst_rate / 2
+            sgst_rate = gst_rate / 2
+        except:
+            pass
+    
+    return {
+        "rate": rate,
+        "gst_rate": gst_rate,
+        "igst_rate": igst_rate,
+        "cgst_rate": cgst_rate,
+        "sgst_rate": sgst_rate,
+    }
+
+
+def _build_product_payload(
+    item_row: Dict[str, Any],
+    *,
+    entity_id: Optional[int],
+    company_name: Optional[str],
+) -> Dict[str, Any]:
+    """Transform Tally stock item into new API format"""
+    stock_data = db.json_loads(item_row["data_json"]) or {}
+    stock_name = item_row["name"] or stock_data.get("NAME") or ""
+    
+    # Parse product name components
+    name_parts = _parse_product_name(stock_name)
+    
+    # Extract unit
+    unit = _extract_unit(stock_data)
+    
+    # Extract rates
+    rates = _extract_rates(stock_data)
+    
+    # Extract HSN code
+    hsn_code = (
+        stock_data.get("HSNCODE")
+        or stock_data.get("HSN")
+        or stock_data.get("HSNNO")
+        or ""
+    )
+    
+    # Extract GUID/UUID (unique identifier from Tally)
+    guid = (
+        stock_data.get("GUID")
+        or stock_data.get("MASTERID")
+        or stock_data.get("ALTERID")
+        or stock_data.get("REMOTEALTGUID")
+        or stock_data.get("REMOTEID")
+        or ""
+    )
+    
+    # Build payload
+    payload = {
+        "stock_item_name": stock_name,
+        "product_master_name": name_parts["product_master_name"],
+        "unit_master_name": unit,
+        "variant_name": name_parts["variant_name"],
+        "product_type_code": name_parts["product_type_code"],
+        "product_type_name": name_parts["product_type_name"],
+        "hsn_code": str(hsn_code).strip(),
+        "guid": str(guid).strip(),  # Add GUID/UUID for unique identification
+        "rate": rates["rate"],
+        "gst_rate": rates["gst_rate"],
+        "igst_rate": rates["igst_rate"],
+        "cgst_rate": rates["cgst_rate"],
+        "sgst_rate": rates["sgst_rate"],
+    }
+    
+    if entity_id:
+        payload["entity_id"] = entity_id
+    if company_name:
+        payload["tally_company"] = company_name
+    
+    return payload
 
 
 def _fetch_unsynced(
@@ -64,37 +212,6 @@ def _fetch_unsynced(
         tuple(params),
     ).fetchall()
     return [dict(row) for row in rows]
-
-
-def _build_payload_for_item(
-    item_row: Dict[str, Any],
-    *,
-    entity_id: Optional[int],
-    company_name: Optional[str],
-) -> Dict[str, Any]:
-    stock_item = db.json_loads(item_row["data_json"]) or {}
-    payload: Dict[str, Any] = {"stock_item": stock_item}
-    if entity_id:
-        payload["entity_id"] = entity_id
-    if company_name:
-        payload["company_name"] = company_name
-    return payload
-
-
-def _norm_name(value: Any) -> str:
-    if value is None:
-        return ""
-    return " ".join(str(value).split()).strip().casefold()
-
-
-def _clean_error_text(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    msg = str(text).strip()
-    lower = msg.lower()
-    if "<html" in lower or "<!doctype" in lower:
-        return "Non-JSON HTML response from API"
-    return msg
 
 
 def _update_sync_status(
@@ -135,145 +252,6 @@ def _update_sync_status(
             ts,
         ),
     )
-
-
-def _fetch_deleted_unsynced(
-    conn,
-    *,
-    company_id: Optional[int],
-    limit: int,
-    max_attempts: int,
-) -> List[Dict[str, Any]]:
-    """Fetch stock items that are deleted but not yet synced to Catalytics."""
-    params: List[Any] = [max_attempts]
-    where_company = ""
-    if company_id:
-        where_company = "AND s.company_id = ?"
-        params.append(company_id)
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT s.*, ss.is_synced, ss.attempts, ss.payload_hash
-        FROM stock_items s
-        LEFT JOIN stock_sync_status ss ON ss.stock_item_id = s.id
-        WHERE COALESCE(s.is_deleted, 0) = 1
-          AND COALESCE(ss.is_synced, 0) = 0
-          AND COALESCE(ss.attempts, 0) < ?
-          {where_company}
-        ORDER BY s.updated_at ASC
-        LIMIT ?
-        """,
-        tuple(params),
-    ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def _sync_deleted_products(
-    conn,
-    *,
-    config: "SyncConfig",
-    company_id: Optional[int],
-    company_name: Optional[str],
-) -> Dict[str, int]:
-    """Sync deleted product records to Catalytics delete endpoint."""
-    deleted_items = _fetch_deleted_unsynced(
-        conn,
-        company_id=company_id,
-        limit=config.limit,
-        max_attempts=config.max_attempts,
-    )
-    if not deleted_items:
-        return {"sent": 0, "ok": 0, "failed": 0}
-
-    endpoint = config.api_base_url.rstrip("/") + "/tally-product-delete/"
-    headers = {}
-    if config.api_key:
-        headers["X-API-Key"] = config.api_key
-
-    total_sent = 0
-    total_ok = 0
-    total_fail = 0
-
-    for i in range(0, len(deleted_items), config.batch_size):
-        batch = deleted_items[i : i + config.batch_size]
-        delete_items = []
-        for row in batch:
-            stock_data = db.json_loads(row["data_json"]) or {}
-            guid = (
-                stock_data.get("GUID")
-                or stock_data.get("MASTERID")
-                or stock_data.get("REMOTEALTGUID")
-                or stock_data.get("REMOTEID")
-                or ""
-            )
-            delete_items.append({"name": row["name"], "guid": str(guid).strip()})
-
-        batch_payload: Dict[str, Any] = {"delete_products": delete_items}
-        if config.entity_id:
-            batch_payload["entity_id"] = config.entity_id
-        if company_name:
-            batch_payload["company_name"] = company_name
-
-        if config.dry_run:
-            logger.info("Dry-run: would delete %d products", len(delete_items))
-            continue
-
-        try:
-            resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
-            total_sent += len(delete_items)
-        except Exception as exc:
-            logger.exception("Delete API request failed")
-            for row in batch:
-                _update_sync_status(
-                    conn,
-                    stock_item_id=row["id"],
-                    success=False,
-                    payload_hash="DELETED",
-                    response_json=None,
-                    error_text=str(exc),
-                )
-            conn.commit()
-            total_fail += len(batch)
-            continue
-
-        response_json = None
-        try:
-            response_json = resp.json()
-        except Exception:
-            response_json = {"status": "error", "message": f"HTTP {resp.status_code} non-JSON"}
-
-        results = (response_json.get("data") or {}).get("results") or []
-        results_map = {
-            _norm_name(r.get("name")): r
-            for r in results
-            if isinstance(r, dict) and r.get("name")
-        }
-
-        for row in batch:
-            name_key = _norm_name(row.get("name"))
-            res = results_map.get(name_key) if name_key else None
-            status_val = (res or {}).get("status")
-            success = status_val in ("deleted", "skipped")
-            error_text = None
-            if not success:
-                error_text = (res or {}).get("message") or response_json.get("message") or "delete_sync_failed"
-            _update_sync_status(
-                conn,
-                stock_item_id=row["id"],
-                success=success,
-                payload_hash="DELETED",
-                response_json=response_json,
-                error_text=error_text,
-            )
-            if success:
-                total_ok += 1
-            else:
-                total_fail += 1
-
-        conn.commit()
-
-    logger.info("Product delete sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
-    return {"sent": total_sent, "ok": total_ok, "failed": total_fail}
 
 
 def build_config(args: argparse.Namespace) -> SyncConfig:
@@ -322,8 +300,11 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("No unsynced stock items found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/tally-product-payload/"
-    headers = {}
+    logger.info("Found %d unsynced products to sync", len(items))
+
+    # New API endpoint
+    endpoint = config.api_base_url.rstrip("/") + "/tally-product_name-payload/"
+    headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
 
@@ -331,78 +312,62 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
     total_ok = 0
     total_fail = 0
 
-    for i in range(0, len(items), config.batch_size):
-        batch = items[i : i + config.batch_size]
-        payload_hashes: Dict[str, str] = {}
-        item_payloads: List[Dict[str, Any]] = []
-
-        for row in batch:
-            name_key = _norm_name(row.get("name"))
-            if not name_key:
-                logger.warning("Skipping stock item id=%s with empty name", row.get("id"))
-                continue
-            try:
-                payload = _build_payload_for_item(
-                    row,
-                    entity_id=config.entity_id,
-                    company_name=company_name,
-                )
-            except Exception as exc:
-                logger.exception("Failed to build payload for stock item id=%s name=%s", row.get("id"), row.get("name"))
-                _update_sync_status(
-                    conn,
-                    stock_item_id=row["id"],
-                    success=False,
-                    payload_hash="",
-                    response_json=None,
-                    error_text=f"payload_build_error: {exc}",
-                )
-                total_fail += 1
-                continue
-            item_data = payload["stock_item"]
-            item_payloads.append(item_data)
-            payload_hashes[name_key] = db.sha256_text(db.json_dumps(payload))
-
-        batch_payload = {"stock_items": item_payloads}
-        if config.entity_id:
-            batch_payload["entity_id"] = config.entity_id
-        if company_name:
-            batch_payload["company_name"] = company_name
+    # Send products ONE AT A TIME (new API expects single product per request)
+    for item_row in items:
+        try:
+            payload = _build_product_payload(
+                item_row,
+                entity_id=config.entity_id,
+                company_name=company_name,
+            )
+            payload_hash = db.sha256_text(db.json_dumps(payload))
+        except Exception as exc:
+            logger.exception("Failed to build payload for product id=%s name=%s", item_row.get("id"), item_row.get("name"))
+            _update_sync_status(
+                conn,
+                stock_item_id=item_row["id"],
+                success=False,
+                payload_hash="",
+                response_json=None,
+                error_text=f"payload_build_error: {exc}",
+            )
+            conn.commit()
+            total_fail += 1
+            continue
 
         if config.dry_run:
-            logger.info("Dry-run: would send %d stock items", len(item_payloads))
-            for row in batch:
-                payload_hash = payload_hashes.get(_norm_name(row.get("name")), "")
-                _update_sync_status(
-                    conn,
-                    stock_item_id=row["id"],
-                    success=False,
-                    payload_hash=payload_hash,
-                    response_json={"dry_run": True},
-                    error_text="dry_run",
-                )
+            logger.info("Dry-run: would send product %s", payload.get("stock_item_name"))
+            _update_sync_status(
+                conn,
+                stock_item_id=item_row["id"],
+                success=False,
+                payload_hash=payload_hash,
+                response_json={"dry_run": True},
+                error_text="dry_run",
+            )
             conn.commit()
             continue
 
+        # Send request
         try:
-            resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
-            total_sent += len(item_payloads)
+            logger.info("Sending product: %s", payload.get("stock_item_name"))
+            resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
+            total_sent += 1
         except Exception as exc:
-            logger.exception("API request failed")
-            for row in batch:
-                payload_hash = payload_hashes.get(_norm_name(row.get("name")), "")
-                _update_sync_status(
-                    conn,
-                    stock_item_id=row["id"],
-                    success=False,
-                    payload_hash=payload_hash,
-                    response_json=None,
-                    error_text=str(exc),
-                )
+            logger.exception("API request failed for product %s", payload.get("stock_item_name"))
+            _update_sync_status(
+                conn,
+                stock_item_id=item_row["id"],
+                success=False,
+                payload_hash=payload_hash,
+                response_json=None,
+                error_text=str(exc),
+            )
             conn.commit()
-            total_fail += len(batch)
+            total_fail += 1
             continue
 
+        # Parse response
         response_json = None
         try:
             response_json = resp.json()
@@ -410,84 +375,57 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             message = f"HTTP {resp.status_code} non-JSON response"
             response_json = {"status": "error", "message": message, "raw_preview": (resp.text or "")[:500]}
 
-        results = (response_json.get("data") or {}).get("results") or []
-        results_map = {}
-        for r in results:
-            if not isinstance(r, dict):
-                continue
-            key = _norm_name(r.get("name") or r.get("stock_name"))
-            if key:
-                results_map[key] = r
-
-        for row in batch:
-            name_key = _norm_name(row.get("name"))
-            res = results_map.get(name_key) if name_key else None
-            if res is None and len(results) == 1 and len(batch) == 1:
-                res = results[0]
-            status_val = (res or {}).get("status")
-            success = status_val in ("created", "updated")
-            payload_hash = payload_hashes.get(name_key, "")
-            error_text = None
-            if not success:
-                raw_error = (res or {}).get("message") or response_json.get("message") or "sync_failed"
-                error_text = _clean_error_text(raw_error) or "sync_failed"
-            _update_sync_status(
-                conn,
-                stock_item_id=row["id"],
-                success=success,
-                payload_hash=payload_hash,
-                response_json=response_json,
-                error_text=error_text,
-            )
-            if success:
-                total_ok += 1
-            else:
-                total_fail += 1
-
+        # Check success
+        status_val = response_json.get("status")
+        success = (status_val == "success" and resp.status_code == 200)
+        
+        error_text = None
+        if not success:
+            error_text = response_json.get("message") or f"HTTP {resp.status_code}"
+        
+        logger.info("Product %s: %s", payload.get("stock_item_name"), "OK" if success else f"FAILED - {error_text}")
+        
+        _update_sync_status(
+            conn,
+            stock_item_id=item_row["id"],
+            success=success,
+            payload_hash=payload_hash,
+            response_json=response_json,
+            error_text=error_text,
+        )
         conn.commit()
+        
+        if success:
+            total_ok += 1
+        else:
+            total_fail += 1
 
     logger.info("Product sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
-
-    # --- Delete sync phase ---
-    delete_stats = _sync_deleted_products(
-        conn,
-        config=config,
-        company_id=company_id,
-        company_name=company_name,
-    )
-
-    return {
-        "sent": total_sent,
-        "ok": total_ok,
-        "failed": total_fail,
-        "delete_sent": delete_stats.get("sent", 0),
-        "delete_ok": delete_stats.get("ok", 0),
-        "delete_failed": delete_stats.get("failed", 0),
-    }
+    return {"sent": total_sent, "ok": total_ok, "failed": total_fail}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sync SQLite-staged products to Catalytics.")
+    parser = argparse.ArgumentParser(description="Sync products to new Catalytics API format")
     parser.add_argument("--config", help="Path to .env file")
     parser.add_argument("--db-path", help="SQLite database path")
-    parser.add_argument("--api-base-url", help="Catalytics base URL (e.g. http://localhost:8000)")
-    parser.add_argument("--api-key", help="API key for Catalytics (X-API-Key)")
-    parser.add_argument("--entity-id", type=int, help="Catalytics entity id")
-    parser.add_argument("--company", help="Company name for payload fallback")
-    parser.add_argument("--batch-size", type=int, default=10, help="Number of stock items per API call")
-    parser.add_argument("--limit", type=int, default=200, help="Max stock items per run")
-    parser.add_argument("--max-attempts", type=int, default=5, help="Max retry attempts per stock item")
-    parser.add_argument("--dry-run", action="store_true", help="Build payloads but do not send")
-    parser.add_argument("--log-level", help="Logging level")
-    parser.add_argument("--log-json", action="store_true", help="JSON log output")
-    parser.add_argument("--log-file", help="Log file path")
+    parser.add_argument("--api-base-url", help="Catalytics base URL")
+    parser.add_argument("--api-key", help="API key (X-API-Key)")
+    parser.add_argument("--entity-id", type=int, help="Entity ID")
+    parser.add_argument("--company", help="Company name")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size (1 for new API)")
+    parser.add_argument("--limit", type=int, default=200, help="Max products per run")
+    parser.add_argument("--max-attempts", type=int, default=5, help="Max retry attempts")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run mode")
+    parser.add_argument("--log-level", help="Log level")
+    parser.add_argument("--log-json", action="store_true", help="JSON logs")
+    parser.add_argument("--log-file", help="Log file")
     args = parser.parse_args()
 
     config = build_config(args)
     try:
         run_once(config)
     except Exception:
-        logger.exception("Product sync run failed")
+        logger.exception("Product sync failed")
         return 1
     return 0
 

@@ -140,7 +140,7 @@ SYNC_BATCH_SIZE=50  # Default: 50 records per batch
 
 #### 2. Product Sync
 **Method**: `sync_products()`
-**Endpoint**: `/import/tally-product-name-payload/`
+**Endpoint**: `/import/tally-product_name-payload/`
 **Payload**: Product name (auto-creates in Catalytics)
 **Note**: Saves full Tally name in `Product.short_name` field
 

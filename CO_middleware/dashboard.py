@@ -1169,6 +1169,91 @@ def bulk_mark_unsynced_invoices():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+# Individual record resync endpoints
+@app.route('/api/customers/<int:customer_id>/resync', methods=['POST'])
+def resync_customer(customer_id):
+    """Mark a single customer as unsynced for resync"""
+    try:
+        db_path = cfg.get_env("TALLY_DB_PATH")
+        if not db_path:
+            return jsonify({'success': False, 'error': 'TALLY_DB_PATH not configured'}), 500
+
+        conn = db.connect(db_path)
+        
+        # Check if customer exists
+        customer = conn.execute("SELECT id, name FROM ledgers WHERE id = ?", (customer_id,)).fetchone()
+        if not customer:
+            return jsonify({'success': False, 'error': 'Customer not found'}), 404
+        
+        # Mark as unsynced
+        conn.execute(
+            "UPDATE ledger_sync_status SET is_synced = 0, last_error = NULL WHERE ledger_id = ?",
+            (customer_id,)
+        )
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': f'Customer "{customer["name"]}" marked for resync'})
+    except Exception as e:
+        logger.exception(f"Failed to mark customer {customer_id} for resync")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/products/<int:product_id>/resync', methods=['POST'])
+def resync_product(product_id):
+    """Mark a single product as unsynced for resync"""
+    try:
+        db_path = cfg.get_env("TALLY_DB_PATH")
+        if not db_path:
+            return jsonify({'success': False, 'error': 'TALLY_DB_PATH not configured'}), 500
+
+        conn = db.connect(db_path)
+        
+        # Check if product exists
+        product = conn.execute("SELECT id, name FROM stock_items WHERE id = ?", (product_id,)).fetchone()
+        if not product:
+            return jsonify({'success': False, 'error': 'Product not found'}), 404
+        
+        # Mark as unsynced
+        conn.execute(
+            "UPDATE stock_sync_status SET is_synced = 0, last_error = NULL WHERE stock_item_id = ?",
+            (product_id,)
+        )
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': f'Product "{product["name"]}" marked for resync'})
+    except Exception as e:
+        logger.exception(f"Failed to mark product {product_id} for resync")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/invoices/<int:invoice_id>/resync', methods=['POST'])
+def resync_invoice(invoice_id):
+    """Mark a single DC/invoice as unsynced for resync"""
+    try:
+        db_path = cfg.get_env("TALLY_DB_PATH")
+        if not db_path:
+            return jsonify({'success': False, 'error': 'TALLY_DB_PATH not configured'}), 500
+
+        conn = db.connect(db_path)
+        
+        # Check if invoice exists
+        invoice = conn.execute("SELECT id, dc_no FROM delivery_notes WHERE id = ?", (invoice_id,)).fetchone()
+        if not invoice:
+            return jsonify({'success': False, 'error': 'DC not found'}), 404
+        
+        # Mark as unsynced
+        conn.execute(
+            "UPDATE sync_status SET is_synced = 0, last_error = NULL WHERE delivery_note_id = ?",
+            (invoice_id,)
+        )
+        conn.commit()
+        
+        return jsonify({'success': True, 'message': f'DC "{invoice["dc_no"]}" marked for resync'})
+    except Exception as e:
+        logger.exception(f"Failed to mark invoice {invoice_id} for resync")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/bulk/delete-customers', methods=['POST'])
 def bulk_delete_customers():
     """Delete selected customers from local SQLite."""

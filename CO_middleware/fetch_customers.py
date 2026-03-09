@@ -100,14 +100,8 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             skipped += 1
             continue
 
-        # Ledger is already filtered as Sundry Debtor by Tally
+        # Ledger already has full details from get_ledgers (uses NATIVEMETHOD *)
         ledger_data = ledger
-
-        # Always do a full fetch for Sundry Debtors to get delivery addresses, GST, PAN etc.
-        if config.fetch_full:
-            full = tally_api.get_ledger_by_name(company_name, name, config.tally_url)
-            if full:
-                ledger_data = full
 
         existing = conn.execute(
             "SELECT data_json FROM ledgers WHERE company_id = ? AND name = ?",
