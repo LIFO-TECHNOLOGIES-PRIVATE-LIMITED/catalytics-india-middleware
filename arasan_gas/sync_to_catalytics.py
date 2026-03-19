@@ -430,6 +430,122 @@ class CatalyticsSyncer:
     # CUSTOMER SYNC
     # ========================================================================
 
+    def _get_customer_error_logger(self):
+        """Get or create a dedicated logger for customer sync errors."""
+        err_logger = logging.getLogger('customer_sync_errors')
+        if not err_logger.handlers:
+            log_path = Path(BASE_DIR) / 'logs' / 'customer_sync_errors.log'
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(log_path, encoding='utf-8')
+            fh.setFormatter(logging.Formatter(
+                '[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'
+            ))
+            err_logger.addHandler(fh)
+            err_logger.setLevel(logging.ERROR)
+        return err_logger
+
+    def _log_customer_field_debug(self, name, company, ledger, error_msg):
+        """Log customer field values to help identify which field caused sync error.
+        Writes to both main log and dedicated customer_sync_errors.log."""
+        # Sanitize inputs so newlines don't break log lines
+        name = (name or '').replace('\n', '').replace('\r', '').strip()
+        error_msg = (error_msg or '').replace('\n', ' ').replace('\r', '').strip()
+        err_logger = self._get_customer_error_logger()
+
+        # Extract key fields and their lengths from the ledger
+        if not ledger or not isinstance(ledger, dict):
+            err_logger.error(
+                f"SYNC FAILED | Customer: '{name}' | Company: '{company}' | "
+                f"Error: {error_msg} | Ledger: not available"
+            )
+            return
+
+        # Fields that commonly hit DB column limits (field_name: max_length)
+        field_checks = {
+            'NAME': 200,
+            'GUID': 100,
+            'MOBILE': 15,
+            'LEDGERMOBILE': 15,
+            'PHONENUMBER': 15,
+            'EMAIL': 254,
+            'GSTIN': 15,
+            'PARTYGSTIN': 15,
+            'INCOMETAXNUMBER': 10,  # PAN
+            'PINCODE': 10,
+            'STATENAME': 150,
+            'PRIORSTATENAME': 150,
+        }
+
+        field_report = []
+        over_limit_fields = []
+        for field, max_len in field_checks.items():
+            val = ledger.get(field, '')
+            if val:
+                val_str = str(val).strip()
+                length = len(val_str)
+                entry = f"{field}='{val_str}' (len={length}/{max_len})"
+                field_report.append(entry)
+                if length > max_len:
+                    over_limit_fields.append(f"{field}: '{val_str}' is {length} chars, max={max_len}")
+
+        # Also check address (max 300 for billing)
+        primary_addr = ledger.get('PRIMARY_ADDRESS', '')
+        if primary_addr:
+            addr_len = len(str(primary_addr))
+            field_report.append(f"PRIMARY_ADDRESS='{str(primary_addr)[:100]}...' (len={addr_len}/300)")
+            if addr_len > 300:
+                over_limit_fields.append(f"PRIMARY_ADDRESS: {addr_len} chars, max=300")
+
+        # Log to dedicated error file
+        err_logger.error(f"{'='*80}")
+        err_logger.error(f"SYNC FAILED | Customer: '{name}' | Company: '{company}'")
+        err_logger.error(f"Error: {error_msg}")
+        if over_limit_fields:
+            err_logger.error(f"FIELDS OVER LIMIT:")
+            for f in over_limit_fields:
+                err_logger.error(f"  >>> {f}")
+        err_logger.error(f"ALL FIELD VALUES:")
+        for f in field_report:
+            err_logger.error(f"  {f}")
+        err_logger.error(f"{'='*80}")
+
+        # Also log summary to main logger
+        if over_limit_fields:
+            logger.error(f"  POSSIBLE CAUSE - fields exceeding DB limits:")
+            for f in over_limit_fields:
+                logger.error(f"    >>> {f}")
+        else:
+            logger.error(f"  Field values sent: {' | '.join(field_report)}")
+
+    def _build_ledger_from_simple(self, simple, customer):
+        """Convert simple lowercase customer dict to uppercase Tally ledger format
+        that the backend's _process_single_ledger expects."""
+        # customer may be a sqlite3.Row (no .get), so handle both dict-like types
+        def _cget(key, default=''):
+            if hasattr(customer, 'get'):
+                return customer.get(key, default)
+            try:
+                return customer[key]
+            except Exception:
+                return default
+
+        name = (simple.get('name') or _cget('name', '')).replace('\n', '').replace('\r', '').strip()
+        address = simple.get('address', '') or _cget('address', '') or ''
+        return {
+            'NAME': name,
+            'GUID': simple.get('guid', '') or _cget('tally_guid', '') or '',
+            'PARENT': simple.get('parent_group', ''),
+            'PARTYGSTIN': simple.get('gstin', '') or '',
+            'INCOMETAXNUMBER': simple.get('pan', '') or '',
+            'MOBILE': simple.get('phone', '') or '',
+            'EMAIL': simple.get('email', '') or '',
+            'STATENAME': simple.get('state', '') or '',
+            'PINCODE': simple.get('pincode', '') or '',
+            'COUNTRYOFRESIDENCE': 'India',
+            'PRIMARY_ADDRESS': address,
+            'ADDRESSES': [address] if address else [],
+        }
+
     def sync_customers(self):
         """Sync customers to Catalytics using payload endpoint"""
         logger.info("\n" + "="*60)
@@ -452,18 +568,66 @@ class CatalyticsSyncer:
 
         for customer in customers:
             customer_id = customer['id']
-            name = customer['name']
+            name = (customer['name'] or '').replace('\n', '').replace('\r', '').strip()
             company = customer['tally_company']
 
             try:
                 logger.info(f"Syncing customer '{name}' (company: {company})...")
 
-                # Step 1: Fetch full ledger data from Tally
-                logger.debug(f"Fetching full ledger data from Tally for '{name}'...")
-                ledger = tally_client.get_ledger_by_name(company, name, self.tally_url)
+                # Step 1: Use stored ledger data from SQLite (saved during fetch)
+                # The backend expects uppercase Tally keys (NAME, GUID, GSTIN etc.)
+                # If data_json has lowercase keys (from get_customers), convert to uppercase format
+                ledger = None
+                if customer['data_json']:
+                    try:
+                        stored = json.loads(customer['data_json'])
+                        # Check if this is full Tally ledger (uppercase NAME) or simple dict (lowercase name)
+                        if stored.get('NAME') or stored.get('LEDGERNAME'):
+                            ledger = stored
+                        else:
+                            # Convert simple dict (lowercase) to backend-expected format (uppercase)
+                            ledger = self._build_ledger_from_simple(stored, customer)
+                            logger.info(f"Built ledger from stored simple data for '{name}'")
+                    except Exception as exc:
+                        logger.error(f"Failed to build ledger from stored data for '{name}': {exc}", exc_info=True)
+
+                if customer['data_json'] and not ledger:
+                    logger.warning(f"Stored data present but ledger not built for '{name}', will fetch from Tally")
 
                 if not ledger:
-                    raise ValueError(f"Could not fetch ledger '{name}' from Tally")
+                    # Fallback: fetch full ledger from Tally
+                    ledger = tally_client.get_ledger_by_name(company, name, self.tally_url)
+                    # Store full Tally ledger in data_json for future syncs
+                    if ledger:
+                        try:
+                            self.db.execute(
+                                'UPDATE customers SET data_json = ? WHERE id = ?',
+                                (json.dumps(ledger), customer_id)
+                            )
+                        except Exception as exc:
+                            logger.error(f"Failed to build ledger from stored data for '{name}': {exc}", exc_info=True)
+
+                if customer['data_json'] and not ledger:
+                    logger.warning(f"Stored data present but ledger not built for '{name}', will fetch from Tally")
+
+                if not ledger:
+                    raise ValueError(f"Could not get ledger data for '{name}'")
+
+                # Clean ledger data to avoid API issues
+                if isinstance(ledger.get('name'), str):
+                    ledger['name'] = ledger['name'].strip()
+                if isinstance(ledger.get('NAME'), str):
+                    ledger['NAME'] = ledger['NAME'].strip()
+                # Strip leading colon from GSTIN (Tally sometimes prefixes with ':')
+                for gst_key in ('GSTIN', 'PARTYGSTIN', 'gstin'):
+                    if isinstance(ledger.get(gst_key), str) and ledger[gst_key].startswith(':'):
+                        ledger[gst_key] = ledger[gst_key].lstrip(':')
+                # Also clean GSTIN in nested LEDGSTREGDETAILS_LIST
+                for gst_detail in ledger.get('LEDGSTREGDETAILS_LIST', []):
+                    if isinstance(gst_detail, dict):
+                        val = gst_detail.get('GSTIN', '')
+                        if isinstance(val, str) and val.startswith(':'):
+                            gst_detail['GSTIN'] = val.lstrip(':')
 
                 # Store request payload for debugging
                 request_payload = {
@@ -475,8 +639,8 @@ class CatalyticsSyncer:
                         'UPDATE customers SET sync_request_json = ? WHERE id = ?',
                         (json.dumps(request_payload), customer_id)
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.error(f"Failed to build ledger from stored data for '{name}': {exc}", exc_info=True)
 
                 # Step 2: Send to Catalytics payload endpoint
                 response = self._api_request(
@@ -596,11 +760,14 @@ class CatalyticsSyncer:
                             error_response_json = json.dumps({'raw': error_detail})
                     
                     logger.error(f"Sync failed for '{name}' (company: {company}): {error_msg}")
+                    self._log_customer_field_debug(name, company, ledger, error_msg)
                     self.db.mark_customer_sync_failed(customer_id, error_msg, error_response_json)
                     stats['failed'] += 1
 
             except Exception as e:
                 logger.error(f"Error syncing '{name}': {e}", exc_info=True)
+                # Log field values to help identify which field caused the error
+                self._log_customer_field_debug(name, company, ledger if 'ledger' in locals() else None, str(e))
                 self.db.mark_customer_sync_failed(customer_id, str(e))
                 stats['failed'] += 1
 
@@ -614,9 +781,13 @@ class CatalyticsSyncer:
         logger.info(f"Failed: {stats['failed']}")
         if stats['total'] > 0:
             logger.info(f"Success Rate: {stats['verified']/stats['total']*100:.1f}%")
+        if stats['failed'] > 0:
+            err_log_path = Path(BASE_DIR) / 'logs' / 'customer_sync_errors.log'
+            logger.warning(f"{stats['failed']} customers failed — see {err_log_path} for field-level details")
         logger.info(f"{'-'*60}")
 
         return stats
+
 
     def sync_single_customer(self, customer_dict, ledger_data=None):
         """
@@ -868,8 +1039,8 @@ class CatalyticsSyncer:
                         error_response_json = json.dumps(error_result)
                         error_detail = error_result.get('message', response.text[:200])
                         error_msg = f"{error_msg} - {error_detail}"
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.error(f"Failed to build ledger from stored data for '{name}': {exc}", exc_info=True)
 
                     logger.error(f"Sync failed for '{name}': {error_msg}")
                     self.db.mark_product_sync_failed(product_id, error_msg, error_response_json)
@@ -908,6 +1079,17 @@ class CatalyticsSyncer:
         except Exception:
             return {}
 
+
+    def _normalize_tally_date(self, value):
+        # Normalize Tally date to YYYY-MM-DD if possible.
+        s = str(value or '').strip()
+        if not s:
+            return ''
+        digits = ''.join(ch for ch in s if ch.isdigit())
+        if len(digits) == 8:
+            return digits[0:4] + '-' + digits[4:6] + '-' + digits[6:8]
+        return s
+
     def _extract_po_number(self, invoice):
         """
         Extract PO/Order number from invoice.
@@ -925,8 +1107,14 @@ class CatalyticsSyncer:
         # Non-PO values to skip (these are delivery mode or status values, not POs)
         non_po_values = {
             'delivery', 'invoice', 'sales', 'bill', 'challan', 'dc', 'dispatch',
-            'shipment', 'yes', 'no', 'standard', 'normal', 'express'
+            'shipment', 'yes', 'no', 'standard', 'normal', 'express',
+            'not applicable', 'n/a', 'na', 'nil', 'none', '-',
+            'customer pickup', 'customerpickup', 'pickup', 'self pickup', 'selfpickup', 'self',
         }
+        non_po_keywords = (
+            'customer pickup', 'customerpickup', 'pickup', 'self pickup', 'selfpickup', 'self',
+            'delivery', 'dispatch', 'challan',
+        )
 
         # Try multiple field names for PO number (in priority order)
         # Priority: actual order numbers > generic references > transport references
@@ -942,8 +1130,11 @@ class CatalyticsSyncer:
             if not value:
                 continue
 
+            value_lower = value.lower()
             # Skip non-PO values (common descriptors)
-            if value.lower() in non_po_values:
+            if value_lower in non_po_values:
+                continue
+            if any(key in value_lower for key in non_po_keywords):
                 continue
 
             # Check if it looks like a real PO number (has digits or is reasonably sized)
@@ -975,6 +1166,7 @@ class CatalyticsSyncer:
 
         for field in fields_to_try:
             value = (data.get(field) or '').strip()
+            value = self._normalize_tally_date(value)
             if value:
                 return value
 
@@ -1099,6 +1291,8 @@ class CatalyticsSyncer:
         filling_station = self._get_filling_station(invoice)
         po_number = self._extract_po_number(invoice)
         po_date = self._extract_po_date(invoice)
+        if not po_number:
+            po_date = ''
 
         voucher_payload = {
             'VOUCHERNUMBER': invoice.get('tally_voucher_no', ''),
@@ -1172,6 +1366,11 @@ class CatalyticsSyncer:
         if not voucher_payload.get('FILLINGSTATION') and filling_station:
             voucher_payload['FILLINGSTATION'] = filling_station
 
+        # Map Other Reference -> Terms of Delivery for challan type detection
+        other_ref = str(voucher_payload.get('BASICORDERREF') or '').strip().lower()
+        if 'customer pickup' in other_ref or 'pickup' in other_ref:
+            voucher_payload.setdefault('TERMSOFDELIVERY', 'Customer Pickup')
+
         # Clean up and extract PO number (filter out "Delivery" and other non-PO values)
         po_number = self._extract_po_number(invoice)
         if po_number:
@@ -1187,6 +1386,8 @@ class CatalyticsSyncer:
 
         # Clean up and extract PO date
         po_date = self._extract_po_date(invoice)
+        if not po_number:
+            po_date = ''
         if po_date:
             # Set PARTYORDERDATE (Order date field) as primary PO date field
             voucher_payload['PARTYORDERDATE'] = po_date
@@ -1316,12 +1517,12 @@ class CatalyticsSyncer:
                         'UPDATE invoices SET sync_request_json = ? WHERE id = ?',
                         (json.dumps(request_payload), invoice_id)
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.error(f"Failed to save sync request for invoice #{voucher_no}: {exc}")
 
                 # Log what's being sent
-                po_number = voucher_payload.get('PONUMBER', '').strip() or '[EMPTY]'
-                po_date = voucher_payload.get('PODATE', '').strip() or '[EMPTY]'
+                po_number = voucher_payload.get('PARTYORDERNO', '') or voucher_payload.get('PONUMBER', '') or '[EMPTY]'
+                po_date = voucher_payload.get('PARTYORDERDATE', '') or voucher_payload.get('PODATE', '') or '[EMPTY]'
                 filling_station = voucher_payload.get('FILLINGSTATION', '').strip() or '[EMPTY]'
 
                 logger.info(f"Payload Details:")
@@ -1438,7 +1639,7 @@ class CatalyticsSyncer:
                         error_detail = error_result.get('message', response.text[:200])
                         error_msg = f"{error_msg} - {error_detail}"
                     except Exception:
-                        pass
+                        error_msg = f"{error_msg} - {response.text[:200]}"
 
                     logger.error(f"Sync failed for invoice #{voucher_no}: {error_msg}")
                     self.db.mark_invoice_sync_failed(invoice_id, error_msg, error_response_json)
@@ -1498,6 +1699,27 @@ class CatalyticsSyncer:
                     f"(company: {company}, customer: {customer_name})..."
                 )
 
+                # Validate: check items are parseable
+                items_json = invoice.get('items_json', '[]')
+                try:
+                    items = json.loads(items_json) if isinstance(items_json, str) else (items_json or [])
+                except Exception:
+                    items = []
+
+                if not items:
+                    error_msg = f"No inventory items found for invoice #{voucher_no}"
+                    logger.error(f"[VALIDATION FAILED] {error_msg}")
+                    self.db.mark_invoice_sync_failed(invoice_id, error_msg)
+                    stats['failed'] += 1
+                    continue
+
+                if not customer_name or customer_name == 'UNKNOWN':
+                    error_msg = f"Customer name is empty or UNKNOWN for invoice #{voucher_no}"
+                    logger.error(f"[VALIDATION FAILED] {error_msg}")
+                    self.db.mark_invoice_sync_failed(invoice_id, error_msg)
+                    stats['failed'] += 1
+                    continue
+
                 # Build simple voucher payload (no ledgers, no stock_items)
                 voucher_payload = self._build_invoice_voucher_payload(invoice)
 
@@ -1516,8 +1738,8 @@ class CatalyticsSyncer:
                         'UPDATE invoices SET sync_request_json = ? WHERE id = ?',
                         (json.dumps(request_payload), invoice_id)
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.error(f"Failed to save sync request for invoice #{voucher_no}: {exc}")
 
                 logger.info(f"Payload Details:")
                 logger.info(f"  Filling Station ID: {filling_station_id}")
@@ -1570,7 +1792,7 @@ class CatalyticsSyncer:
                         error_detail = error_result.get('message', response.text[:200])
                         error_msg = f"{error_msg} - {error_detail}"
                     except Exception:
-                        pass
+                        error_msg = f"{error_msg} - {response.text[:200]}"
 
                     logger.error(f"Sync failed for invoice #{voucher_no}: {error_msg}")
                     self.db.mark_invoice_sync_failed(invoice_id, error_msg, error_response_json)

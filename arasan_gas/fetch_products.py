@@ -58,9 +58,10 @@ STOCK_NAME_PATTERN = re.compile(
 def parse_stock_item_name(name):
     """
     Parse a Tally stock item name into product components.
+    Handles spacing variations in quantity/unit (e.g., "1.5CUM" vs "1.5 CUM").
 
     Args:
-        name: e.g. "INDUSTRIAL OXYGEN 4 CUM (CYL)"
+        name: e.g. "INDUSTRIAL OXYGEN 4 CUM (CYL)" or "ARGON B TYPE 1.5CUM (CYL)"
 
     Returns:
         dict with keys: product_master_name, quantity, unit_name, variant_name,
@@ -70,7 +71,10 @@ def parse_stock_item_name(name):
     if not name:
         return None
 
-    match = STOCK_NAME_PATTERN.match(name.strip())
+    # Normalize: collapse multiple spaces into single space
+    normalized_name = ' '.join(name.strip().split())
+    
+    match = STOCK_NAME_PATTERN.match(normalized_name)
     if not match:
         return None
 
@@ -84,12 +88,21 @@ def parse_stock_item_name(name):
     if type_code not in type_map:
         return None
 
+    # Create canonical variant name (always with space between quantity and unit)
+    canonical_variant = f"{quantity} {unit_name}"
+    
+    # Create canonical product name for uniqueness checking
+    # This ensures "ARGON B TYPE 1.5CUM (CYL)" and "ARGON B TYPE 1.5 CUM (CYL)" 
+    # are treated as the same product
+    canonical_name = f"{product_master_name} {canonical_variant} ({type_code})"
+
     return {
         'product_master_name': product_master_name,
         'unit_name': unit_name,
-        'variant_name': f"{quantity} {unit_name}",
+        'variant_name': canonical_variant,
         'product_type_code': type_code,
         'product_type_name': type_map[type_code],
+        'canonical_name': canonical_name,  # For uniqueness checking
     }
 
 
@@ -176,21 +189,25 @@ def fetch_products_from_all_companies():
                     f"GST={product.get('gst_rate', 0)}%"
                 )
 
-                # Step 3: Check duplicate
-                existing = db.product_exists(product_name)
+                # Step 3: Check duplicate using canonical name
+                # Canonical name normalizes spacing in quantity/unit
+                canonical_name = parsed['canonical_name']
+                
+                existing = db.product_exists_normalized(canonical_name)
 
                 if existing:
                     owner_company = existing['tally_company']
                     logger.warning(
                         f"[DUPLICATE SKIPPED] '{product_name}' "
+                        f"(canonical: '{canonical_name}') "
                         f"(owned by {owner_company}, attempted by {company_name})"
                     )
                     db.log_duplicate(
                         entity_type='product',
-                        entity_name=product_name,
+                        entity_name=canonical_name,
                         tally_company=company_name,
                         owned_by_company=owner_company,
-                        details=f"HSN: {product.get('hsn_code', 'N/A')}"
+                        details=f"HSN: {product.get('hsn_code', 'N/A')}, Original: {product_name}"
                     )
                     overall_stats['duplicates_skipped'] += 1
                     continue
@@ -200,6 +217,7 @@ def fetch_products_from_all_companies():
                     product_data = {
                         'tally_guid': product['guid'],
                         'name': product_name,
+                        'name_canonical': canonical_name,  # ← Canonical name for uniqueness
                         'tally_company': company_name,
                         'hsn_code': product.get('hsn_code', ''),
                         'unit': product.get('unit', ''),

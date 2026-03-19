@@ -35,6 +35,9 @@ def _attach_customer_fetch_file_handler():
 
 _attach_customer_fetch_file_handler()
 
+def _normalize_customer_name(raw_name):
+    return ' '.join((raw_name or '').split())
+
 def fetch_customers_from_all_companies():
     """
     Fetch customers from all active Tally companies
@@ -66,16 +69,6 @@ def fetch_customers_from_all_companies():
     }
 
     # Process each company in order (priority by configuration order)
-    groups_env = os.getenv("CUSTOMER_LEDGER_GROUPS", "Sundry Debtors")
-    allowed_groups = [g.strip().lower() for g in groups_env.replace(";", ",").split(",") if g.strip()]
-
-    def _is_allowed_group(parent_group: str) -> bool:
-        if not allowed_groups:
-            return True
-        pg = (parent_group or "").strip().lower()
-        if not pg:
-            return False
-        return any(g in pg for g in allowed_groups)
 
     for company_name in active_companies:
         company_key = config.get_company_key(company_name)
@@ -96,19 +89,14 @@ def fetch_customers_from_all_companies():
 
             # Step 2: Process each customer with duplicate check
             for customer in customers:
-                customer_name = customer['name']
+                customer_name = _normalize_customer_name(customer.get('name'))
+                customer['name'] = customer_name
                 parent_group = customer.get('parent_group', '')
 
                 if not customer_name:
                     logger.warning(f"Skipping customer with empty name")
                     continue
 
-                if not _is_allowed_group(parent_group):
-                    logger.info(
-                        f"[GROUP SKIP] '{customer_name}' (company: {company_name}) "
-                        f"under '{parent_group}' not in allowed groups: {', '.join(allowed_groups)}"
-                    )
-                    continue
 
                 # Step 3: Check if customer name already exists
                 existing = db.customer_exists(customer_name)

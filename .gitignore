@@ -1,0 +1,30 @@
+# Environment
+.env
+.venv/
+venv/
+ENV/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Logs
+logs/
+*.log
+
+# Databases / runtime state
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Build artifacts
+build/
+dist/
+release/
+
+# OS files
+Thumbs.db
+Desktop.ini

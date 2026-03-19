@@ -6,6 +6,8 @@ import sqlite3
 import logging
 import json
 import hashlib
+import time
+import msvcrt
 from pathlib import Path
 from datetime import datetime
 
@@ -33,16 +35,43 @@ class Database:
     def __init__(self, db_path='arasan_gas.sqlite'):
         self.db_path = db_path
         self.conn = None
+        self._lock_file = None
+        self._lock_path = str(Path(self.db_path).with_suffix(".lock"))
         self.initialize()
 
     def initialize(self):
         """Create database and tables if they don't exist"""
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         # WAL mode allows concurrent reads while writing (prevents "database is locked")
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.create_tables()
         logger.info(f"Database initialized: {self.db_path}")
+
+    def _acquire_write_lock(self, timeout=30.0, poll=0.1):
+        """Acquire cross-process write lock to serialize SQLite writes."""
+        if self._lock_file is None:
+            self._lock_file = open(self._lock_path, 'a+b')
+        end = time.time() + timeout
+        while True:
+            try:
+                msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.time() >= end:
+                    raise TimeoutError('Timed out waiting for SQLite write lock')
+                time.sleep(poll)
+
+    def _release_write_lock(self):
+        """Release cross-process write lock."""
+        if not self._lock_file:
+            return
+        try:
+            self._lock_file.seek(0)
+            msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
 
     def create_tables(self):
         """Create all required tables"""
@@ -76,18 +105,29 @@ class Database:
             )
         """)
 
-        # Products table with company tracking
+        # Products table with company tracking and canonical name for uniqueness
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tally_guid TEXT,
-                name TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                name_canonical TEXT UNIQUE NOT NULL,
                 tally_company TEXT NOT NULL,
                 hsn_code TEXT,
                 unit TEXT,
                 rate REAL,
                 description TEXT,
                 data_json TEXT,
+                product_master_name TEXT,
+                variant_name TEXT,
+                unit_name TEXT,
+                product_type_code TEXT,
+                product_type_name TEXT,
+                gst_applicable TEXT,
+                gst_rate REAL,
+                igst_rate REAL,
+                cgst_rate REAL,
+                sgst_rate REAL,
                 sync_request_json TEXT,
                 last_response_json TEXT,
                 first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -197,18 +237,41 @@ class Database:
             ON invoices(tally_company)
         """)
 
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_duplicate_log_unique
+            ON duplicate_log(entity_type, entity_name, tally_company, owned_by_company)
+        """)
+
         self.conn.commit()
         logger.info("Database tables created successfully")
 
         # Run migrations
         self._migrate_db()
 
-    def execute(self, query, params=()):
-        """Execute a query with parameters"""
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        self.conn.commit()
-        return cursor
+    def execute(self, query, params=(), retries=5, base_delay=0.2):
+        """Execute a query with parameters (retries on database lock)."""
+        last_err = None
+        for attempt in range(retries):
+            locked = False
+            try:
+                self._acquire_write_lock()
+                locked = True
+                cursor = self.conn.cursor()
+                cursor.execute(query, params)
+                self.conn.commit()
+                return cursor
+            except sqlite3.OperationalError as e:
+                last_err = e
+                if 'database is locked' in str(e).lower() and attempt < retries - 1:
+                    time.sleep(base_delay * (2 ** attempt))
+                    continue
+                raise
+            finally:
+                if locked:
+                    self._release_write_lock()
+        if last_err:
+            raise last_err
+        return None
 
     def query(self, query, params=()):
         """Execute a SELECT query and return one result"""
@@ -270,16 +333,22 @@ class Database:
         if self.conn:
             self.conn.close()
             logger.info("Database connection closed")
+        if self._lock_file:
+            try:
+                self._lock_file.close()
+            except Exception:
+                pass
 
     # ========================================================================
     # CUSTOMER OPERATIONS
     # ========================================================================
 
     def customer_exists(self, name):
-        """Check if customer name already exists"""
+        """Check if customer name already exists (ignores whitespace differences)"""
+        normalized = ''.join((name or '').split())
         result = self.query(
-            "SELECT id, tally_company FROM customers WHERE name = ?",
-            (name,)
+            "SELECT id, tally_company FROM customers WHERE REPLACE(name, ' ', '') = ?",
+            (normalized,)
         )
         return result if result else None
 
@@ -384,20 +453,38 @@ class Database:
         )
         return result if result else None
 
+    def product_exists_normalized(self, canonical_name):
+        """
+        Check if product exists using canonical (normalized) name.
+        Canonical name handles spacing variations like "1.5CUM" vs "1.5 CUM".
+        
+        Args:
+            canonical_name: Normalized product name (e.g., "ARGON B TYPE 1.5 CUM (CYL)")
+            
+        Returns:
+            Product record if exists, None otherwise
+        """
+        result = self.query(
+            "SELECT id, tally_company, name FROM products WHERE name_canonical = ?",
+            (canonical_name,)
+        )
+        return result if result else None
+
     def insert_product(self, product_data):
-        """Insert new product"""
+        """Insert new product with canonical name for uniqueness checking"""
         self.execute("""
             INSERT INTO products (
-                tally_guid, name, tally_company, hsn_code, unit,
+                tally_guid, name, name_canonical, tally_company, hsn_code, unit,
                 rate, description, data_json,
                 product_master_name, variant_name, unit_name,
                 product_type_code, product_type_name,
                 gst_applicable, gst_rate, igst_rate, cgst_rate, sgst_rate,
                 first_fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
             product_data.get('tally_guid'),
             product_data.get('name'),
+            product_data.get('name_canonical'),  # ← Canonical name for uniqueness
             product_data.get('tally_company'),
             product_data.get('hsn_code'),
             product_data.get('unit'),
@@ -577,14 +664,17 @@ class Database:
             invoice_id
         ))
 
-    def get_unsynced_invoices(self, limit=50):
-        """Get invoices that haven't been synced"""
+    def get_unsynced_invoices(self, limit=50, max_attempts=10):
+        """Get invoices that haven't been synced.
+        Excludes deleted invoices and invoices that failed too many times."""
         return self.query_all("""
             SELECT * FROM invoices
             WHERE is_synced = 0
+              AND COALESCE(is_deleted, 0) = 0
+              AND COALESCE(sync_attempts, 0) < ?
             ORDER BY first_fetched_at
             LIMIT ?
-        """, (limit,))
+        """, (max_attempts, limit))
 
     def mark_invoice_synced(self, invoice_id, dc_no, catalytics_dc_id, response_json=None):
         """Mark invoice as successfully synced"""
@@ -622,21 +712,25 @@ class Database:
         voucher_list = list(voucher_nos)
         count = 0
 
-        # Batch in groups of 500 to stay within SQLite limits
-        for i in range(0, len(voucher_list), 500):
-            batch = voucher_list[i:i+500]
-            placeholders = ','.join('?' for _ in batch)
-            cursor = self.conn.cursor()
-            cursor.execute(f"""
-                UPDATE invoices
-                SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP
-                WHERE tally_company = ?
-                  AND tally_voucher_no IN ({placeholders})
-                  AND COALESCE(is_deleted, 0) = 0
-            """, [company_name] + batch)
-            count += cursor.rowcount
+        self._acquire_write_lock()
+        try:
+            # Batch in groups of 500 to stay within SQLite limits
+            for i in range(0, len(voucher_list), 500):
+                batch = voucher_list[i:i+500]
+                placeholders = ','.join('?' for _ in batch)
+                cursor = self.conn.cursor()
+                cursor.execute(f"""
+                    UPDATE invoices
+                    SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP
+                    WHERE tally_company = ?
+                      AND tally_voucher_no IN ({placeholders})
+                      AND COALESCE(is_deleted, 0) = 0
+                """, [company_name] + batch)
+                count += cursor.rowcount
 
-        self.conn.commit()
+            self.conn.commit()
+        finally:
+            self._release_write_lock()
         return count
 
     # ========================================================================
@@ -644,7 +738,16 @@ class Database:
     # ========================================================================
 
     def log_duplicate(self, entity_type, entity_name, tally_company, owned_by_company, details=''):
-        """Log duplicate entity for audit"""
+        """Log duplicate entity for audit (skip if already logged)"""
+        existing = self.query(
+            """SELECT 1 FROM duplicate_log
+               WHERE entity_type = ? AND entity_name = ?
+                 AND tally_company = ? AND owned_by_company = ?
+               LIMIT 1""",
+            (entity_type, entity_name, tally_company, owned_by_company)
+        )
+        if existing:
+            return
         self.execute("""
             INSERT INTO duplicate_log (
                 entity_type, entity_name, tally_company,

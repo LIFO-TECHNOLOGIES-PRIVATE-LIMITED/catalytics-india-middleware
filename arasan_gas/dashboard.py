@@ -50,13 +50,50 @@ current_progress = {
 }
 progress_lock = threading.Lock()
 
+# Single-operation guard to avoid concurrent writes to SQLite
+operation_lock = threading.Lock()
+operation_state = {'active': False, 'name': None, 'started_at': None}
+
+def _start_operation(name):
+    with operation_lock:
+        if operation_state['active']:
+            return False, operation_state.copy()
+        operation_state['active'] = True
+        operation_state['name'] = name
+        operation_state['started_at'] = datetime.now().isoformat()
+        return True, operation_state.copy()
+
+def _finish_operation():
+    with operation_lock:
+        operation_state['active'] = False
+        operation_state['name'] = None
+        operation_state['started_at'] = None
+
+@app.route('/api/operation')
+def api_operation_status():
+    with operation_lock:
+        return jsonify(operation_state)
+
+
 def check_tally_connection():
-    """Check if Tally server is accessible"""
+    """Check if Tally server is accessible.
+    Uses the global Tally lock to avoid concurrent requests which cause
+    Tally to crash with Memory Access Violation."""
+    from tally_client import _tally_lock
+    if not _tally_lock.acquire(timeout=3):
+        # Another request in progress — Tally is reachable, just busy
+        return True
     try:
-        response = requests.get(f"{config.TALLY_URL}", timeout=2)
+        response = requests.get(
+            f"{config.TALLY_URL}",
+            timeout=2,
+            headers={"Connection": "close"},
+        )
         return response.status_code == 200
     except:
         return False
+    finally:
+        _tally_lock.release()
 
 def check_catalytics_connection():
     """Check if Catalytics backend is accessible"""
@@ -387,6 +424,16 @@ def api_data_invoices():
 
     return jsonify({'invoices': invoices, 'total': len(invoices)})
 
+def _guarded_run(op_name, func, *args, **kwargs):
+    started, state = _start_operation(op_name)
+    if not started:
+        msg = f"Another operation is running: {state['name']}"
+        return False, msg
+    try:
+        return _run_with_dashboard_capture(func, *args, **kwargs)
+    finally:
+        _finish_operation()
+
 def _run_with_dashboard_capture(func, *args, **kwargs):
     """Run a function while routing its log output to the dashboard terminal.
     Returns (success: bool, output_text: str)."""
@@ -419,7 +466,7 @@ def trigger_fetch_customers():
         dashboard_logger.write_log("=== FETCH CUSTOMERS STARTED ===")
         dashboard_logger.write_log(f"Companies: {', '.join(config.get_active_companies())}")
 
-        success, output = _run_with_dashboard_capture(fetch_customers_from_all_companies)
+        success, output = _guarded_run("Fetch Customers", fetch_customers_from_all_companies)
 
         dashboard_logger.write_log(f"=== FETCH CUSTOMERS {'COMPLETED' if success else 'FAILED'} ===")
         with activity_lock:
@@ -454,7 +501,7 @@ def trigger_fetch_products():
         dashboard_logger.write_log("=== FETCH PRODUCTS STARTED ===")
         dashboard_logger.write_log(f"Companies: {', '.join(config.get_active_companies())}")
 
-        success, output = _run_with_dashboard_capture(fetch_products_from_all_companies)
+        success, output = _guarded_run("Fetch Products", fetch_products_from_all_companies)
 
         dashboard_logger.write_log(f"=== FETCH PRODUCTS {'COMPLETED' if success else 'FAILED'} ===")
         with activity_lock:
@@ -494,7 +541,7 @@ def trigger_fetch_invoices():
 
         def _bg_fetch():
             try:
-                success, output = _run_with_dashboard_capture(fetch_invoices_from_all_companies)
+                success, output = _guarded_run("Fetch Invoices", fetch_invoices_from_all_companies)
                 dashboard_logger.write_log(
                     f"=== FETCH INVOICES {'COMPLETED' if success else 'FAILED'} ==="
                 )
@@ -552,7 +599,7 @@ def trigger_sync():
         dashboard_logger.write_log("=== SYNC TO CATALYTICS STARTED ===")
 
         syncer = CatalyticsSyncer()
-        success, output = _run_with_dashboard_capture(syncer.sync_all)
+        success, output = _guarded_run("Sync All", syncer.sync_all)
 
         dashboard_logger.write_log(f"=== SYNC TO CATALYTICS {'COMPLETED' if success else 'FAILED'} ===")
 
@@ -605,7 +652,7 @@ def trigger_sync_products():
         dashboard_logger.write_log("=== PRODUCT SYNC TO CATALYTICS STARTED ===")
 
         syncer = CatalyticsSyncer()
-        success, output = _run_with_dashboard_capture(syncer.sync_products)
+        success, output = _guarded_run("Sync Products", syncer.sync_products)
 
         dashboard_logger.write_log(
             f"=== PRODUCT SYNC TO CATALYTICS {'COMPLETED' if success else 'FAILED'} ==="
@@ -658,7 +705,7 @@ def trigger_sync_customers():
         dashboard_logger.write_log("=== CUSTOMER SYNC TO CATALYTICS STARTED ===")
 
         syncer = CatalyticsSyncer()
-        success, output = _run_with_dashboard_capture(syncer.sync_customers)
+        success, output = _guarded_run("Sync Customers", syncer.sync_customers)
 
         dashboard_logger.write_log(
             f"=== CUSTOMER SYNC TO CATALYTICS {'COMPLETED' if success else 'FAILED'} ==="
@@ -697,7 +744,6 @@ def trigger_sync_customers():
 
 
 
-
 @app.route('/api/trigger/sync_invoices', methods=['POST'])
 def trigger_sync_invoices():
     """Manually trigger invoice-only sync to Catalytics (as DCs) using lightweight API"""
@@ -714,7 +760,7 @@ def trigger_sync_invoices():
         dashboard_logger.write_log("=== INVOICE SYNC TO CATALYTICS STARTED (LIGHTWEIGHT API) ===")
 
         syncer = CatalyticsSyncer()
-        success, output = _run_with_dashboard_capture(syncer.sync_invoices_simple)
+        success, output = _guarded_run("Sync Invoices", syncer.sync_invoices_simple)
 
         dashboard_logger.write_log(
             f"=== INVOICE SYNC TO CATALYTICS {'COMPLETED' if success else 'FAILED'} ==="
@@ -2314,14 +2360,29 @@ def api_diagnostics():
             'invoices': {'total': total_invoices, 'synced': synced_invoices, 'pending': total_invoices - synced_invoices}
         }
 
-        # Test Tally connection
+        # Test Tally connection (uses lock to avoid crashing Tally)
         try:
-            tally_response = requests.get(config.TALLY_URL, timeout=5)
-            diagnostics['connections']['tally'] = {
-                'status': 'online' if tally_response.status_code == 200 else 'error',
-                'url': config.TALLY_URL,
-                'response_time_ms': round(tally_response.elapsed.total_seconds() * 1000)
-            }
+            from tally_client import _tally_lock
+            if not _tally_lock.acquire(timeout=3):
+                diagnostics['connections']['tally'] = {
+                    'status': 'online',
+                    'url': config.TALLY_URL,
+                    'response_time_ms': 0,
+                    'note': 'busy (request in progress)'
+                }
+            else:
+                try:
+                    tally_response = requests.get(
+                        config.TALLY_URL, timeout=5,
+                        headers={"Connection": "close"},
+                    )
+                    diagnostics['connections']['tally'] = {
+                        'status': 'online' if tally_response.status_code == 200 else 'error',
+                        'url': config.TALLY_URL,
+                        'response_time_ms': round(tally_response.elapsed.total_seconds() * 1000)
+                    }
+                finally:
+                    _tally_lock.release()
         except Exception as e:
             diagnostics['connections']['tally'] = {
                 'status': 'offline',

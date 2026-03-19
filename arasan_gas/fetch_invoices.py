@@ -1,4 +1,4 @@
-"""
+﻿"""
 Fetch invoices from multiple Tally companies with enhanced change detection.
 - Stores complete Tally data (voucher, ledger, stock items) as JSON
 - Computes payload hash for robust change detection (like CO_middleware)
@@ -12,6 +12,7 @@ from datetime import datetime
 from config import config, BASE_DIR
 from db import Database, json_dumps, json_loads, sha256_text
 from tally_client import TallyClient
+from fetch_products import parse_stock_item_name
 
 # Try to import dashboard logger (optional - may not be available)
 try:
@@ -152,55 +153,45 @@ def _invoice_in_date_range(invoice, from_date, to_date):
     """
     vd = str(invoice.get('voucher_date', '') or '').replace('-', '').strip()
     if not vd or len(vd) != 8:
-        return True  # unknown date — include and let DB decide
+        return True  # unknown date â€” include and let DB decide
     return vd >= from_date
 
 
 def _has_delivery_info(invoice):
-    """Return True only if this Tally invoice contains delivery information.
-    Only invoices with a vehicle number, consignee address, delivery address,
-    order number, or 'Other References=Delivery' correspond to a Delivery Challan
-    in Catalytics and should be synced.
-    Plain sales invoices without any delivery data are skipped.
+    """Return True only when Other References indicates delivery/pickup.
+
+    This is a strict filter: vehicle/PO/delivery address are NOT considered.
     """
     raw = invoice.get('raw_voucher', {}) or {}
+    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip().lower()
+    if not other_ref:
+        return False
 
-    # ── Dispatch / vehicle fields ─────────────────────────────────────────────
-    if raw.get('DISPATCHEDTHROUGH') or raw.get('MOTORVEHICLENO') or raw.get('BASICSHIPPEDBY'):
+    other_ref_norm = ' '.join(other_ref.split())
+    other_ref_compact = other_ref_norm.replace(' ', '')
+
+    exact = {'dc'}
+    substrings = (
+        'delivery',
+        'delivery challan',
+        'dispatch',
+        'customer pickup',
+        'pickup',
+        'self pickup',
+        'self',
+    )
+
+    if other_ref_norm in exact:
         return True
-
-    # ── Delivery / consignee address from normalised invoice ─────────────────
-    if invoice.get('delivery_address'):
+    if any(key in other_ref_norm for key in substrings):
         return True
-
-    # ── Consignee block from raw voucher ─────────────────────────────────────
-    consignee = raw.get('CONSIGNEE') or {}
-    if isinstance(consignee, dict) and (consignee.get('ADDRESS') or consignee.get('NAME')):
+    if 'customerpickup' in other_ref_compact or 'deliverychallan' in other_ref_compact:
         return True
-
-    # ── Order No(s) field (PARTYORDERNO) ─────────────────────────────────────
-    # Invoice has a customer order number → linked to a DC
-    if raw.get('PARTYORDERNO'):
-        return True
-
-    # ── PO Number / Reference fields ─────────────────────────────────────────
-    if raw.get('PONUMBER') or raw.get('REFERENCE') or raw.get('VOUCHERREFERENCE'):
-        return True
-
-    # ── Other References = "Delivery" ────────────────────────────────────────
-    # Tally "Other References" field set to "Delivery" explicitly marks this as a DC
-    other_ref = str(raw.get('OTHERREFERENCE') or raw.get('VOUCHERREFERENCE') or '').strip().lower()
-    if other_ref in ('delivery', 'dc', 'delivery challan', 'dispatch'):
-        return True
-
-    # ── Terms of delivery / narration hint ───────────────────────────────────
-    if raw.get('TERMSOFDELIVERY') or raw.get('NARRATION'):
-        narration = str(raw.get('NARRATION', '')).lower()
-        if 'delivery' in narration or 'dispatch' in narration or 'dc' in narration or 'order' in narration:
-            return True
-
     return False
 
+
+def _normalize_name_key(value):
+    return str(value or '').replace(' ', '').strip().lower()
 
 
 def fetch_invoices_from_all_companies(from_date=None, to_date=None):
@@ -218,7 +209,7 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     try:
         config.reload_from_env()
     except AttributeError:
-        pass  # Older dashboard instance — use cached config values
+        pass  # Older dashboard instance â€” use cached config values
 
     if not from_date:
         from_date = config.INVOICE_FETCH_START_DATE or datetime.now().strftime('%Y%m%d')
@@ -248,6 +239,8 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
         'total_fetched': 0,
         'skipped_date': 0,
         'skipped_no_delivery': 0,
+        'skipped_missing_customer': 0,
+        'skipped_missing_product': 0,
         'new_saved': 0,
         'updated_saved': 0,
         'already_exists': 0,
@@ -267,11 +260,20 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
         logger.info(f"{'='*60}")
 
         try:
-            invoices = tally.get_sales_invoices(company_name, from_date, to_date)
+            try:
+                invoices = tally.get_sales_invoices(company_name, from_date, to_date)
+            except Exception as tally_err:
+                logger.error(
+                    f"[TALLY CONNECTION FAILED] Could not fetch invoices from '{company_name}': {tally_err}",
+                    exc_info=True
+                )
+                overall_stats['errors'] += 1
+                continue
+
             overall_stats['total_fetched'] += len(invoices)
 
             if not invoices:
-                logger.info(f"No invoices found for {company_name} in date range")
+                logger.warning(f"No invoices returned from Tally for {company_name} in date range {from_date}-{to_date}")
                 continue
 
             logger.info(f"Fetched {len(invoices)} invoices from Tally")
@@ -286,20 +288,107 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
 
                 # --- Date range filter (Tally ERP9 SVFROMDATE/SVTODATE is unreliable) ---
                 if not _invoice_in_date_range(invoice, from_date, to_date):
-                    logger.info(
-                        f"[DATE SKIP] #{voucher_no} ({company_name}): "
-                        f"date {invoice.get('voucher_date')} before start date {from_date}"
-                    )
                     overall_stats['skipped_date'] += 1
                     continue
 
                 # --- Delivery filter: only invoices with delivery information ---
                 if not _has_delivery_info(invoice):
-                    logger.info(
-                        f"[NO DELIVERY] #{voucher_no} ({company_name}): "
-                        f"no vehicle/consignee/delivery address — skipping"
-                    )
                     overall_stats['skipped_no_delivery'] += 1
+                    raw = invoice.get('raw_voucher', {}) or {}
+                    basic_ref = (raw.get('BASICORDERREF') or '').strip()
+                    other_ref_raw = (raw.get('OTHERREFERENCE') or '').strip()
+                    if basic_ref:
+                        other_ref = basic_ref
+                        other_ref_source = 'BASICORDERREF'
+                    elif other_ref_raw:
+                        other_ref = other_ref_raw
+                        other_ref_source = 'OTHERREFERENCE'
+                    else:
+                        other_ref = ''
+                        other_ref_source = '<none>'
+                    other_ref_disp = other_ref if other_ref else '<empty>'
+                    logger.info(
+                        f"[SKIP NO OTHER REF] #{voucher_no} ({customer_name}) - "
+                        f"Other References not set to delivery/pickup/self (source: {other_ref_source}, value: {other_ref_disp})"
+                    )
+                    continue
+
+                # --- Customer must exist in SQLite (ignore spaces/case) ---
+                normalized_customer = _normalize_name_key(customer_name)
+                ledger_cache_key = f"{company_name}::{normalized_customer}"
+                if ledger_cache_key not in ledger_cache:
+                    try:
+                        row = db.query(
+                            "SELECT name, data_json FROM customers WHERE lower(replace(name, ' ', '')) = ?",
+                            (normalized_customer,)
+                        )
+                        row_dict = dict(row) if row else {}
+                        if row_dict.get('data_json'):
+                            ledger_cache[ledger_cache_key] = json_loads(row_dict.get('data_json'))
+                            db_name = str(row_dict.get('name') or '').strip()
+                            if db_name and _normalize_name_key(db_name) == normalized_customer:
+                                if _normalize_name_key(customer_name) == normalized_customer and db_name != customer_name:
+                                    logger.info(
+                                        f"[CUSTOMER MATCH NORMALIZED] Invoice='{customer_name}' matched DB='{db_name}'"
+                                    )
+                        else:
+                            ledger_cache[ledger_cache_key] = None
+                    except Exception as e:
+                        logger.warning(f"[LEDGER LOOKUP FAILED] Could not lookup ledger for '{customer_name}': {e}")
+                        ledger_cache[ledger_cache_key] = None
+
+                ledger_data = ledger_cache[ledger_cache_key]
+                if not ledger_data:
+                    overall_stats['skipped_missing_customer'] += 1
+                    logger.info(
+                        f"[SKIP MISSING CUSTOMER] #{voucher_no} ({customer_name}) - "
+                        f"customer not found in SQLite (ignoring spaces)"
+                    )
+                    continue
+
+                # --- All products in invoice must exist in SQLite (exact name match) ---
+                inventory_items = invoice.get('items', [])
+                stock_items_map = {}
+                missing_products = []
+                for item in inventory_items:
+                    item_name = (item.get('item_name') or '').strip()
+                    if not item_name:
+                        missing_products.append('<empty>')
+                        continue
+                    normalized_item_name = _normalize_name_key(item_name)
+                    stock_cache_key = f"{company_name}::{normalized_item_name}"
+                    if stock_cache_key not in stock_cache:
+                        try:
+                            row = db.query(
+                                "SELECT name, data_json FROM products WHERE lower(replace(name, ' ', '')) = ?",
+                                (normalized_item_name,)
+                            )
+                            row_dict = dict(row) if row else {}
+                            if row_dict.get('data_json'):
+                                stock_cache[stock_cache_key] = json_loads(row_dict.get('data_json'))
+                                db_name = str(row_dict.get('name') or '').strip()
+                                if db_name and _normalize_name_key(db_name) == normalized_item_name:
+                                    if _normalize_name_key(item_name) == normalized_item_name and db_name != item_name:
+                                        logger.info(
+                                            f"[PRODUCT MATCH NORMALIZED] Invoice='{item_name}' matched DB='{db_name}'"
+                                        )
+                            else:
+                                stock_cache[stock_cache_key] = None
+                        except Exception as e:
+                            logger.warning(f"[STOCK LOOKUP FAILED] Could not lookup stock item '{item_name}': {e}")
+                            stock_cache[stock_cache_key] = None
+
+                    if stock_cache.get(stock_cache_key):
+                        stock_items_map[item_name] = stock_cache[stock_cache_key]
+                    else:
+                        missing_products.append(item_name)
+
+                if missing_products:
+                    overall_stats['skipped_missing_product'] += 1
+                    logger.info(
+                        f"[SKIP MISSING PRODUCT] #{voucher_no} ({customer_name}) - "
+                        f"missing products (ignoring spaces): {', '.join(sorted(set(missing_products)))[:200]}"
+                    )
                     continue
 
                 try:
@@ -308,77 +397,7 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                     full_voucher_payload = _build_full_voucher_payload(invoice)
                     data_json = json_dumps(full_voucher_payload)
 
-                    # ── Fetch ledger data for customer (cached per company+name) ──
-                    ledger_cache_key = f"{company_name}::{customer_name}"
-                    if ledger_cache_key not in ledger_cache:
-                        try:
-                            import tally_client
-                            ld = tally_client.get_ledger_by_name(company_name, customer_name, tally.url)
-                            ledger_cache[ledger_cache_key] = ld
-                            
-                            # Auto-save missing customer to SQL for sync
-                            if ld and not db.customer_exists(customer_name):
-                                cust_data = {
-                                    'tally_guid': ld.get("GUID", ""),
-                                    'name': ld.get("NAME", customer_name),
-                                    'tally_company': company_name,
-                                    'gstin': ld.get("GSTIN", "") or ld.get("PARTYGSTIN", "") or ld.get("GSTREGISTRATION", ""),
-                                    'pan': ld.get("INCOMETAXNUMBER", "") or ld.get("PANNUMBER", ""),
-                                    'address': ld.get("PRIMARY_ADDRESS", "") or (", ".join(ld.get("ADDRESSES", [])) if ld.get("ADDRESSES") else ""),
-                                    'state': ld.get("STATE", "") or ld.get("STATENAME", "") or ld.get("PRIORSTATENAME", ""),
-                                    'city': "",
-                                    'pincode': ld.get("PINCODE", ""),
-                                    'phone': ld.get("MOBILE", "") or ld.get("LEDGERMOBILE", ""),
-                                    'email': ld.get("EMAIL", "") or ld.get("LEDGEREMAIL", ""),
-                                    'data_json': json_dumps(ld)
-                                }
-                                db.insert_customer(cust_data)
-                                logger.info(f"[NEW CUSTOMER] '{customer_name}' added from invoice fetch")
-                        except Exception as e:
-                            logger.debug(f"Could not fetch/save ledger for '{customer_name}': {e}")
-                            ledger_cache[ledger_cache_key] = None
-                    ledger_data = ledger_cache[ledger_cache_key]
                     ledger_data_json = json_dumps(ledger_data) if ledger_data else None
-
-                    # ── Fetch stock items (cached per company+item_name) ──────────
-                    stock_items_map = {}
-                    inventory_items = invoice.get('items', [])
-                    for item in inventory_items:
-                        item_name = item.get('item_name', '')
-                        if not item_name:
-                            continue
-                        stock_cache_key = f"{company_name}::{item_name}"
-                        if stock_cache_key not in stock_cache:
-                            try:
-                                import tally_client
-                                sd = tally_client.get_stock_item_by_name(company_name, item_name, tally.url)
-                                stock_cache[stock_cache_key] = sd
-                                
-                                # Auto-save missing product to SQL for sync
-                                if sd and not db.product_exists(item_name):
-                                    prod_data = {
-                                        'tally_guid': sd.get("GUID", ""),
-                                        'name': item_name,
-                                        'tally_company': company_name,
-                                        'hsn_code': sd.get("HSNCODE", ""),
-                                        'unit': sd.get("BASEUNITS", ""),
-                                        'rate': tally._parse_rate(sd.get("STANDARDPRICE", "0")),
-                                        'description': sd.get("PARENT", ""),
-                                        'data_json': json_dumps(sd),
-                                        'gst_applicable': sd.get("GSTAPPLICABLE", ""),
-                                        'gst_rate': sd.get("GST_RATE", 0.0),
-                                        'igst_rate': sd.get("IGST_RATE", 0.0),
-                                        'cgst_rate': sd.get("CGST_RATE", 0.0),
-                                        'sgst_rate': sd.get("SGST_RATE", 0.0),
-                                    }
-                                    db.insert_product(prod_data)
-                                    logger.info(f"[NEW PRODUCT] '{item_name}' added from invoice fetch")
-                            except Exception as e:
-                                logger.debug(f"Could not fetch/save stock item '{item_name}': {e}")
-                                stock_cache[stock_cache_key] = None
-                        if stock_cache[stock_cache_key]:
-                            stock_items_map[item_name] = stock_cache[stock_cache_key]
-
                     stock_items_json = json_dumps(stock_items_map) if stock_items_map else None
 
                     # Enrich stored voucher JSON with ledger + stock item GST details
@@ -544,6 +563,8 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     logger.info(f"Total Fetched from Tally: {overall_stats['total_fetched']}")
     logger.info(f"Skipped (out of date range): {overall_stats['skipped_date']}")
     logger.info(f"Skipped (no delivery info): {overall_stats['skipped_no_delivery']}")
+    logger.info(f"Skipped (missing customer): {overall_stats['skipped_missing_customer']}")
+    logger.info(f"Skipped (missing product): {overall_stats['skipped_missing_product']}")
     logger.info(f"New Invoices Saved: {overall_stats['new_saved']}")
     logger.info(f"Updated Invoices (hash/data changed): {overall_stats['updated_saved']}")
     logger.info(f"Already Exists (Unchanged): {overall_stats['already_exists']}")
@@ -591,3 +612,4 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"\nInvoice fetch failed: {e}", exc_info=True)
         exit(1)
+
