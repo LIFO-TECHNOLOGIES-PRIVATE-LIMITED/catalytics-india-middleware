@@ -1,10 +1,9 @@
-import importlib
+import tally_client
 from typing import Any, Dict, List, Optional
 
 
 def _load_client():
-    # "import" is a reserved keyword; load module dynamically.
-    return importlib.import_module("import.tally_client")
+    return tally_client
 
 
 def get_companies(url: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -15,6 +14,12 @@ def get_companies(url: Optional[str] = None) -> List[Dict[str, Any]]:
 def get_ledgers(company_name: str, url: Optional[str] = None) -> List[Dict[str, Any]]:
     client = _load_client()
     return client.get_ledgers(company_name, url)
+
+
+def get_sundry_debtors(company_name: str, url: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get only Sundry Debtor ledgers (customers) - more efficient than get_ledgers"""
+    client = _load_client()
+    return client.get_sundry_debtors(company_name, url)
 
 
 def get_stock_items(company_name: str, url: Optional[str] = None) -> List[Dict[str, Any]]:

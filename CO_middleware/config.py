@@ -21,20 +21,27 @@ def load_env_file(path: Optional[str]) -> None:
             value = value.strip().strip("'").strip('"')
             if not key:
                 continue
-            existing = os.environ.get(key)
-            if existing is None or str(existing).strip() == "":
-                os.environ[key] = value
+            os.environ[key] = value
 
 
 def resolve_env_path(default_dir: str) -> str:
-    # Priority: explicit env var -> cwd/.env -> default_dir/.env
+    # Priority: explicit env var -> default_dir/.env -> cwd/.env
     env_override = os.environ.get("TALLY_ENV_PATH")
     if env_override:
         return env_override
+    
+    # First try the script directory
+    default_env = os.path.join(default_dir, ".env")
+    if os.path.exists(default_env):
+        return default_env
+    
+    # Then try current working directory
     cwd_env = os.path.join(os.getcwd(), ".env")
     if os.path.exists(cwd_env):
         return cwd_env
-    return os.path.join(default_dir, ".env")
+    
+    # Fall back to default_dir even if it doesn't exist
+    return default_env
 
 
 def get_env(name: str, default: Optional[str] = None) -> Optional[str]:

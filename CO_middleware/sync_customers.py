@@ -63,13 +63,7 @@ def _fetch_unsynced(
         """,
         tuple(params),
     ).fetchall()
-    filtered: List[Dict[str, Any]] = []
-    for row in rows:
-        data_json = row["data_json"]
-        ledger_data = db.json_loads(data_json) if data_json else {}
-        if _is_sundry_debtor(ledger_data):
-            filtered.append(dict(row))
-    return filtered
+    return [dict(row) for row in rows]
 
 
 def _build_payload_for_ledger(
@@ -79,7 +73,84 @@ def _build_payload_for_ledger(
     company_name: Optional[str],
 ) -> Dict[str, Any]:
     ledger = db.json_loads(ledger_row["data_json"]) or {}
-    payload: Dict[str, Any] = {"ledger": ledger}
+    
+    # Extract key fields for easier access by Catalytics
+    # GST Number
+    gstin = ""
+    gst_details_list = ledger.get("GSTDETAILS_LIST") or []
+    if gst_details_list and isinstance(gst_details_list, list):
+        gstin = gst_details_list[0].get("GSTIN", "")
+    if not gstin:
+        gstin = ledger.get("GSTIN", "")
+    
+    # PAN Number
+    pan = (
+        ledger.get("PAN")
+        or ledger.get("INCOMETAXNUMBER")
+        or ledger.get("LEDGERPANNUMBER")
+        or ledger.get("PANNUMBER")
+        or ""
+    )
+    
+    # Address, PIN, State, Country from mailing details
+    pincode = ""
+    state = ""
+    country = ""
+    address = ""
+    
+    mailing_list = ledger.get("LEDMAILINGDETAILS_LIST") or ledger.get("LEDGERMAILINGDETAILS_LIST") or []
+    if mailing_list and isinstance(mailing_list, list):
+        mailing = mailing_list[0]
+        pincode = mailing.get("PINCODE", "")
+        state = mailing.get("STATE", "")
+        country = mailing.get("COUNTRY", "")
+        # Try to get address from mailing details
+        address_list = mailing.get("ADDRESS_LIST", [])
+        if address_list and isinstance(address_list, list):
+            # Join all address lines
+            address_lines = []
+            for addr_item in address_list:
+                if isinstance(addr_item, dict):
+                    addr_text = addr_item.get("ADDRESS", "")
+                    if addr_text:
+                        address_lines.append(addr_text)
+            address = ", ".join(address_lines)
+    
+    # Fallback to top-level fields
+    if not pincode:
+        pincode = ledger.get("PINCODE", "")
+    if not state:
+        state = ledger.get("STATE", "")
+    if not country:
+        country = ledger.get("COUNTRY", "")
+    
+    # Mobile and Email
+    mobile = ledger.get("MOBILE", "")
+    email = ledger.get("EMAIL") or ledger.get("EMAILID") or ledger.get("LEDGEREMAILID") or ""
+    
+    # GUID for unique identification
+    guid = (
+        ledger.get("GUID")
+        or ledger.get("MASTERID")
+        or ledger.get("ALTERID")
+        or ledger.get("REMOTEALTGUID")
+        or ledger.get("REMOTEID")
+        or ""
+    )
+    
+    payload: Dict[str, Any] = {
+        "ledger": ledger,  # Full Tally data
+        # Extracted fields for easy access
+        "guid": str(guid).strip(),
+        "gstin": str(gstin).strip(),
+        "pan": str(pan).strip(),
+        "pincode": str(pincode).strip(),
+        "state": str(state).strip(),
+        "country": str(country).strip(),
+        "address": str(address).strip(),
+        "mobile": str(mobile).strip(),
+        "email": str(email).strip(),
+    }
     if entity_id:
         payload["entity_id"] = entity_id
     if company_name:
@@ -222,7 +293,7 @@ def _sync_deleted_customers(
     if not deleted_ledgers:
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-customer-delete/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-customer-delete/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
@@ -359,10 +430,16 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("No unsynced ledgers found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/import/tally-customer-payload/"
+    endpoint = config.api_base_url.rstrip("/") + "/tally-customer-payload/"
     headers = {}
     if config.api_key:
         headers["X-API-Key"] = config.api_key
+    
+    logger.info(f"=== SYNC CUSTOMERS TO CATALYTICS ===")
+    logger.info(f"Endpoint: {endpoint}")
+    logger.info(f"Headers: X-API-Key={'SET' if config.api_key else 'NOT SET'}")
+    logger.info(f"Entity ID: {config.entity_id}")
+    logger.info(f"Found {len(ledgers)} unsynced customers")
 
     total_sent = 0
     total_ok = 0
@@ -422,7 +499,11 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             continue
 
         try:
+            logger.info(f"POST {endpoint}")
+            logger.info(f"Headers: {headers}")
+            logger.info(f"Payload: entity_id={batch_payload.get('entity_id')}, items={len(ledger_payloads)}")
             resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
+            logger.info(f"Response: {resp.status_code} - {resp.text[:200]}")
             total_sent += len(ledger_payloads)
         except Exception as exc:
             logger.exception("API request failed")

@@ -1,3 +1,4 @@
+import logging
 import os
 import socket
 import sys
@@ -73,9 +74,11 @@ class RunnerState:
         self.last_product_sync_at: Optional[str] = None
         self.product_fetch_stats: Dict[str, int] = {}
         self.product_sync_stats: Dict[str, int] = {}
+        self.next_run_at: Optional[str] = None
         self.interval_sec = 300
         self.customer_interval_sec: Optional[int] = None
         self.product_interval_sec: Optional[int] = None
+        self.env_path = DEFAULT_ENV_PATH
         self.source_doc = _normalize_source_doc(cfg.get_env("TALLY_SOURCE_DOC", "delivery_note"))
         self.activity: List[Dict[str, Any]] = []
 
@@ -119,6 +122,7 @@ class RunnerState:
             "last_product_sync_at": self.last_product_sync_at,
             "product_fetch_stats": self.product_fetch_stats,
             "product_sync_stats": self.product_sync_stats,
+            "next_run_at": self.next_run_at,
             "interval_sec": self.interval_sec,
             "customer_interval_sec": self.customer_interval_sec,
             "product_interval_sec": self.product_interval_sec,
@@ -145,26 +149,26 @@ def _get_interval(name: str, fallback: int) -> int:
 
 def _env_namespace() -> SimpleNamespace:
     return SimpleNamespace(
-        config=None,
-        db_path=None,
-        tally_url=None,
-        company=None,
-        entity_id=None,
-        from_date=None,
-        to_date=None,
-        days_back=None,
-        fetch_stock=False,
-        fetch_full=False,
-        dry_run=False,
-        log_level=None,
-        log_json=False,
+        config=STATE.env_path,
+        db_path=cfg.get_env("TALLY_DB_PATH"),
+        tally_url=cfg.get_env("TALLY_URL"),
+        company=cfg.get_env("TALLY_COMPANY"),
+        entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
+        from_date=cfg.get_env("TALLY_FROM_DATE"),
+        to_date=cfg.get_env("TALLY_TO_DATE"),
+        days_back=cfg.get_env_int("TALLY_DAYS_BACK"),
+        fetch_stock=cfg.get_env_bool("TALLY_FETCH_STOCK", False),
+        fetch_full=cfg.get_env_bool("TALLY_FETCH_FULL", False),
+        dry_run=cfg.get_env_bool("SYNC_DRY_RUN", False),
+        log_level=cfg.get_env("LOG_LEVEL", "INFO"),
+        log_json=cfg.get_env_bool("LOG_JSON", False),
         log_file=None,
-        api_base_url=None,
-        api_key=None,
-        batch_size=None,
-        limit=None,
-        max_attempts=None,
-        allow_tally_fetch=False,
+        api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
+        api_key=cfg.get_env("CATALYTICS_API_KEY"),
+        batch_size=cfg.get_env_int("SYNC_BATCH_SIZE"),
+        limit=cfg.get_env_int("SYNC_LIMIT"),
+        max_attempts=cfg.get_env_int("SYNC_MAX_ATTEMPTS", 100),
+        allow_tally_fetch=cfg.get_env_bool("SYNC_ALLOW_TALLY_FETCH", True),
     )
 
 
@@ -240,46 +244,73 @@ def _run_sync_products():
 
 
 def _loop_worker():
+    next_dc_fetch_ts = time.time()
     next_customer_ts = time.time()
     next_product_ts = time.time()
+    logger = logging.getLogger("automation_loop")
     while not STATE.stop_event.is_set():
         acquired = STATE.busy_lock.acquire(timeout=1)
         if not acquired:
             time.sleep(1)
             continue
 
-        do_customers = cfg.get_env_bool("AUTO_SYNC_CUSTOMERS", False)
-        do_products = cfg.get_env_bool("AUTO_SYNC_PRODUCTS", False)
-        total_steps = 2  # fetch DC + sync DC
-        if do_customers and time.time() >= next_customer_ts:
-            total_steps += 2
-        if do_products and time.time() >= next_product_ts:
-            total_steps += 2
-        step_num = 0
-        cycle_errors: List[str] = []
-
-        with STATE.lock:
-            STATE.busy = True
-            STATE.status = "running"
-            STATE.errors = []
-
         try:
-            # --- DC Fetch ---
-            step_num += 1
-            with STATE.lock:
-                STATE.set_step("Fetching DCs from Tally", step_num, total_steps)
-            try:
-                stats = _run_fetch()
-                with STATE.lock:
-                    STATE.fetch_stats = stats
-                    STATE.last_fetch_at = _now_iso()
-                    STATE.add_activity("Fetch DCs", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
-            except Exception as exc:
-                cycle_errors.append(f"DC Fetch: {exc}")
-                with STATE.lock:
-                    STATE.add_activity("Fetch DCs", "error", str(exc))
+            # Reload config to pick up any changes in .env
+            cfg.load_env_file(STATE.env_path)
+            
+            # Update interval/settings from config if changed
+            interval_env = cfg.get_env_int("SYNC_INTERVAL")
+            if interval_env and interval_env >= 10:
+                STATE.interval_sec = interval_env
+            
+            STATE.source_doc = _normalize_source_doc(cfg.get_env("TALLY_SOURCE_DOC", "delivery_note"))
 
-            # --- DC Sync ---
+            do_customers = cfg.get_env_bool("AUTO_SYNC_CUSTOMERS", True)
+            do_products = cfg.get_env_bool("AUTO_SYNC_PRODUCTS", True)
+            
+            # Calculate total steps for UI progress bar
+            # Sync steps happen every cycle; Fetch steps are throttled.
+            total_steps = 1 # Sync DC (Always)
+            if time.time() >= next_dc_fetch_ts:
+                total_steps += 1
+                
+            if do_customers:
+                total_steps += 1 # Sync Customers (Always)
+                if time.time() >= next_customer_ts:
+                    total_steps += 1 # Fetch Customers (Throttled)
+                    
+            if do_products:
+                total_steps += 1 # Sync Products (Always)
+                if time.time() >= next_product_ts:
+                    total_steps += 1 # Fetch Products (Throttled)
+                
+            step_num = 0
+            cycle_errors: List[str] = []
+
+            with STATE.lock:
+                STATE.busy = True
+                STATE.status = "running"
+                STATE.errors = []
+
+            # --- 1. DC Fetch ---
+            if time.time() >= next_dc_fetch_ts:
+                step_num += 1
+                with STATE.lock:
+                    STATE.set_step("Fetching DCs from Tally", step_num, total_steps)
+                try:
+                    stats = _run_fetch()
+                    next_dc_fetch_ts = time.time() + STATE.interval_sec
+                    with STATE.lock:
+                        STATE.fetch_stats = stats
+                        STATE.last_fetch_at = _now_iso()
+                        STATE.add_activity("Fetch DCs", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
+                except Exception as exc:
+                    cycle_errors.append(f"DC Fetch: {exc}")
+                    logger.error(f"DC Fetch failed: {exc}")
+                    with STATE.lock:
+                        STATE.add_activity("Fetch DCs", "error", str(exc))
+
+            # --- 2. DC Sync (Every Cycle) ---
             step_num += 1
             with STATE.lock:
                 STATE.set_step("Syncing DCs to Catalytics", step_num, total_steps)
@@ -288,83 +319,97 @@ def _loop_worker():
                 with STATE.lock:
                     STATE.sync_stats = stats
                     STATE.last_sync_at = _now_iso()
-                    STATE.add_activity("Sync DCs", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
+                    if stats.get('sent', 0) > 0:
+                        STATE.add_activity("Sync DCs", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
             except Exception as exc:
                 cycle_errors.append(f"DC Sync: {exc}")
+                logger.error(f"DC Sync failed: {exc}")
                 with STATE.lock:
                     STATE.add_activity("Sync DCs", "error", str(exc))
 
-            # --- Customer Fetch + Sync ---
+            # --- 3. Customer Fetch + Sync ---
             if do_customers:
-                customer_interval = _get_interval("AUTO_SYNC_CUSTOMERS_INTERVAL_SEC", STATE.interval_sec)
+                customer_interval = _get_interval("AUTO_SYNC_CUSTOMERS_INTERVAL_SEC", STATE.interval_sec * 4)
                 with STATE.lock:
                     STATE.customer_interval_sec = customer_interval
+                
+                # Fetch (Throttled)
                 if time.time() >= next_customer_ts:
                     step_num += 1
                     with STATE.lock:
                         STATE.set_step("Fetching Customers from Tally", step_num, total_steps)
                     try:
                         stats = _run_fetch_customers()
+                        next_customer_ts = time.time() + customer_interval
                         with STATE.lock:
                             STATE.customer_fetch_stats = stats
                             STATE.last_customer_fetch_at = _now_iso()
                             STATE.add_activity("Fetch Customers", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
                     except Exception as exc:
                         cycle_errors.append(f"Customer Fetch: {exc}")
+                        logger.error(f"Customer Fetch failed: {exc}")
                         with STATE.lock:
                             STATE.add_activity("Fetch Customers", "error", str(exc))
 
-                    step_num += 1
+                # Sync (Every Cycle)
+                step_num += 1
+                with STATE.lock:
+                    STATE.set_step("Syncing Customers to Catalytics", step_num, total_steps)
+                try:
+                    stats = _run_sync_customers()
                     with STATE.lock:
-                        STATE.set_step("Syncing Customers to Catalytics", step_num, total_steps)
-                    try:
-                        stats = _run_sync_customers()
-                        with STATE.lock:
-                            STATE.customer_sync_stats = stats
-                            STATE.last_customer_sync_at = _now_iso()
+                        STATE.customer_sync_stats = stats
+                        STATE.last_customer_sync_at = _now_iso()
+                        if stats.get('sent', 0) > 0:
                             STATE.add_activity("Sync Customers", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
-                    except Exception as exc:
-                        cycle_errors.append(f"Customer Sync: {exc}")
-                        with STATE.lock:
-                            STATE.add_activity("Sync Customers", "error", str(exc))
-                    next_customer_ts = time.time() + customer_interval
+                except Exception as exc:
+                    cycle_errors.append(f"Customer Sync: {exc}")
+                    logger.error(f"Customer Sync failed: {exc}")
+                    with STATE.lock:
+                        STATE.add_activity("Sync Customers", "error", str(exc))
 
-            # --- Product Fetch + Sync ---
+            # --- 4. Product Fetch + Sync ---
             if do_products:
-                product_interval = _get_interval("AUTO_SYNC_PRODUCTS_INTERVAL_SEC", STATE.interval_sec)
+                product_interval = _get_interval("AUTO_SYNC_PRODUCTS_INTERVAL_SEC", STATE.interval_sec * 4)
                 with STATE.lock:
                     STATE.product_interval_sec = product_interval
+                
+                # Fetch (Throttled)
                 if time.time() >= next_product_ts:
                     step_num += 1
                     with STATE.lock:
                         STATE.set_step("Fetching Products from Tally", step_num, total_steps)
                     try:
                         stats = _run_fetch_products()
+                        next_product_ts = time.time() + product_interval
                         with STATE.lock:
                             STATE.product_fetch_stats = stats
                             STATE.last_product_fetch_at = _now_iso()
                             STATE.add_activity("Fetch Products", "ok", f"created={stats.get('created',0)} updated={stats.get('updated',0)} deleted={stats.get('deleted',0)}")
                     except Exception as exc:
                         cycle_errors.append(f"Product Fetch: {exc}")
+                        logger.error(f"Product Fetch failed: {exc}")
                         with STATE.lock:
                             STATE.add_activity("Fetch Products", "error", str(exc))
 
-                    step_num += 1
+                # Sync (Every Cycle)
+                step_num += 1
+                with STATE.lock:
+                    STATE.set_step("Syncing Products to Catalytics", step_num, total_steps)
+                try:
+                    stats = _run_sync_products()
                     with STATE.lock:
-                        STATE.set_step("Syncing Products to Catalytics", step_num, total_steps)
-                    try:
-                        stats = _run_sync_products()
-                        with STATE.lock:
-                            STATE.product_sync_stats = stats
-                            STATE.last_product_sync_at = _now_iso()
+                        STATE.product_sync_stats = stats
+                        STATE.last_product_sync_at = _now_iso()
+                        if stats.get('sent', 0) > 0:
                             STATE.add_activity("Sync Products", "ok", f"sent={stats.get('sent',0)} ok={stats.get('ok',0)} failed={stats.get('failed',0)}")
-                    except Exception as exc:
-                        cycle_errors.append(f"Product Sync: {exc}")
-                        with STATE.lock:
-                            STATE.add_activity("Sync Products", "error", str(exc))
-                    next_product_ts = time.time() + product_interval
+                except Exception as exc:
+                    cycle_errors.append(f"Product Sync: {exc}")
+                    logger.error(f"Product Sync failed: {exc}")
+                    with STATE.lock:
+                        STATE.add_activity("Sync Products", "error", str(exc))
 
-            # --- Finalize cycle ---
+            # Finalize cycle
             with STATE.lock:
                 STATE.clear_step()
                 if cycle_errors:
@@ -375,18 +420,32 @@ def _loop_worker():
                     STATE.last_error = None
                     STATE.errors = []
                     STATE.status = "idle"
+                    
+                # Estimate next run time
+                next_ts = time.time() + STATE.interval_sec
+                STATE.next_run_at = datetime.fromtimestamp(next_ts).strftime("%Y-%m-%d %H:%M:%S")
+
+        except Exception as global_exc:
+            logger.exception("Fatal error in automation loop cycle")
+            with STATE.lock:
+                STATE.add_activity("Loop Cycle", "fatal_error", str(global_exc))
+                STATE.status = "error"
+                STATE.last_error = f"Global: {global_exc}"
+                
         finally:
             with STATE.lock:
                 STATE.busy = False
                 STATE.clear_step()
             STATE.busy_lock.release()
 
+        # Wait for the next cycle, or exit if stop_event is set
         if STATE.stop_event.wait(STATE.interval_sec):
             break
 
     with STATE.lock:
         STATE.running = False
         STATE.status = "stopped"
+        STATE.next_run_at = "-"
 
 
 def _start_loop(interval_sec: Optional[int] = None) -> bool:
@@ -2459,6 +2518,7 @@ def _html_page() -> str:
       document.getElementById('lastCustomerFetch').innerText = s.last_customer_fetch_at || '-';
       document.getElementById('lastProductFetch').innerText = s.last_product_fetch_at || '-';
       const sourceDoc = s.source_doc || 'delivery_note';
+      document.getElementById('nextRun').innerText = s.next_run_at || '-';
       const modeLabel = sourceDoc === 'sales_invoice' ? 'Sales Invoice -> DC' : 'Delivery Note -> DC';
       document.getElementById('sourceMode').innerText = modeLabel;
 

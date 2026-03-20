@@ -112,13 +112,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     conn = db.connect(config.db_path)
     db.init_db(conn)
 
-    from_date, to_date = _default_date_range(config.days_back)
-    if config.from_date:
-        from_date = config.from_date
-    if config.to_date:
-        to_date = config.to_date
-
-    logger.info("Using date range %s to %s", from_date, to_date)
+    # Get company
     companies = tally_api.get_companies(config.tally_url)
     available = [c.get("name") for c in companies]
     company_match = None
@@ -139,8 +133,61 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         tally_url=config.tally_url,
     )
 
-    vouchers = tally_api.get_sales_invoices(company_name, config.tally_url, from_date, to_date)
-    logger.info("Fetched %d sales invoices from Tally", len(vouchers))
+    # Get date range
+    if config.from_date and config.to_date:
+        from_date = config.from_date
+        to_date = config.to_date
+        logger.info("Using user-specified date range %s to %s", from_date, to_date)
+    else:
+        # Use default range (days_back or financial year)
+        from_date, to_date = _default_date_range(config.days_back)
+        logger.info("Using default date range %s to %s (days_back=%s)", from_date, to_date, config.days_back)
+
+    logger.info("=" * 70)
+    logger.info("DC FETCH DEBUG INFO")
+    logger.info("=" * 70)
+    logger.info("Tally URL: %s", config.tally_url)
+    logger.info("Company: %s", company_name)
+    logger.info("Date Range: %s to %s", from_date, to_date)
+    logger.info("Days Back: %s", config.days_back)
+    logger.info("Fetch Stock: %s", config.fetch_stock)
+    logger.info("=" * 70)
+
+    vouchers = tally_api.get_delivery_notes(company_name, config.tally_url, from_date, to_date)
+    logger.info("Fetched %d delivery notes (DCs) from Tally", len(vouchers))
+    
+    # CRITICAL: Filter by date in Python because Tally's XML date filter doesn't work reliably
+    # Tally returns ALL vouchers regardless of SVFROMDATE/SVTODATE in some versions
+    filtered_vouchers = []
+    for v in vouchers:
+        voucher_date = v.get("DATE") or ""
+        # Check if voucher date is within our range
+        if voucher_date >= from_date and voucher_date <= to_date:
+            filtered_vouchers.append(v)
+        else:
+            logger.debug("Filtered out DC with date %s (outside range %s to %s)", voucher_date, from_date, to_date)
+    
+    if len(filtered_vouchers) < len(vouchers):
+        logger.warning(
+            "Tally returned %d DCs but only %d are within date range %s to %s. "
+            "Filtered out %d old DCs.",
+            len(vouchers), len(filtered_vouchers), from_date, to_date,
+            len(vouchers) - len(filtered_vouchers)
+        )
+    
+    vouchers = filtered_vouchers
+    logger.info("After date filtering: %d delivery notes (DCs)", len(vouchers))
+    
+    if vouchers:
+        logger.info("Sample DC dates:")
+        for i, v in enumerate(vouchers[:5]):  # Show first 5
+            logger.info("  DC #%d: %s (Date: %s, Party: %s)", 
+                       i+1, 
+                       v.get("VOUCHERNUMBER", "?"),
+                       v.get("DATE", "?"),
+                       v.get("PARTYLEDGERNAME", "?"))
+    else:
+        logger.info("No DCs found in date range %s to %s", from_date, to_date)
 
     created = 0
     updated = 0
@@ -184,8 +231,10 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         inventory_items = voucher.get("INVENTORY") or []
         db.replace_delivery_note_items(conn, delivery_note_id=dn_id, items=inventory_items)
 
+        # Only fetch ledger and stock items if fetch_stock is enabled
+        # This speeds up DC fetch significantly (avoids 10+ second cooldowns per fetch)
         ledger_data = None
-        if party_name:
+        if config.fetch_stock and party_name:
             ledger_data = tally_api.get_ledger_by_name(company_name, party_name, config.tally_url)
             if ledger_data:
                 db.upsert_json_row(
@@ -317,6 +366,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         ledgers_fetched,
         stock_items_fetched,
     )
+    
     return {"created": created, "updated": updated, "skipped": skipped, "deleted": deleted}
 
 
