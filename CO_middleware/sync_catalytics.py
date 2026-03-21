@@ -105,6 +105,111 @@ def _load_stock_items(conn, company_id: int, inventory_items: List[Dict[str, Any
     return stock_map
 
 
+_NON_PO_VALUES = {
+    'delivery', 'invoice', 'sales', 'bill', 'challan', 'dc', 'dispatch',
+    'shipment', 'yes', 'no', 'standard', 'normal', 'express',
+    'not applicable', 'n/a', 'na', 'nil', 'none', '-',
+    'customer pickup', 'customerpickup', 'pickup', 'self pickup', 'selfpickup', 'self',
+}
+_NON_PO_KEYWORDS = (
+    'customer pickup', 'customerpickup', 'pickup', 'self pickup',
+    'selfpickup', 'self', 'delivery', 'dispatch', 'challan',
+)
+_PO_FIELDS = [
+    'PARTYORDERNO', 'AGGREMENTORDERNO',
+    'ORDERREF', 'ORDERINGNO', 'REFNO', 'REFERENCE',
+    'PONUMBER', 'BASICORDERREF', 'VOUCHERREFERENCE',
+]
+_PO_DATE_FIELDS = ['PARTYORDERDATE', 'AGGREMENTORDERDATE', 'ORDERDATE', 'PODATE', 'REFERENCEDATE']
+
+
+def _extract_po_number(voucher: Dict[str, Any]) -> str:
+    for field in _PO_FIELDS:
+        value = (voucher.get(field) or "").strip()
+        if not value:
+            continue
+        vl = value.lower()
+        if vl in _NON_PO_VALUES:
+            continue
+        if any(k in vl for k in _NON_PO_KEYWORDS):
+            continue
+        if len(value) >= 1 and (any(c.isdigit() for c in value) or len(value) > 3):
+            return value
+    return ""
+
+
+def _extract_po_date(voucher: Dict[str, Any]) -> str:
+    for field in _PO_DATE_FIELDS:
+        val = (voucher.get(field) or "").strip()
+        if val:
+            digits = ''.join(ch for ch in val if ch.isdigit())
+            if len(digits) == 8:
+                return digits[0:4] + '-' + digits[4:6] + '-' + digits[6:8]
+            return val
+    return ""
+
+
+def _enrich_voucher(
+    voucher: Dict[str, Any],
+    note: Dict[str, Any],
+    items: List[Dict[str, Any]],
+) -> None:
+    """Enrich voucher with fields the backend expects, matching arasan patterns."""
+    # Ensure basic identity fields
+    voucher.setdefault("VOUCHERNUMBER", note.get("dc_no") or "")
+    voucher.setdefault("DATE", note.get("voucher_date") or "")
+    voucher.setdefault("PARTYLEDGERNAME", note.get("party_ledger_name") or "")
+
+    # FILLINGSTATION: voucher godown > item godown > env default
+    if not voucher.get("FILLINGSTATION"):
+        for key in ("GODOWNNAME", "LOCATIONNAME"):
+            val = (voucher.get(key) or "").strip()
+            if val:
+                voucher["FILLINGSTATION"] = val
+                break
+    if not voucher.get("FILLINGSTATION"):
+        for item in items:
+            godown = (item.get("GODOWNNAME") or "").strip()
+            if godown:
+                voucher["FILLINGSTATION"] = godown
+                break
+    if not voucher.get("FILLINGSTATION"):
+        default_fs = os.getenv("DEFAULT_FILLING_STATION", "").strip()
+        if default_fs:
+            voucher["FILLINGSTATION"] = default_fs
+
+    # PO number
+    po_number = _extract_po_number(voucher)
+    if po_number:
+        voucher["PARTYORDERNO"] = po_number
+        voucher["PONUMBER"] = po_number
+    else:
+        voucher.pop("PARTYORDERNO", None)
+        voucher.pop("PONUMBER", None)
+        voucher.pop("BASICORDERREF", None)
+
+    # PO date
+    po_date = _extract_po_date(voucher) if po_number else ""
+    if po_number and po_date:
+        voucher["PARTYORDERDATE"] = po_date
+        voucher["PODATE"] = po_date
+    else:
+        voucher.pop("PARTYORDERDATE", None)
+        voucher.pop("PODATE", None)
+
+    # Terms of delivery (customer pickup detection)
+    other_ref = str(voucher.get("BASICORDERREF") or "").strip().lower()
+    if "customer pickup" in other_ref or "pickup" in other_ref:
+        voucher.setdefault("TERMSOFDELIVERY", "Customer Pickup")
+
+    # LEDGERENTRIES fallback
+    if not voucher.get("LEDGERENTRIES"):
+        party = voucher.get("PARTYLEDGERNAME") or ""
+        amount = voucher.get("AMOUNT") or ""
+        if party:
+            voucher["LEDGERENTRIES"] = [{"LEDGERNAME": party, "AMOUNT": str(amount)}]
+
+
 def _build_payload_for_note(
     conn,
     note: Dict[str, Any],
@@ -116,6 +221,9 @@ def _build_payload_for_note(
     voucher = db.json_loads(note["data_json"]) or {}
     items = _load_items(conn, note["id"])
     voucher["INVENTORY"] = items
+
+    # Enrich voucher with all fields the backend expects
+    _enrich_voucher(voucher, note, items)
 
     party_name = note.get("party_ledger_name") or voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME")
     ledger_data = _load_ledger(conn, note["company_id"], party_name)
@@ -405,6 +513,15 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             dc_no = _norm_dc_no(dc_no_raw)
             if dc_no:
                 payload_hashes[dc_no] = payload_hash
+            logger.info(
+                "  DC #%s | party=%s | date=%s | filling_station=%s | po=%s | items=%d",
+                dc_no or "?",
+                voucher.get("PARTYLEDGERNAME") or "?",
+                voucher.get("DATE") or "?",
+                voucher.get("FILLINGSTATION") or "[EMPTY]",
+                voucher.get("PARTYORDERNO") or "[EMPTY]",
+                len(voucher.get("INVENTORY") or []),
+            )
 
         batch_payload = {
             "vouchers": vouchers,

@@ -2197,6 +2197,11 @@
                 </div>
             </div>
             <!-- Single company mode - no company selector -->
+            <!-- Active Companies chips -->
+            <div id="active-companies-section" style="margin-top: 12px; display: none;">
+                <div style="font-size: 12px; font-weight: 600; color: #555; margin-bottom: 6px;">Active Tally Companies:</div>
+                <div id="active-companies-chips" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
+            </div>
         </div>
 
         <!-- Statistics Grid -->
@@ -2282,6 +2287,14 @@
         <!-- Data Tables -->
         <div class="card" id="data-records-section">
             <h2>Data Records</h2>
+            <!-- Step Progress Bar -->
+            <div id="stepBar" class="step-bar hidden">
+                <span class="step-label pulse" id="stepLabel">Processing...</span>
+                <div class="step-progress">
+                    <div class="step-fill" id="stepFill" style="width: 0%"></div>
+                </div>
+                <span class="step-count" id="stepCount">0/0</span>
+            </div>
             <div class="data-tabs">
                 <button id="tab-invoices" class="data-tab active" data-tab="invoices"
                     onclick="switchDataTab('invoices')">Invoices/DCs</button>
@@ -2695,11 +2708,199 @@
         
       
 
+        <!-- Terminal Output -->
+        <div class="card">
+            <h2>Terminal Output</h2>
+            <p style="color: #666; margin-bottom: 10px;">Live terminal output from fetch and sync operations</p>
+            <div id="terminal-output" style="
+                background: #0d1117;
+                color: #00ff00;
+                padding: 15px;
+                border-radius: 5px;
+                font-family: 'Courier New', monospace;
+                font-size: 12px;
+                max-height: 400px;
+                min-height: 200px;
+                overflow-y: auto;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                border: 2px solid #30363d;
+                box-shadow: inset 0 0 5px rgba(0,0,0,0.3);
+                margin-bottom: 10px;
+                line-height: 1.4;
+            ">Waiting for operations...</div>
+            <div style="display: flex; gap: 10px;">
+                <button class="btn btn-secondary" onclick="refreshTerminalOutput()" style="flex: 1;">&#x1F504; Refresh Logs</button>
+                <button class="btn btn-danger" onclick="clearTerminalLogs()" style="flex: 1;">&#x1F5D1; Clear Logs</button>
+            </div>
+        </div>
+
         <!-- Activity Timeline -->
-        
+        <div class="card">
+            <h2>Recent Activity</h2>
+            <div class="activity-container" id="activityContainer">
+                <div style="text-align: center; padding: 40px; color: #999;">Loading activity...</div>
+            </div>
+        </div>
+
+        <!-- System Diagnostics -->
+        <div class="card">
+            <h2>System Diagnostics</h2>
+            <p style="color: #666; margin-bottom: 20px;">System health check and statistics</p>
+            <div style="margin-bottom: 20px;">
+                <button class="btn btn-secondary" onclick="fetchDiagnostics()" id="btnDiagnostics" style="width: 100%;">&#x1F504; Refresh Diagnostics</button>
+            </div>
+            <div id="diagnosticsContainer">
+                <div style="text-align: center; padding: 20px; color: #999;">Click refresh to load diagnostics</div>
+            </div>
+        </div>
+
+        <!-- Data Verification -->
+        <div class="card">
+            <h2>Data Verification</h2>
+            <p style="color: #666; margin-bottom: 20px;">Verify data consistency between SQLite and Catalytics</p>
+            <div style="margin-bottom: 20px;">
+                <button class="btn btn-primary" onclick="runDataMatcher()" id="btnVerifyData" style="width: 100%;">&#x2714; Verify Data Matching</button>
+            </div>
+            <div id="matchResultsContainer" style="display: none;">
+                <div id="matchResults"></div>
+            </div>
+        </div>
+
+        <!-- SQLite Database Browser -->
+        <div class="card">
+            <h2>Database Tools</h2>
+            <p style="color: #666; margin-bottom: 20px;">Open the SQLite database files in DB Browser for SQLite</p>
+            <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                <button class="btn btn-secondary" onclick="openSqliteDb('master')" style="flex: 1; min-width: 180px;">
+                    &#x1F5C4; Open Master DB (Customers/Products)
+                </button>
+                <button class="btn btn-secondary" onclick="openSqliteDb('tally')" style="flex: 1; min-width: 180px;">
+                    &#x1F5C4; Open Tally DC DB (Invoices)
+                </button>
+            </div>
+            <div id="openDbResult" style="margin-top: 12px;"></div>
+        </div>
 
         <!-- Data Mapping Info -->
-       
+        <div class="card">
+            <h2>Data Mapping: Tally → Catalytics</h2>
+            <p style="color: #666; margin-bottom: 20px;">Fields fetched from Tally and synced to Catalytics backend</p>
+
+            <!-- Customer Data Mapping -->
+            <div class="data-mapping-section">
+                <h3>Customer Data</h3>
+                <div class="mapping-flow">
+                    <div class="mapping-box">
+                        <h4>From Tally</h4>
+                        <ul class="field-list">
+                            <li><code>NAME</code> - Customer name</li>
+                            <li><code>GSTIN</code> - GST number</li>
+                            <li><code>PAN</code> - PAN card</li>
+                            <li><code>ADDRESS</code> - Full address</li>
+                            <li><code>STATE</code> - State name</li>
+                            <li><code>PINCODE</code> - Postal code</li>
+                            <li><code>MOBILE</code> - Phone number</li>
+                            <li><code>EMAIL</code> - Email address</li>
+                        </ul>
+                    </div>
+                    <div class="mapping-arrow">→</div>
+                    <div class="mapping-box">
+                        <h4>SQLite Middleware</h4>
+                        <ul class="field-list">
+                            <li>Normalized fields</li>
+                            <li>Duplicate prevention</li>
+                            <li>Sync status tracking</li>
+                            <li>Error logging</li>
+                        </ul>
+                    </div>
+                    <div class="mapping-arrow">→</div>
+                    <div class="mapping-box">
+                        <h4>To Catalytics</h4>
+                        <ul class="field-list">
+                            <li>Full Tally ledger JSON</li>
+                            <li><code>/tally-customer-payload/</code></li>
+                            <li>Customer model created</li>
+                            <li>PostgreSQL storage</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Product Data Mapping -->
+            <div class="data-mapping-section">
+                <h3>Product Data</h3>
+                <div class="mapping-flow">
+                    <div class="mapping-box">
+                        <h4>From Tally</h4>
+                        <ul class="field-list">
+                            <li><code>NAME</code> - Stock item name</li>
+                            <li><code>HSNCODE</code> - HSN code</li>
+                            <li><code>BASEUNITS</code> - Unit (CUM, kg)</li>
+                            <li><code>STDCOST</code> - Rate/Price</li>
+                            <li><code>GSTRATE</code> - GST %</li>
+                        </ul>
+                    </div>
+                    <div class="mapping-arrow">→</div>
+                    <div class="mapping-box">
+                        <h4>SQLite Middleware</h4>
+                        <ul class="field-list">
+                            <li>Name parsing (type code)</li>
+                            <li>Canonical name dedup</li>
+                            <li>Sync status tracking</li>
+                            <li>Error logging</li>
+                        </ul>
+                    </div>
+                    <div class="mapping-arrow">→</div>
+                    <div class="mapping-box">
+                        <h4>To Catalytics</h4>
+                        <ul class="field-list">
+                            <li>Parsed product fields</li>
+                            <li><code>/tally-product_name-payload/</code></li>
+                            <li>Product model created</li>
+                            <li>PostgreSQL storage</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Invoice/DC Data Mapping -->
+            <div class="data-mapping-section">
+                <h3>Invoice / DC Data</h3>
+                <div class="mapping-flow">
+                    <div class="mapping-box">
+                        <h4>From Tally</h4>
+                        <ul class="field-list">
+                            <li><code>VOUCHERNUMBER</code> - DC no</li>
+                            <li><code>DATE</code> - Voucher date</li>
+                            <li><code>PARTYLEDGERNAME</code> - Customer</li>
+                            <li><code>INVENTORY</code> - Line items</li>
+                            <li><code>LEDGERENTRIES</code> - Amounts</li>
+                        </ul>
+                    </div>
+                    <div class="mapping-arrow">→</div>
+                    <div class="mapping-box">
+                        <h4>SQLite Middleware</h4>
+                        <ul class="field-list">
+                            <li>Normalized fields</li>
+                            <li>Items JSON serialized</li>
+                            <li>Sync status tracking</li>
+                            <li>Per-company storage</li>
+                        </ul>
+                    </div>
+                    <div class="mapping-arrow">→</div>
+                    <div class="mapping-box">
+                        <h4>To Catalytics</h4>
+                        <ul class="field-list">
+                            <li>Full Tally voucher JSON</li>
+                            <li><code>/tally-dc-name-payload/</code></li>
+                            <li>DeliveryChallan created</li>
+                            <li>PostgreSQL storage</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
 
         <!-- Logs -->
        
@@ -3826,14 +4027,19 @@
                 const syncRespText = pretty(product.last_response_json);
                 const syncError = product.last_sync_error || null;
 
-                //  build tab content 
+                //  build tab content
                 const overviewHtml = `
                     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:6px;">
                         ${[
                         [' Company', product.tally_company || ''],
+                        [' Product Master', product.product_master_name || ''],
+                        [' Variant', product.variant_name || ''],
+                        [' Unit', product.unit_name || product.unit || ''],
+                        [' Type', product.product_type_name ? `${product.product_type_code} — ${product.product_type_name}` : (product.product_type_code || '')],
                         [' HSN Code', product.hsn_code || ''],
-                        [' Unit', product.unit || ''],
                         [' Rate', product.rate != null ? 'INR ' + parseFloat(product.rate).toFixed(2) : ''],
+                        [' GST Rate', product.gst_rate != null ? product.gst_rate + '%' : ''],
+                        [' IGST / CGST / SGST', product.igst_rate != null ? `${product.igst_rate}% / ${product.cgst_rate}% / ${product.sgst_rate}%` : ''],
                         [' Catalytics ID', product.catalytics_id || ''],
                         [' Sync Attempts', product.sync_attempts ?? ''],
                         [' First Fetched', product.first_fetched_at ? new Date(product.first_fetched_at).toLocaleString() : ''],
@@ -5096,6 +5302,27 @@
             }
         }
 
+        // ==================== SQLITE BROWSER ====================
+        async function openSqliteDb(dbType) {
+            const resultEl = document.getElementById('openDbResult');
+            resultEl.innerHTML = '<span style="color:#666;">Opening database...</span>';
+            try {
+                const response = await fetch('/api/open-db', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ db_type: dbType })
+                });
+                const data = await response.json();
+                if (data.success) {
+                    resultEl.innerHTML = `<span style="color:#10b981;">&#x2714; ${data.message}</span>`;
+                } else {
+                    resultEl.innerHTML = `<span style="color:#ef4444;">&#x26A0; ${data.error}</span>`;
+                }
+            } catch (error) {
+                resultEl.innerHTML = `<span style="color:#ef4444;">&#x26A0; Error: ${error.message}</span>`;
+            }
+        }
+
         // Initial load and auto-refresh
         fetchStatus();
         fetchLogs('main');
@@ -5105,6 +5332,7 @@
         fetchProgress();
         fetchAutomationStatus();
         fetchEnvConfig();
+        refreshTerminalOutput();
 
         // Refresh every 5 seconds
         setInterval(fetchStatus, 5000);

@@ -1,7 +1,14 @@
+"""
+Sync customers to Catalytics using tally-customer-payload endpoint.
+Reads from 'customers' table (populated by fetch_customers.py).
+Matches arasan_gas sync_to_catalytics.sync_customers() logic.
+"""
 import argparse
-from dataclasses import dataclass
+import json
 import logging
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional
 import os
 import sys
 
@@ -10,14 +17,29 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import requests
-
 import config as cfg
-import db
+from config import config, BASE_DIR
+from db import Database
 from logging_utils import setup_logging
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
-
 logger = logging.getLogger("tally_sync_customers")
+
+
+def _attach_file_handler():
+    log_path = Path(str(BASE_DIR)) / 'logs' / 'customer_sync.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'customer_sync_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'customer_sync_file'
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+_attach_file_handler()
 
 
 @dataclass
@@ -36,359 +58,44 @@ class SyncConfig:
     log_file: Optional[str]
 
 
-def _fetch_unsynced(
-    conn,
-    *,
-    company_id: Optional[int],
-    limit: int,
-    max_attempts: int,
-) -> List[Dict[str, Any]]:
-    params: List[Any] = [max_attempts]
-    where_company = ""
-    if company_id:
-        where_company = "AND l.company_id = ?"
-        params.append(company_id)
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT l.*, ls.is_synced, ls.attempts, ls.payload_hash
-        FROM ledgers l
-        LEFT JOIN ledger_sync_status ls ON ls.ledger_id = l.id
-        WHERE COALESCE(ls.is_synced, 0) = 0
-          AND COALESCE(ls.attempts, 0) < ?
-          AND COALESCE(l.is_deleted, 0) = 0
-          {where_company}
-        ORDER BY l.updated_at ASC
-        LIMIT ?
-        """,
-        tuple(params),
-    ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def _build_payload_for_ledger(
-    ledger_row: Dict[str, Any],
-    *,
-    entity_id: Optional[int],
-    company_name: Optional[str],
-) -> Dict[str, Any]:
-    ledger = db.json_loads(ledger_row["data_json"]) or {}
-    
-    # Extract key fields for easier access by Catalytics
-    # GST Number
-    gstin = ""
-    gst_details_list = ledger.get("GSTDETAILS_LIST") or []
-    if gst_details_list and isinstance(gst_details_list, list):
-        gstin = gst_details_list[0].get("GSTIN", "")
-    if not gstin:
-        gstin = ledger.get("GSTIN", "")
-    
-    # PAN Number
-    pan = (
-        ledger.get("PAN")
-        or ledger.get("INCOMETAXNUMBER")
-        or ledger.get("LEDGERPANNUMBER")
-        or ledger.get("PANNUMBER")
-        or ""
-    )
-    
-    # Address, PIN, State, Country from mailing details
-    pincode = ""
-    state = ""
-    country = ""
-    address = ""
-    
-    mailing_list = ledger.get("LEDMAILINGDETAILS_LIST") or ledger.get("LEDGERMAILINGDETAILS_LIST") or []
-    if mailing_list and isinstance(mailing_list, list):
-        mailing = mailing_list[0]
-        pincode = mailing.get("PINCODE", "")
-        state = mailing.get("STATE", "")
-        country = mailing.get("COUNTRY", "")
-        # Try to get address from mailing details
-        address_list = mailing.get("ADDRESS_LIST", [])
-        if address_list and isinstance(address_list, list):
-            # Join all address lines
-            address_lines = []
-            for addr_item in address_list:
-                if isinstance(addr_item, dict):
-                    addr_text = addr_item.get("ADDRESS", "")
-                    if addr_text:
-                        address_lines.append(addr_text)
-            address = ", ".join(address_lines)
-    
-    # Fallback to top-level fields
-    if not pincode:
-        pincode = ledger.get("PINCODE", "")
-    if not state:
-        state = ledger.get("STATE", "")
-    if not country:
-        country = ledger.get("COUNTRY", "")
-    
-    # Mobile and Email
-    mobile = ledger.get("MOBILE", "")
-    email = ledger.get("EMAIL") or ledger.get("EMAILID") or ledger.get("LEDGEREMAILID") or ""
-    
-    # GUID for unique identification
-    guid = (
-        ledger.get("GUID")
-        or ledger.get("MASTERID")
-        or ledger.get("ALTERID")
-        or ledger.get("REMOTEALTGUID")
-        or ledger.get("REMOTEID")
-        or ""
-    )
-    
-    payload: Dict[str, Any] = {
-        "ledger": ledger,  # Full Tally data
-        # Extracted fields for easy access
-        "guid": str(guid).strip(),
-        "gstin": str(gstin).strip(),
-        "pan": str(pan).strip(),
-        "pincode": str(pincode).strip(),
-        "state": str(state).strip(),
-        "country": str(country).strip(),
-        "address": str(address).strip(),
-        "mobile": str(mobile).strip(),
-        "email": str(email).strip(),
-    }
-    if entity_id:
-        payload["entity_id"] = entity_id
-    if company_name:
-        payload["company_name"] = company_name
-    return payload
-
-
-def _norm_name(value: Any) -> str:
-    if value is None:
-        return ""
-    # Collapse whitespace and normalize case
-    return " ".join(str(value).split()).strip().casefold()
-
-
-def _is_sundry_debtor(ledger_data: Dict[str, Any]) -> bool:
-    parent = (ledger_data.get("PARENT") or ledger_data.get("PARENTNAME") or "").strip()
-    return bool(parent) and parent.casefold() == "sundry debtors"
-
-
-def _status_is_success(status_val: Optional[str]) -> bool:
-    return status_val in ("created", "updated", "skipped")
-
-
-def _response_indicates_success(response_json: Optional[Dict[str, Any]]) -> bool:
-    if not response_json or response_json.get("status") != "success":
-        return False
-    data = response_json.get("data") or {}
-    errors = data.get("errors")
-    if isinstance(errors, int):
-        return errors == 0
-    # Fall back to presence of created/updated counts
-    created = data.get("created")
-    updated = data.get("updated")
-    if isinstance(created, int) or isinstance(updated, int):
-        return (created or 0) + (updated or 0) > 0
-    return True
-
-
-def _clean_error_text(text: Optional[str]) -> Optional[str]:
-    if not text:
+def _build_ledger_from_customer(customer_row) -> Optional[Dict[str, Any]]:
+    """
+    Extract ledger data from customer row's data_json.
+    Returns the stored Tally ledger dict (uppercase keys), or None.
+    """
+    data_json = customer_row['data_json']
+    if not data_json:
         return None
-    msg = str(text).strip()
-    lower = msg.lower()
-    if "<html" in lower or "<!doctype" in lower:
-        return "Non-JSON HTML response from API"
-    return msg
+    try:
+        stored = json.loads(data_json)
+        if isinstance(stored, dict) and (stored.get('NAME') or stored.get('LEDGERNAME')):
+            return stored
+    except Exception:
+        pass
+    return None
 
 
-def _update_sync_status(
-    conn,
-    *,
-    ledger_id: int,
-    success: bool,
-    payload_hash: str,
-    response_json: Optional[Dict[str, Any]],
-    error_text: Optional[str],
-) -> None:
-    ts = db.now_ts()
-    conn.execute(
-        """
-        INSERT INTO ledger_sync_status
-            (ledger_id, is_synced, attempts, last_attempt_at, synced_at,
-             last_error, last_response_json, payload_hash, created_at, updated_at)
-        VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(ledger_id) DO UPDATE SET
-            is_synced = excluded.is_synced,
-            attempts = ledger_sync_status.attempts + 1,
-            last_attempt_at = excluded.last_attempt_at,
-            synced_at = excluded.synced_at,
-            last_error = excluded.last_error,
-            last_response_json = excluded.last_response_json,
-            payload_hash = excluded.payload_hash,
-            updated_at = excluded.updated_at
-        """,
-        (
-            ledger_id,
-            1 if success else 0,
-            ts,
-            ts if success else None,
-            error_text,
-            db.json_dumps(response_json) if response_json else None,
-            payload_hash,
-            ts,
-            ts,
-        ),
-    )
-
-
-def _fetch_deleted_unsynced(
-    conn,
-    *,
-    company_id: Optional[int],
-    limit: int,
-    max_attempts: int,
-) -> List[Dict[str, Any]]:
-    """Fetch ledgers that are deleted but not yet synced to Catalytics."""
-    params: List[Any] = [max_attempts]
-    where_company = ""
-    if company_id:
-        where_company = "AND l.company_id = ?"
-        params.append(company_id)
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT l.*, ls.is_synced, ls.attempts, ls.payload_hash
-        FROM ledgers l
-        LEFT JOIN ledger_sync_status ls ON ls.ledger_id = l.id
-        WHERE COALESCE(l.is_deleted, 0) = 1
-          AND COALESCE(ls.is_synced, 0) = 0
-          AND COALESCE(ls.attempts, 0) < ?
-          {where_company}
-        ORDER BY l.updated_at ASC
-        LIMIT ?
-        """,
-        tuple(params),
-    ).fetchall()
-    filtered: List[Dict[str, Any]] = []
-    for row in rows:
-        data_json = row["data_json"]
-        ledger_data = db.json_loads(data_json) if data_json else {}
-        if _is_sundry_debtor(ledger_data):
-            filtered.append(dict(row))
-    return filtered
-
-
-def _sync_deleted_customers(
-    conn,
-    *,
-    config: "SyncConfig",
-    company_id: Optional[int],
-    company_name: Optional[str],
-) -> Dict[str, int]:
-    """Sync deleted customer records to Catalytics delete endpoint."""
-    deleted_ledgers = _fetch_deleted_unsynced(
-        conn,
-        company_id=company_id,
-        limit=config.limit,
-        max_attempts=config.max_attempts,
-    )
-    if not deleted_ledgers:
-        return {"sent": 0, "ok": 0, "failed": 0}
-
-    endpoint = config.api_base_url.rstrip("/") + "/tally-customer-delete/"
-    headers = {}
-    if config.api_key:
-        headers["X-API-Key"] = config.api_key
-
-    total_sent = 0
-    total_ok = 0
-    total_fail = 0
-
-    for i in range(0, len(deleted_ledgers), config.batch_size):
-        batch = deleted_ledgers[i : i + config.batch_size]
-        delete_items = []
-        for row in batch:
-            ledger_data = db.json_loads(row["data_json"]) or {}
-            guid = (
-                ledger_data.get("GUID")
-                or ledger_data.get("MASTERID")
-                or ledger_data.get("REMOTEALTGUID")
-                or ledger_data.get("REMOTEID")
-                or ""
-            )
-            delete_items.append({"name": row["name"], "guid": str(guid).strip()})
-
-        batch_payload: Dict[str, Any] = {"delete_customers": delete_items}
-        if config.entity_id:
-            batch_payload["entity_id"] = config.entity_id
-        if company_name:
-            batch_payload["company_name"] = company_name
-
-        if config.dry_run:
-            logger.info("Dry-run: would delete %d customers", len(delete_items))
-            continue
-
-        try:
-            resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
-            total_sent += len(delete_items)
-        except Exception as exc:
-            logger.exception("Delete API request failed")
-            for row in batch:
-                _update_sync_status(
-                    conn,
-                    ledger_id=row["id"],
-                    success=False,
-                    payload_hash="DELETED",
-                    response_json=None,
-                    error_text=str(exc),
-                )
-            conn.commit()
-            total_fail += len(batch)
-            continue
-
-        response_json = None
-        try:
-            response_json = resp.json()
-        except Exception:
-            response_json = {"status": "error", "message": f"HTTP {resp.status_code} non-JSON"}
-
-        results = (response_json.get("data") or {}).get("results") or []
-        results_map = {
-            _norm_name(r.get("name")): r
-            for r in results
-            if isinstance(r, dict) and r.get("name")
-        }
-
-        for row in batch:
-            name_key = _norm_name(row.get("name"))
-            res = results_map.get(name_key) if name_key else None
-            status_val = (res or {}).get("status")
-            success = status_val in ("deleted", "skipped")
-            error_text = None
-            if not success:
-                error_text = (res or {}).get("message") or response_json.get("message") or "delete_sync_failed"
-            _update_sync_status(
-                conn,
-                ledger_id=row["id"],
-                success=success,
-                payload_hash="DELETED",
-                response_json=response_json,
-                error_text=error_text,
-            )
-            if success:
-                total_ok += 1
-            else:
-                total_fail += 1
-
-        conn.commit()
-
-    logger.info("Customer delete sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
-    return {"sent": total_sent, "ok": total_ok, "failed": total_fail}
+def _clean_gstin(ledger: Dict[str, Any]) -> None:
+    """Strip leading colon from GSTIN fields (Tally sometimes prefixes with ':')."""
+    for gst_key in ('GSTIN', 'PARTYGSTIN', 'gstin'):
+        if isinstance(ledger.get(gst_key), str) and ledger[gst_key].startswith(':'):
+            ledger[gst_key] = ledger[gst_key].lstrip(':')
+    for gst_detail in ledger.get('LEDGSTREGDETAILS_LIST', []):
+        if isinstance(gst_detail, dict):
+            val = gst_detail.get('GSTIN', '')
+            if isinstance(val, str) and val.startswith(':'):
+                gst_detail['GSTIN'] = val.lstrip(':')
 
 
 def build_config(args: argparse.Namespace) -> SyncConfig:
-    env_path = getattr(args, "config", None) or DEFAULT_ENV_PATH
+    env_path = getattr(args, 'config', None) or DEFAULT_ENV_PATH
     cfg.load_env_file(env_path)
+    # Use SQLITE_DB_PATH for master data (customers table), not TALLY_DB_PATH (DC tables)
+    db_path = cfg.get_env("SQLITE_DB_PATH") or ""
+    if db_path and not os.path.isabs(db_path):
+        db_path = str(Path(ROOT_DIR) / db_path)
     return SyncConfig(
-        db_path=args.db_path or cfg.get_env("TALLY_DB_PATH") or "",
+        db_path=db_path,
         api_base_url=args.api_base_url or cfg.get_env("CATALYTICS_API_BASE_URL") or "",
         api_key=args.api_key or cfg.get_env("CATALYTICS_API_KEY"),
         entity_id=args.entity_id or cfg.get_env_int("CATALYTICS_ENTITY_ID"),
@@ -409,217 +116,219 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
     if not config.db_path or not config.api_base_url:
         raise ValueError("db_path and api_base_url are required")
 
-    conn = db.connect(config.db_path)
-    db.init_db(conn)
+    db = Database(config.db_path)
+    customers = db.get_unsynced_customers(config.limit)
 
-    company_id = None
-    company_name = config.company
-    if config.company:
-        row = conn.execute(
-            "SELECT id, name, entity_id FROM companies WHERE name = ?",
-            (config.company,),
-        ).fetchone()
-        if row:
-            company_id = int(row["id"])
-            if not config.entity_id and row["entity_id"]:
-                config.entity_id = int(row["entity_id"])
-            company_name = row["name"]
+    logger.info("=" * 60)
+    logger.info("CUSTOMER SYNC")
+    logger.info("=" * 60)
+    logger.info(f"Found {len(customers)} unsynced customers")
 
-    ledgers = _fetch_unsynced(conn, company_id=company_id, limit=config.limit, max_attempts=config.max_attempts)
-    if not ledgers:
-        logger.info("No unsynced ledgers found")
-        return {"sent": 0, "ok": 0, "failed": 0}
+    if not customers:
+        logger.info("No customers to sync")
+        db.close()
+        return {'sent': 0, 'ok': 0, 'failed': 0}
 
-    endpoint = config.api_base_url.rstrip("/") + "/tally-customer-payload/"
-    headers = {}
+    endpoint = config.api_base_url.rstrip('/') + '/tally-customer-payload/'
+    headers = {'Content-Type': 'application/json'}
     if config.api_key:
-        headers["X-API-Key"] = config.api_key
-    
-    logger.info(f"=== SYNC CUSTOMERS TO CATALYTICS ===")
-    logger.info(f"Endpoint: {endpoint}")
-    logger.info(f"Headers: X-API-Key={'SET' if config.api_key else 'NOT SET'}")
-    logger.info(f"Entity ID: {config.entity_id}")
-    logger.info(f"Found {len(ledgers)} unsynced customers")
+        headers['X-API-Key'] = config.api_key
 
     total_sent = 0
     total_ok = 0
     total_fail = 0
 
-    for i in range(0, len(ledgers), config.batch_size):
-        batch = ledgers[i : i + config.batch_size]
-        payload_hashes: Dict[str, str] = {}
-        ledger_payloads: List[Dict[str, Any]] = []
-
-        for row in batch:
-            name_key = _norm_name(row.get("name"))
-            if not name_key:
-                logger.warning("Skipping ledger id=%s with empty name", row.get("id"))
-                continue
-            try:
-                payload = _build_payload_for_ledger(
-                    row,
-                    entity_id=config.entity_id,
-                    company_name=company_name,
-                )
-            except Exception as exc:
-                logger.exception("Failed to build payload for ledger id=%s name=%s", row.get("id"), row.get("name"))
-                _update_sync_status(
-                    conn,
-                    ledger_id=row["id"],
-                    success=False,
-                    payload_hash="",
-                    response_json=None,
-                    error_text=f"payload_build_error: {exc}",
-                )
-                total_fail += 1
-                continue
-            ledger_data = payload["ledger"]
-            ledger_payloads.append(ledger_data)
-            payload_hashes[name_key] = db.sha256_text(db.json_dumps(payload))
-
-        batch_payload = {"ledgers": ledger_payloads}
-        if config.entity_id:
-            batch_payload["entity_id"] = config.entity_id
-        if company_name:
-            batch_payload["company_name"] = company_name
-
-        if config.dry_run:
-            logger.info("Dry-run: would send %d ledgers", len(ledger_payloads))
-            for row in batch:
-                payload_hash = payload_hashes.get(_norm_name(row.get("name")), "")
-                _update_sync_status(
-                    conn,
-                    ledger_id=row["id"],
-                    success=False,
-                    payload_hash=payload_hash,
-                    response_json={"dry_run": True},
-                    error_text="dry_run",
-                )
-            conn.commit()
-            continue
+    for customer in customers:
+        customer_id = customer['id']
+        name = (customer['name'] or '').strip()
+        company = customer['tally_company']
 
         try:
-            logger.info(f"POST {endpoint}")
-            logger.info(f"Headers: {headers}")
-            logger.info(f"Payload: entity_id={batch_payload.get('entity_id')}, items={len(ledger_payloads)}")
-            resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
-            logger.info(f"Response: {resp.status_code} - {resp.text[:200]}")
-            total_sent += len(ledger_payloads)
-        except Exception as exc:
-            logger.exception("API request failed")
-            for row in batch:
-                payload_hash = payload_hashes.get(_norm_name(row.get("name")), "")
-                _update_sync_status(
-                    conn,
-                    ledger_id=row["id"],
-                    success=False,
-                    payload_hash=payload_hash,
-                    response_json=None,
-                    error_text=str(exc),
-                )
-            conn.commit()
-            total_fail += len(batch)
-            continue
+            logger.info(f"Syncing customer '{name}' (company: {company})...")
 
-        response_json = None
-        try:
-            response_json = resp.json()
-        except Exception:
-            message = f"HTTP {resp.status_code} non-JSON response"
-            response_json = {"status": "error", "message": message, "raw_preview": (resp.text or "")[:500]}
+            ledger = _build_ledger_from_customer(customer)
 
-        results = (response_json.get("data") or {}).get("results") or []
-        results_map: Dict[str, Dict[str, Any]] = {}
-        for r in results:
-            if not isinstance(r, dict):
-                continue
-            key = _norm_name(r.get("name") or r.get("ledger_name") or r.get("NAME"))
-            if key:
-                results_map[key] = r
-        index_results: Optional[List[Dict[str, Any]]] = None
-        dict_results = [r for r in results if isinstance(r, dict)]
-        if dict_results and len(dict_results) == len(batch):
-            index_results = dict_results
+            if not ledger:
+                raise ValueError(f"No ledger data in data_json for '{name}' — re-run fetch_customers.py")
 
-        for idx, row in enumerate(batch):
-            name_key = _norm_name(row.get("name"))
-            res = results_map.get(name_key) if name_key else None
-            if res is None and index_results is not None:
-                res = index_results[idx]
-            if res is None and len(results) == 1 and len(batch) == 1:
-                res = results[0] if isinstance(results[0], dict) else None
-            status_val = (res or {}).get("status")
-            success = _status_is_success(status_val)
-            if not success and res is None and _response_indicates_success(response_json):
-                # No per-item results but API reports success without errors
-                success = True
-            payload_hash = payload_hashes.get(name_key, "")
-            error_text = None
-            if not success:
-                raw_error = (res or {}).get("message")
-                if not raw_error:
-                    data = response_json.get("data") or {}
-                    errors = data.get("errors")
-                    if response_json.get("status") != "success" or (isinstance(errors, int) and errors > 0):
-                        raw_error = response_json.get("message") or "sync_failed"
-                    else:
-                        raw_error = "sync_failed"
-                error_text = _clean_error_text(raw_error) or "sync_failed"
-            _update_sync_status(
-                conn,
-                ledger_id=row["id"],
-                success=success,
-                payload_hash=payload_hash,
-                response_json=response_json,
-                error_text=error_text,
+            # Clean GSTIN fields
+            _clean_gstin(ledger)
+
+            # Normalize NAME
+            if isinstance(ledger.get('NAME'), str):
+                ledger['NAME'] = ledger['NAME'].strip()
+
+            # Enrich ledger with all extracted fields from the customer row
+            # This ensures the latest fetched data is sent even if data_json is stale
+            gstin = (customer['gstin'] or '').strip()
+            if gstin:
+                ledger['PARTYGSTIN'] = gstin
+                ledger['GSTIN'] = gstin
+
+            phone = (customer['phone'] or '').strip()
+            if phone:
+                ledger['MOBILE'] = phone
+
+            email = (customer['email'] or '').strip()
+            if email:
+                ledger['EMAIL'] = email
+
+            state = (customer['state'] or '').strip()
+            if state:
+                ledger['STATENAME'] = state
+                if not ledger.get('STATE'):
+                    ledger['STATE'] = state
+
+            pincode = (customer['pincode'] or '').strip()
+            if pincode:
+                ledger['PINCODE'] = pincode
+
+            address = (customer['address'] or '').strip()
+            if address:
+                ledger['PRIMARY_ADDRESS'] = address
+                if not ledger.get('ADDRESSES'):
+                    ledger['ADDRESSES'] = [address]
+
+            delivery_addresses_json = customer['delivery_addresses_json']
+            if delivery_addresses_json:
+                try:
+                    delivery_addresses = json.loads(delivery_addresses_json)
+                    if isinstance(delivery_addresses, list) and delivery_addresses:
+                        ledger['DELIVERY_ADDRESSES'] = delivery_addresses
+                except Exception:
+                    pass
+
+            tally_guid = (customer['tally_guid'] or '').strip()
+            if tally_guid:
+                ledger['GUID'] = tally_guid
+
+            request_payload = {'entity_id': config.entity_id, 'ledger': ledger}
+            if config.company:
+                request_payload['company_name'] = config.company
+
+            # Log enriched fields
+            logger.info(
+                f"  GSTIN={gstin or 'N/A'}, phone={phone or 'N/A'}, "
+                f"email={email or 'N/A'}, state={state or 'N/A'}, "
+                f"pincode={pincode or 'N/A'}, "
+                f"delivery_addresses={len(json.loads(delivery_addresses_json)) if delivery_addresses_json else 0}"
             )
-            if success:
+
+            # Save sync_request_json before sending
+            request_json = json.dumps(request_payload)
+            try:
+                db.execute(
+                    "UPDATE customers SET sync_request_json = ? WHERE id = ?",
+                    (request_json, customer_id)
+                )
+            except Exception as _e:
+                logger.warning(f"Could not save sync_request_json for '{name}': {_e}")
+
+            if config.dry_run:
+                logger.info(f"Dry-run: would send customer '{name}'")
+                db.mark_customer_sync_failed(customer_id, 'dry_run')
+                continue
+
+            resp = requests.post(endpoint, json=request_payload, headers=headers, timeout=30)
+            total_sent += 1
+
+            if resp.status_code in (200, 201):
+                result = resp.json()
+                response_json = json.dumps(result)
+
+                if result.get('status') != 'success':
+                    raise ValueError(f"API returned non-success: {result.get('message')}")
+
+                data = result.get('data', {})
+                created = data.get('created', 0)
+                updated = data.get('updated', 0)
+                errors = data.get('errors', 0)
+
+                if errors > 0:
+                    results_list = data.get('results', [{}])
+                    if results_list and isinstance(results_list, list):
+                        first = results_list[0]
+                        error_type = first.get('error_type', '')
+                        error_details = first.get('error_details') or first.get('message', 'Unknown error')
+                        error_msg = f"{error_type}: {error_details}" if error_type else str(error_details)
+                    else:
+                        error_msg = 'Unknown error'
+                    raise ValueError(f"API error: {error_msg}")
+
+                if created == 0 and updated == 0:
+                    raise ValueError("Customer not created or updated")
+
+                # Extract catalytics_id from results
+                catalytics_id = None
+                results_list = data.get('results', [])
+                if results_list and isinstance(results_list, list):
+                    first = results_list[0]
+                    if isinstance(first, dict):
+                        catalytics_id = first.get('customer_id')
+
+                if catalytics_id:
+                    logger.info(f"  Customer ID from API: {catalytics_id}")
+                else:
+                    logger.warning(f"  No customer_id returned from API for '{name}'")
+
+                db.mark_customer_synced(customer_id, catalytics_id, response_json)
                 total_ok += 1
+                logger.info(
+                    f"SUCCESS: '{name}' synced "
+                    f"(SQLite ID={customer_id}, Catalytics ID={catalytics_id}, "
+                    f"GSTIN={gstin or 'N/A'}, "
+                    f"status={'created' if created else 'updated'})"
+                )
+
             else:
+                error_msg = f"HTTP {resp.status_code}"
+                error_response_json = None
+                try:
+                    error_result = resp.json()
+                    error_response_json = json.dumps(error_result)
+                    error_msg = f"{error_msg} - {error_result.get('message', resp.text[:200])}"
+                except Exception:
+                    pass
+                logger.error(f"Sync failed for '{name}': {error_msg}")
+                db.mark_customer_sync_failed(customer_id, error_msg, error_response_json)
                 total_fail += 1
 
-        conn.commit()
+        except Exception as e:
+            logger.error(f"Error syncing '{name}': {e}", exc_info=True)
+            db.mark_customer_sync_failed(customer_id, str(e))
+            total_fail += 1
 
-    logger.info("Customer sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
+    logger.info("-" * 60)
+    logger.info("CUSTOMER SYNC SUMMARY")
+    logger.info(f"Total: {total_sent + total_fail}")
+    logger.info(f"OK: {total_ok}")
+    logger.info(f"Failed: {total_fail}")
+    logger.info("-" * 60)
 
-    # --- Delete sync phase ---
-    delete_stats = _sync_deleted_customers(
-        conn,
-        config=config,
-        company_id=company_id,
-        company_name=company_name,
-    )
-
-    return {
-        "sent": total_sent,
-        "ok": total_ok,
-        "failed": total_fail,
-        "delete_sent": delete_stats.get("sent", 0),
-        "delete_ok": delete_stats.get("ok", 0),
-        "delete_failed": delete_stats.get("failed", 0),
-    }
+    db.close()
+    return {'sent': total_sent, 'ok': total_ok, 'failed': total_fail}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sync SQLite-staged customers to Catalytics.")
+    parser = argparse.ArgumentParser(description="Sync customers to Catalytics.")
     parser.add_argument("--config", help="Path to .env file")
-    parser.add_argument("--db-path", help="SQLite database path")
-    parser.add_argument("--api-base-url", help="Catalytics base URL (e.g. http://localhost:8000)")
-    parser.add_argument("--api-key", help="API key for Catalytics (X-API-Key)")
-    parser.add_argument("--entity-id", type=int, help="Catalytics entity id")
-    parser.add_argument("--company", help="Company name for payload fallback")
-    parser.add_argument("--batch-size", type=int, default=10, help="Number of ledgers per API call")
-    parser.add_argument("--limit", type=int, default=200, help="Max ledgers per run")
-    parser.add_argument("--max-attempts", type=int, default=5, help="Max retry attempts per ledger")
-    parser.add_argument("--dry-run", action="store_true", help="Build payloads but do not send")
-    parser.add_argument("--log-level", help="Logging level")
-    parser.add_argument("--log-json", action="store_true", help="JSON log output")
-    parser.add_argument("--log-file", help="Log file path")
+    parser.add_argument("--db-path", help="SQLite database path (unused, SQLITE_DB_PATH used instead)")
+    parser.add_argument("--api-base-url", help="Catalytics base URL")
+    parser.add_argument("--api-key", help="API key (X-API-Key)")
+    parser.add_argument("--entity-id", type=int, help="Entity ID")
+    parser.add_argument("--company", help="Company name")
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--max-attempts", type=int, default=5)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--log-level")
+    parser.add_argument("--log-json", action="store_true")
+    parser.add_argument("--log-file")
     args = parser.parse_args()
 
-    config = build_config(args)
+    sync_config = build_config(args)
     try:
-        run_once(config)
+        run_once(sync_config)
     except Exception:
         logger.exception("Customer sync run failed")
         return 1

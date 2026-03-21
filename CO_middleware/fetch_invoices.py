@@ -56,7 +56,8 @@ def _normalize_dc_no(voucher: Dict[str, Any]) -> str:
 
 def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
     now = datetime.now()
-    if days_back:
+    # Use `is not None` — days_back=0 means "today only" which is valid and must not fall through
+    if days_back is not None:
         from_dt = now - timedelta(days=days_back)
         return from_dt.strftime("%Y%m%d"), now.strftime("%Y%m%d")
     if now.month >= 4:
@@ -94,7 +95,7 @@ def build_config(args: argparse.Namespace) -> FetchConfig:
         entity_id=args.entity_id or cfg.get_env_int("CATALYTICS_ENTITY_ID"),
         from_date=args.from_date or cfg.get_env("TALLY_FROM_DATE"),
         to_date=args.to_date or cfg.get_env("TALLY_TO_DATE"),
-        days_back=args.days_back or cfg.get_env_int("TALLY_DAYS_BACK"),
+        days_back=args.days_back if args.days_back is not None else cfg.get_env_int("TALLY_DAYS_BACK"),
         fetch_stock=bool(args.fetch_stock) or cfg.get_env_bool("TALLY_FETCH_STOCK", False),
         dry_run=bool(args.dry_run) or cfg.get_env_bool("TALLY_DRY_RUN", False),
         log_level=args.log_level or cfg.get_env("LOG_LEVEL", "INFO"),
@@ -153,30 +154,10 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     logger.info("Fetch Stock: %s", config.fetch_stock)
     logger.info("=" * 70)
 
+    # get_delivery_notes already applies Python-level date filtering internally.
+    # It returns only DCs within from_date..to_date.
     vouchers = tally_api.get_delivery_notes(company_name, config.tally_url, from_date, to_date)
-    logger.info("Fetched %d delivery notes (DCs) from Tally", len(vouchers))
-    
-    # CRITICAL: Filter by date in Python because Tally's XML date filter doesn't work reliably
-    # Tally returns ALL vouchers regardless of SVFROMDATE/SVTODATE in some versions
-    filtered_vouchers = []
-    for v in vouchers:
-        voucher_date = v.get("DATE") or ""
-        # Check if voucher date is within our range
-        if voucher_date >= from_date and voucher_date <= to_date:
-            filtered_vouchers.append(v)
-        else:
-            logger.debug("Filtered out DC with date %s (outside range %s to %s)", voucher_date, from_date, to_date)
-    
-    if len(filtered_vouchers) < len(vouchers):
-        logger.warning(
-            "Tally returned %d DCs but only %d are within date range %s to %s. "
-            "Filtered out %d old DCs.",
-            len(vouchers), len(filtered_vouchers), from_date, to_date,
-            len(vouchers) - len(filtered_vouchers)
-        )
-    
-    vouchers = filtered_vouchers
-    logger.info("After date filtering: %d delivery notes (DCs)", len(vouchers))
+    logger.info("Fetched %d delivery notes (DCs) from Tally for range %s to %s", len(vouchers), from_date, to_date)
     
     if vouchers:
         logger.info("Sample DC dates:")
@@ -292,7 +273,8 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         elif is_changed:
             updated += 1
 
-        if is_changed or existing_hash is None:
+        hash_changed = existing_hash != payload_hash
+        if hash_changed or existing_hash is None:
             db.ensure_sync_status(
                 conn,
                 delivery_note_id=dn_id,

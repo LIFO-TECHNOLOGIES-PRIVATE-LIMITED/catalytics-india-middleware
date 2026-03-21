@@ -38,15 +38,15 @@ STATE_FILE = Path(ROOT_DIR) / 'automation_state.json'
 
 # Default intervals (in seconds)
 DEFAULT_INTERVALS = {
-    'fetch_invoices': 120,  # 2 minutes - DCs
+    'fetch_invoices': 40,   # 40 seconds - DCs
     'sync': 60,  # 60 seconds (1 minute)
-    'fetch_master': 1800,  # 30 minutes - products + customers (INCREASED to reduce Tally load)
+    'fetch_master': 14400,  # 4 hours - products + customers
 }
 
 INITIAL_DELAYS = {
     'fetch_master': 10,  # Products + Customers start at 0:10 (customers skip full fetch if already have details)
-    'fetch_invoices': 120,  # DCs start at 2:00 (safe timing)
-    'sync': 180,  # Sync starts at 3:00
+    'fetch_invoices': 60,   # DCs start at 1:00
+    'sync': 120,  # Sync starts at 2:00
 }
 
 
@@ -244,19 +244,18 @@ class AutomationManager:
 
     def _fetch_master_loop(self):
         """Continuous loop for fetching master data (customers + products)"""
-        from fetch_customers import build_config as build_fetch_customers_config, run_once as fetch_customers_once
-        from fetch_products import build_config as build_fetch_products_config, run_once as fetch_products_once
-        from types import SimpleNamespace
+        from fetch_products import fetch_products_from_all_companies
+        from fetch_customers import fetch_customers_from_all_companies
 
         task = 'fetch_master'
-        
+        consecutive_errors = 0
+
         # Initial delay to avoid hitting Tally immediately on startup
-        # INCREASED to 20 seconds for maximum stability on 8GB RAM systems
         initial_delay = INITIAL_DELAYS[task]
         logger.info(f"{task}: Waiting {initial_delay} seconds before first run...")
         if self.stop_flags[task].wait(timeout=initial_delay):
             return  # Stop flag was set during initial delay
-        
+
         while not self.stop_flags[task].is_set():
             try:
                 # Update next run time
@@ -270,27 +269,13 @@ class AutomationManager:
                 logger.info(f"Running {task}...")
                 self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA STARTED ===")
 
-                # Build args for products (FETCH PRODUCTS FIRST)
-                args = SimpleNamespace(
-                    config=cfg.resolve_env_path(ROOT_DIR),
-                    db_path=cfg.get_env("TALLY_DB_PATH"),
-                    tally_url=cfg.get_env("TALLY_URL"),
-                    company=cfg.get_env("TALLY_COMPANY"),
-                    entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
-                    fetch_full=cfg.get_env_bool("TALLY_FETCH_FULL_PRODUCTS", False),
-                    log_level=cfg.get_env("LOG_LEVEL", "INFO"),
-                    log_json=cfg.get_env_bool("LOG_JSON", False),
-                    log_file=None
-                )
-
                 # Fetch products FIRST
-                fetch_config = build_fetch_products_config(args)
                 ok2 = True
-                prod_created = 0
+                prod_new = 0
                 prod_updated = 0
                 try:
-                    result = fetch_products_once(fetch_config)
-                    prod_created = result.get('created', 0)
+                    result = fetch_products_from_all_companies()
+                    prod_new = result.get('new_saved', 0)
                     prod_updated = result.get('updated', 0)
                 except Exception as e:
                     logger.error(f"Product fetch failed: {e}", exc_info=True)
@@ -301,38 +286,24 @@ class AutomationManager:
                 if self.stop_flags[task].wait(timeout=10):
                     return  # Stop flag was set during delay
 
-                # Build args namespace for customers
-                args = SimpleNamespace(
-                    config=cfg.resolve_env_path(ROOT_DIR),
-                    db_path=cfg.get_env("TALLY_DB_PATH"),
-                    tally_url=cfg.get_env("TALLY_URL"),
-                    company=cfg.get_env("TALLY_COMPANY"),
-                    entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
-                    fetch_full=True,  # Fetch full details only for customers that don't have them
-                    log_level=cfg.get_env("LOG_LEVEL", "INFO"),
-                    log_json=cfg.get_env_bool("LOG_JSON", False),
-                    log_file=None
-                )
-
                 # Fetch customers SECOND
-                fetch_config = build_fetch_customers_config(args)
                 ok1 = True
-                cust_created = 0
+                cust_new = 0
                 cust_updated = 0
                 try:
-                    result = fetch_customers_once(fetch_config)
-                    cust_created = result.get('created', 0)
+                    result = fetch_customers_from_all_companies()
+                    cust_new = result.get('new_saved', 0)
                     cust_updated = result.get('updated', 0)
                 except Exception as e:
                     logger.error(f"Customer fetch failed: {e}", exc_info=True)
                     ok1 = False
 
                 if ok1 and ok2:
-                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA COMPLETED (products: created={prod_created}, updated={prod_updated} | customers: created={cust_created}, updated={cust_updated}) ===")
+                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA COMPLETED (products: new={prod_new}, updated={prod_updated} | customers: new={cust_new}, updated={cust_updated}) ===")
                 elif ok2:
-                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA PARTIAL (products OK: created={prod_created}, updated={prod_updated} | customers FAILED) ===")
+                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA PARTIAL (products OK: new={prod_new}, updated={prod_updated} | customers FAILED) ===")
                 elif ok1:
-                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA PARTIAL (products FAILED | customers OK: created={cust_created}, updated={cust_updated}) ===")
+                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA PARTIAL (products FAILED | customers OK: new={cust_new}, updated={cust_updated}) ===")
                 else:
                     self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA FAILED ===")
 
@@ -342,14 +313,18 @@ class AutomationManager:
                     self._save_state()
 
                 logger.info(f"{task} completed")
+                consecutive_errors = 0  # reset on success
 
                 # Wait for interval or stop signal
                 self.stop_flags[task].wait(timeout=interval)
 
             except Exception as e:
-                logger.error(f"Error in {task}: {e}")
-                self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA ERROR: {e} ===")
-                self.stop_flags[task].wait(timeout=10)
+                consecutive_errors += 1
+                # Backoff: 30s, 60s, 120s, 120s, ... (cap at 120s)
+                backoff = min(30 * consecutive_errors, 120)
+                logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
+                self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA ERROR: {e} (retry in {backoff}s) ===")
+                self.stop_flags[task].wait(timeout=backoff)
 
     def _fetch_invoices_loop(self):
         """Continuous loop for fetching invoices/DCs"""
@@ -357,9 +332,9 @@ class AutomationManager:
         from types import SimpleNamespace
 
         task = 'fetch_invoices'
+        consecutive_errors = 0
 
         # Initial delay to avoid hitting Tally immediately on startup
-        # INCREASED to 30 seconds for maximum stability on 8GB RAM systems
         initial_delay = INITIAL_DELAYS[task]
         logger.info(f"{task}: Waiting {initial_delay} seconds before first run...")
         if self.stop_flags[task].wait(timeout=initial_delay):
@@ -420,15 +395,18 @@ class AutomationManager:
                     self._save_state()
 
                 logger.info(f"{task} completed")
+                consecutive_errors = 0  # reset on success
 
                 # Wait for interval or stop signal
                 self.stop_flags[task].wait(timeout=interval)
 
             except Exception as e:
-                logger.error(f"Error in {task}: {e}")
-                self._log_to_dashboard(f"=== AUTO: FETCH DCs ERROR: {e} ===")
-                self.stop_flags[task].wait(timeout=10)
-
+                consecutive_errors += 1
+                # Backoff: 30s, 60s, 120s cap — avoids hammering a crashed Tally
+                backoff = min(30 * consecutive_errors, 120)
+                logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
+                self._log_to_dashboard(f"=== AUTO: FETCH DCs ERROR: {e} (retry in {backoff}s) ===")
+                self.stop_flags[task].wait(timeout=backoff)
 
     def _sync_loop(self):
         """Continuous loop for syncing to Catalytics"""
@@ -438,14 +416,13 @@ class AutomationManager:
         from types import SimpleNamespace
 
         task = 'sync'
-        
-        # Initial delay to avoid hitting Tally immediately on startup
-        # INCREASED to 60 seconds for maximum stability on 8GB RAM systems
+        consecutive_errors = 0
+
         initial_delay = INITIAL_DELAYS[task]
         logger.info(f"{task}: Waiting {initial_delay} seconds before first run...")
         if self.stop_flags[task].wait(timeout=initial_delay):
             return  # Stop flag was set during initial delay
-        
+
         while not self.stop_flags[task].is_set():
             try:
                 # Update next run time
@@ -515,14 +492,18 @@ class AutomationManager:
                     self._save_state()
 
                 logger.info(f"{task} completed")
+                consecutive_errors = 0  # reset on success
 
                 # Wait for interval or stop signal
                 self.stop_flags[task].wait(timeout=interval)
 
             except Exception as e:
-                logger.error(f"Error in {task}: {e}")
-                self._log_to_dashboard(f"=== AUTO: SYNC ERROR: {e} ===")
-                self.stop_flags[task].wait(timeout=10)
+                consecutive_errors += 1
+                # Backoff: 30s, 60s, 120s cap
+                backoff = min(30 * consecutive_errors, 120)
+                logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
+                self._log_to_dashboard(f"=== AUTO: SYNC ERROR: {e} (retry in {backoff}s) ===")
+                self.stop_flags[task].wait(timeout=backoff)
 
 
 # Global automation manager instance

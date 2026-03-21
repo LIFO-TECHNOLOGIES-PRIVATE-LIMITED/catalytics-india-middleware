@@ -1,211 +1,301 @@
-import argparse
-from dataclasses import dataclass
+"""
+Fetch customers (Sundry Debtors) from all active Tally companies.
+Implements duplicate prevention based on customer name (first-come-first-served).
+"""
+import json
 import logging
-from typing import Any, Dict, Optional
 import os
-import sys
+from pathlib import Path
+from datetime import datetime
 
+import sys
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-import config as cfg
-import db
+from config import config, BASE_DIR
+from db import Database
 import tally_api
-from logging_utils import setup_logging
 
-DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
-
-logger = logging.getLogger("tally_fetch_customers")
-
-
-@dataclass
-class FetchConfig:
-    db_path: str
-    tally_url: str
-    company: str
-    entity_id: Optional[int]
-    fetch_full: bool
-    log_level: str
-    log_json: bool
-    log_file: Optional[str]
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 
-def build_config(args: argparse.Namespace) -> FetchConfig:
-    env_path = getattr(args, "config", None) or DEFAULT_ENV_PATH
-    cfg.load_env_file(env_path)
-    return FetchConfig(
-        db_path=args.db_path or cfg.get_env("TALLY_DB_PATH") or "",
-        tally_url=args.tally_url or cfg.get_env("TALLY_URL", "http://localhost:9000/"),
-        company=args.company or cfg.get_env("TALLY_COMPANY") or "",
-        entity_id=args.entity_id or cfg.get_env_int("CATALYTICS_ENTITY_ID"),
-        fetch_full=bool(args.fetch_full) or cfg.get_env_bool("TALLY_FETCH_FULL_CUSTOMERS", False),
-        log_level=args.log_level or cfg.get_env("LOG_LEVEL", "INFO"),
-        log_json=bool(args.log_json) or cfg.get_env_bool("LOG_JSON", False),
-        log_file=args.log_file or cfg.get_env("LOG_FILE"),
-    )
+def _attach_file_handler():
+    log_path = Path(str(BASE_DIR)) / 'logs' / 'customer_fetch.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'customer_fetch_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'customer_fetch_file'
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
 
 
-def run_once(config: FetchConfig) -> Dict[str, int]:
-    setup_logging(level=config.log_level, json_output=config.log_json, file_path=config.log_file)
+_attach_file_handler()
 
-    if not config.db_path or not config.company:
-        raise ValueError("db_path and company are required")
 
-    conn = db.connect(config.db_path)
-    db.init_db(conn)
+def _normalize_customer_name(raw_name: str) -> str:
+    """Normalize customer name: collapse internal whitespace (same as arasan)."""
+    return ' '.join((raw_name or '').split())
 
-    companies = tally_api.get_companies(config.tally_url)
-    available = [c.get("name") for c in companies]
-    company_match = None
-    for comp in companies:
-        if (comp.get("name") or "").strip().lower() == config.company.strip().lower():
-            company_match = comp
-            break
-    if not company_match:
-        logger.error("Company '%s' not found in Tally. Available: %s", config.company, available)
-        return {"created": 0, "updated": 0, "skipped": 0}
 
-    company_name = company_match.get("name") or config.company
-    company_id = db.ensure_company(
-        conn,
-        name=company_name,
-        tally_name=company_name,
-        entity_id=config.entity_id,
-        tally_url=config.tally_url,
-    )
+def _map_ledger_to_customer(ledger: dict, company_name: str) -> dict:
+    """Map raw Tally ledger dict (UPPERCASE keys) to customer data dict."""
+    name = _normalize_customer_name(ledger.get('NAME') or ledger.get('LEDGERNAME') or '')
+    guid = (ledger.get('GUID') or ledger.get('MASTERID') or ledger.get('REMOTEID') or '').strip()
 
-    ledgers = tally_api.get_ledgers(company_name, config.tally_url)
-    logger.info("Fetched %d total ledgers from Tally", len(ledgers))
-    
-    # Filter for customer ledgers (Sundry Debtors group)
-    # Check multiple possible group names
-    customer_groups = ["sundry debtors", "debtors", "sundry debtors (current)", "receivables"]
-    customer_ledgers = []
-    for ledger in ledgers:
-        parent = (ledger.get("PARENT") or "").strip().lower()
-        if any(group in parent for group in customer_groups):
-            customer_ledgers.append(ledger)
-    
-    ledgers = customer_ledgers
-    logger.info("Filtered to %d customer ledgers (Sundry Debtors)", len(ledgers))
+    # GST: parse_ledgers_full already normalises to GSTIN
+    gstin = (ledger.get('GSTIN') or ledger.get('GSTREGISTRATIONNUMBER') or
+             ledger.get('PARTYGSTIN') or ledger.get('GSTREGISTRATION') or '').strip()
+    if gstin.startswith(':'):
+        gstin = gstin.lstrip(':')
 
-    created = 0
-    updated = 0
-    skipped = 0
+    pan = (ledger.get('PAN') or ledger.get('INCOMETAXNUMBER') or
+           ledger.get('PANCARDNUMBER') or ledger.get('PANNUMBER') or '').strip()
 
-    for ledger in ledgers:
-        name = (ledger.get("NAME") or ledger.get("LEDGERNAME") or "").strip()
-        if not name:
-            skipped += 1
-            continue
+    # State / pincode: parse_ledgers_full normalises to STATE and PINCODE
+    state = (ledger.get('STATE') or ledger.get('STATENAME') or
+             ledger.get('PRIORSTATENAME') or ledger.get('LEDSTATENAME') or '').strip()
+    pincode = (ledger.get('PINCODE') or ledger.get('PINCODENO') or
+               ledger.get('LEDGERPINCODE') or '').strip()
 
-        # Ledger already has full details from get_ledgers (uses NATIVEMETHOD *)
-        ledger_data = ledger
+    # Phone: parse_ledgers_full normalises to MOBILE
+    phone = (ledger.get('MOBILE') or ledger.get('LEDGERMOBILE') or
+             ledger.get('LEDPHONE') or ledger.get('PHONE') or
+             ledger.get('MOBILENO') or ledger.get('PHONENUMBER') or '').strip()
 
-        existing = conn.execute(
-            "SELECT data_json FROM ledgers WHERE company_id = ? AND name = ?",
-            (company_id, name),
-        ).fetchone()
-        existing_json = existing["data_json"] if existing else None
+    email = (ledger.get('EMAIL') or ledger.get('LEDGEREMAIL') or
+             ledger.get('EMAILID') or '').strip()
 
-        ledger_id = db.upsert_ledger(conn, company_id=company_id, name=name, data=ledger_data)
-        payload_hash = db.sha256_text(db.json_dumps(ledger_data))
+    # Primary address: parse_ledgers_full sets PRIMARY_ADDRESS from LEDMAILINGDETAILS.LIST
+    address = (ledger.get('PRIMARY_ADDRESS') or '').strip()
+    if not address:
+        addresses = ledger.get('ADDRESSES')
+        if isinstance(addresses, list) and addresses:
+            address = ', '.join(str(a) for a in addresses if a)
+        else:
+            address = (ledger.get('MAILINGNAME') or '').strip()
 
-        hash_row = conn.execute(
-            "SELECT payload_hash FROM ledger_sync_status WHERE ledger_id = ?",
-            (ledger_id,),
-        ).fetchone()
-        existing_hash = hash_row["payload_hash"] if hash_row else None
+    # Delivery addresses: list of dicts with name/address/state/pincode/gstin
+    delivery_addresses = ledger.get('DELIVERY_ADDRESSES') or []
 
-        is_changed = (existing_json is None) or (existing_json != db.json_dumps(ledger_data)) or (existing_hash != payload_hash)
-        if existing_json is None:
-            created += 1
-        elif is_changed:
-            updated += 1
+    return {
+        'tally_guid': guid,
+        'name': name,
+        'tally_company': company_name,
+        'gstin': gstin,
+        'pan': pan,
+        'address': address,
+        'state': state,
+        'city': '',
+        'pincode': pincode,
+        'phone': phone,
+        'email': email,
+        'delivery_addresses_json': json.dumps(delivery_addresses) if delivery_addresses else None,
+        'data_json': json.dumps(ledger),
+    }
 
-        if is_changed or existing_hash is None:
-            db.ensure_ledger_sync_status(
-                conn,
-                ledger_id=ledger_id,
-                is_synced=0,
-                payload_hash=payload_hash,
-            )
 
-    # --- Delete detection ---
-    # Collect all Sundry Debtor names from Tally response (already filtered by get_sundry_debtors)
-    deleted = 0
-    tally_names = set()
-    for ledger in ledgers:
-        name = (ledger.get("NAME") or ledger.get("LEDGERNAME") or "").strip()
-        if name:
-            tally_names.add(name)
+def fetch_customers_from_all_companies():
+    """
+    Fetch customers from all active Tally companies.
+    First-come-first-served duplicate prevention by customer name.
+    """
+    db = Database(config.SQLITE_DB_PATH)
+    active_companies = config.get_active_companies()
 
-    # Safety: only detect deletions if Tally returned >0 Sundry Debtor names
-    # and there are previously synced records (not a first-run scenario)
-    has_synced_records = conn.execute(
-        """SELECT 1 FROM ledger_sync_status ls
-           JOIN ledgers l ON l.id = ls.ledger_id
-           WHERE ls.is_synced = 1 AND l.company_id = ? LIMIT 1""",
-        (company_id,),
-    ).fetchone() is not None
+    if not active_companies:
+        logger.error("No active Tally companies configured")
+        return {'total_fetched': 0, 'new_saved': 0, 'duplicates_skipped': 0, 'errors': 0}
 
-    if tally_names and has_synced_records:
-        # Find active ledgers in SQLite that are NOT in the Tally response
-        sqlite_ledgers = conn.execute(
-            "SELECT id, name, data_json FROM ledgers WHERE company_id = ? AND COALESCE(is_deleted, 0) = 0",
-            (company_id,),
-        ).fetchall()
+    logger.info(f"Starting customer fetch from {len(active_companies)} companies")
+    logger.info(f"Active companies: {', '.join(active_companies)}")
 
-        names_to_delete = []
-        for row in sqlite_ledgers:
-            # All ledgers in our DB should be Sundry Debtors (we only fetch those)
-            if row["name"] not in tally_names:
-                names_to_delete.append(row["name"])
+    groups_env = os.getenv('CUSTOMER_LEDGER_GROUPS', 'Sundry Debtors')
+    allowed_groups = [g.strip().lower() for g in groups_env.replace(';', ',').split(',') if g.strip()]
 
-        if names_to_delete:
-            deleted = db.mark_records_deleted(conn, "ledgers", company_id, names_to_delete)
-            logger.info("Marked %d ledgers as deleted (not in Tally response)", deleted)
-            # Mark deleted records as unsynced so they get propagated
-            for row_name in names_to_delete:
-                row = conn.execute(
-                    "SELECT id FROM ledgers WHERE company_id = ? AND name = ?",
-                    (company_id, row_name),
-                ).fetchone()
-                if row:
-                    db.ensure_ledger_sync_status(
-                        conn,
-                        ledger_id=row["id"],
-                        is_synced=0,
-                        payload_hash="DELETED",
+    def _is_allowed_group(parent_group: str) -> bool:
+        if not allowed_groups:
+            return True
+        pg = (parent_group or '').strip().lower()
+        if not pg:
+            return False
+        return any(g in pg for g in allowed_groups)
+
+    overall_stats = {'total_fetched': 0, 'new_saved': 0, 'updated': 0, 'duplicates_skipped': 0, 'errors': 0}
+
+    for company_name in active_companies:
+        company_key = config.get_company_key(company_name)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing: {company_name} ({company_key})")
+        logger.info(f"{'='*60}")
+
+        try:
+            ledgers = tally_api.get_sundry_debtors(company_name, config.TALLY_URL)
+            overall_stats['total_fetched'] += len(ledgers)
+
+            if not ledgers:
+                logger.warning(f"No customers fetched from {company_name}")
+                continue
+
+            logger.info(f"Fetched {len(ledgers)} customers from Tally")
+
+            for ledger in ledgers:
+                customer_name = _normalize_customer_name(ledger.get('NAME') or ledger.get('LEDGERNAME') or '')
+                parent_group = (ledger.get('PARENT') or '').strip()
+
+                if not customer_name:
+                    logger.warning("Skipping customer with empty name")
+                    continue
+
+                if not _is_allowed_group(parent_group):
+                    logger.info(
+                        f"[GROUP SKIP] '{customer_name}' (company: {company_name}) "
+                        f"under '{parent_group}' not in allowed groups: {', '.join(allowed_groups)}"
                     )
+                    continue
 
-    conn.commit()
-    logger.info("Done. created=%d updated=%d skipped=%d deleted=%d", created, updated, skipped, deleted)
-    return {"created": created, "updated": updated, "skipped": skipped, "deleted": deleted}
+                guid = (ledger.get('GUID') or ledger.get('MASTERID') or ledger.get('REMOTEID') or '').strip()
+
+                # --- GUID-based lookup (takes priority over name) ---
+                existing_by_guid = db.customer_exists_by_guid(guid) if guid else None
+                if existing_by_guid:
+                    owner_company = existing_by_guid['tally_company']
+                    if owner_company == company_name:
+                        try:
+                            customer_data = _map_ledger_to_customer(ledger, company_name)
+                            db.update_customer(existing_by_guid['id'], customer_data)
+                            da_count = len(customer_data.get('delivery_addresses_json') and __import__('json').loads(customer_data['delivery_addresses_json']) or [])
+                            logger.info(
+                                f"[UPDATED by GUID] '{customer_name}' "
+                                f"(company: {company_name}, GUID: {guid}, "
+                                f"GSTIN: {customer_data.get('gstin') or 'N/A'}, "
+                                f"phone: {customer_data.get('phone') or 'N/A'}, "
+                                f"email: {customer_data.get('email') or 'N/A'}, "
+                                f"state: {customer_data.get('state') or 'N/A'}, "
+                                f"pincode: {customer_data.get('pincode') or 'N/A'}, "
+                                f"delivery_addresses: {da_count})"
+                            )
+                            overall_stats['updated'] += 1
+                        except Exception as e:
+                            logger.error(f"[ERROR] Failed to update customer '{customer_name}' by GUID: {e}", exc_info=True)
+                            overall_stats['errors'] += 1
+                    else:
+                        logger.warning(
+                            f"[DUPLICATE SKIPPED by GUID] '{customer_name}' "
+                            f"(GUID: {guid}, owned by {owner_company}, attempted by {company_name})"
+                        )
+                        db.log_duplicate(
+                            entity_type='customer',
+                            entity_name=customer_name,
+                            tally_company=company_name,
+                            owned_by_company=owner_company,
+                            details=f"GUID: {guid}, GSTIN: {ledger.get('GSTREGISTRATIONNUMBER', 'N/A')}",
+                        )
+                        overall_stats['duplicates_skipped'] += 1
+                    continue
+
+                # --- Name-based lookup (fallback) ---
+                existing = db.customer_exists(customer_name)
+
+                if existing:
+                    owner_company = existing['tally_company']
+                    if owner_company == company_name:
+                        # Same company — update with fresh Tally data
+                        try:
+                            customer_data = _map_ledger_to_customer(ledger, company_name)
+                            db.update_customer(existing['id'], customer_data)
+                            da_count = len(customer_data.get('delivery_addresses_json') and __import__('json').loads(customer_data['delivery_addresses_json']) or [])
+                            logger.info(
+                                f"[UPDATED by name] '{customer_name}' "
+                                f"(company: {company_name}, GUID: {customer_data.get('tally_guid') or 'N/A'}, "
+                                f"GSTIN: {customer_data.get('gstin') or 'N/A'}, "
+                                f"phone: {customer_data.get('phone') or 'N/A'}, "
+                                f"email: {customer_data.get('email') or 'N/A'}, "
+                                f"state: {customer_data.get('state') or 'N/A'}, "
+                                f"pincode: {customer_data.get('pincode') or 'N/A'}, "
+                                f"delivery_addresses: {da_count})"
+                            )
+                            overall_stats['updated'] += 1
+                        except Exception as e:
+                            logger.error(f"[ERROR] Failed to update customer '{customer_name}': {e}", exc_info=True)
+                            overall_stats['errors'] += 1
+                    else:
+                        # Different company — cross-company duplicate, skip
+                        logger.warning(
+                            f"[DUPLICATE SKIPPED] '{customer_name}' "
+                            f"(owned by {owner_company}, attempted by {company_name})"
+                        )
+                        db.log_duplicate(
+                            entity_type='customer',
+                            entity_name=customer_name,
+                            tally_company=company_name,
+                            owned_by_company=owner_company,
+                            details=f"GSTIN: {ledger.get('GSTREGISTRATIONNUMBER', 'N/A')}",
+                        )
+                        overall_stats['duplicates_skipped'] += 1
+                    continue
+
+                try:
+                    customer_data = _map_ledger_to_customer(ledger, company_name)
+                    db.insert_customer(customer_data)
+                    da_count = len(customer_data.get('delivery_addresses_json') and __import__('json').loads(customer_data['delivery_addresses_json']) or [])
+                    logger.info(
+                        f"[NEW CUSTOMER] '{customer_name}' saved "
+                        f"(company: {company_name}, GUID: {customer_data.get('tally_guid') or 'N/A'}, "
+                        f"GSTIN: {customer_data.get('gstin') or 'N/A'}, "
+                        f"phone: {customer_data.get('phone') or 'N/A'}, "
+                        f"email: {customer_data.get('email') or 'N/A'}, "
+                        f"state: {customer_data.get('state') or 'N/A'}, "
+                        f"pincode: {customer_data.get('pincode') or 'N/A'}, "
+                        f"delivery_addresses: {da_count})"
+                    )
+                    overall_stats['new_saved'] += 1
+
+                except Exception as e:
+                    logger.error(f"[ERROR] Failed to save customer '{customer_name}': {e}", exc_info=True)
+                    overall_stats['errors'] += 1
+
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to process company '{company_name}': {e}", exc_info=True)
+            overall_stats['errors'] += 1
+
+    logger.info(f"\n{'='*60}")
+    logger.info("CUSTOMER FETCH SUMMARY")
+    logger.info(f"{'='*60}")
+    logger.info(f"Total Fetched from Tally:  {overall_stats['total_fetched']}")
+    logger.info(f"New Customers Saved:        {overall_stats['new_saved']}")
+    logger.info(f"Updated (same company):     {overall_stats['updated']}")
+    logger.info(f"Duplicates Skipped:         {overall_stats['duplicates_skipped']}")
+    logger.info(f"Errors:                     {overall_stats['errors']}")
+    logger.info(f"{'='*60}")
+
+    db_stats = db.get_statistics()
+    logger.info(f"Total Customers in DB: {db_stats['total_customers']}")
+    logger.info(f"Synced Customers:      {db_stats['synced_customers']}")
+    logger.info(f"Customers by Company:  {db_stats['customers_by_company']}")
+
+    db.close()
+    return overall_stats
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Fetch Tally customers (ledgers) and store in SQLite.")
-    parser.add_argument("--config", help="Path to .env file")
-    parser.add_argument("--db-path", help="SQLite database path")
-    parser.add_argument("--tally-url", help="Tally HTTP URL")
-    parser.add_argument("--company", help="Tally company name")
-    parser.add_argument("--entity-id", type=int, help="Catalytics entity id (stored for sync)")
-    parser.add_argument("--fetch-full", action="store_true", help="Fetch full ledger details per customer")
-    parser.add_argument("--log-level", help="Logging level")
-    parser.add_argument("--log-json", action="store_true", help="JSON log output")
-    parser.add_argument("--log-file", help="Log file path")
-    args = parser.parse_args()
-
-    config = build_config(args)
+if __name__ == '__main__':
     try:
-        run_once(config)
-    except Exception:
-        logger.exception("Customer fetch run failed")
-        return 1
-    return 0
+        logger.info("=" * 60)
+        logger.info("CHENNAI OXYGEN - CUSTOMER FETCH")
+        logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("=" * 60)
 
+        stats = fetch_customers_from_all_companies()
+        logger.info("\n✓ Customer fetch completed successfully")
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+    except Exception as e:
+        logger.error(f"\n✗ Customer fetch failed: {e}", exc_info=True)
+        exit(1)

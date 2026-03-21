@@ -1,26 +1,55 @@
 @echo off
 setlocal
 
-set PYTHON_EXE=py
-pushd "%~dp0"
+cd /d "%~dp0"
 
-echo Building executables using PyInstaller...
-%PYTHON_EXE% -m pip install --upgrade pyinstaller
-%PYTHON_EXE% -m pip install -r requirements.txt
+echo [1/4] Checking PyInstaller...
+py -m PyInstaller --version >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] PyInstaller is not installed. Run: py -m pip install pyinstaller
+    exit /b 1
+)
 
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_fetch fetch_tally.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_fetch_invoices fetch_invoices.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_sync sync_catalytics.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_loop run_loop.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_invoice_loop run_loop_invoices.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --noconsole --name tally_ui web_ui.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_fetch_customers fetch_customers.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_sync_customers sync_customers.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_fetch_products fetch_products.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_sync_products sync_products.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_masters_loop run_loop_masters.py
-%PYTHON_EXE% -m PyInstaller --onefile --clean --name tally_reset_sync reset_sync.py
+echo [2/4] Cleaning previous build artifacts...
+if exist "build" rmdir /s /q "build"
+if exist "dist" rmdir /s /q "dist"
+if exist "co_middleware_dashboard.spec" del /q "co_middleware_dashboard.spec"
 
-echo Executables created in .\dist (tally_fetch.exe, tally_fetch_invoices.exe, tally_sync.exe, tally_loop.exe, tally_invoice_loop.exe, tally_ui.exe, tally_fetch_customers.exe, tally_sync_customers.exe, tally_fetch_products.exe, tally_sync_products.exe, tally_masters_loop.exe, tally_reset_sync.exe)
-popd
+echo [3/4] Building CO Middleware dashboard EXE...
+py -m PyInstaller ^
+    --noconfirm ^
+    --clean ^
+    --onefile ^
+    --noconsole ^
+    --name co_middleware_dashboard ^
+    --add-data "templates;templates" ^
+    --hidden-import config ^
+    --hidden-import db ^
+    --hidden-import tally_api ^
+    --hidden-import tally_client ^
+    --hidden-import fetch_tally ^
+    --hidden-import fetch_invoices ^
+    --hidden-import fetch_customers ^
+    --hidden-import fetch_products ^
+    --hidden-import sync_catalytics ^
+    --hidden-import sync_customers ^
+    --hidden-import sync_products ^
+    --hidden-import automation_manager ^
+    --hidden-import log_capture ^
+    --hidden-import logging_utils ^
+    dashboard.py
+
+if errorlevel 1 (
+    echo [ERROR] EXE build failed.
+    exit /b 1
+)
+
+echo [4/4] Build complete.
+echo EXE generated at: "%cd%\dist\co_middleware_dashboard.exe"
+echo.
+echo Place these next to the EXE on client machine:
+echo   - .env
+echo   - tally_dc.sqlite (optional, auto-created if missing)
+echo   - logs\ folder (optional, auto-created if missing)
+
 endlocal

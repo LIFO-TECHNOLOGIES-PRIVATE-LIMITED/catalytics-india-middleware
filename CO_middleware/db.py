@@ -185,6 +185,31 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+# Fields that Tally updates automatically on every alteration
+# but do NOT represent a meaningful data change for sync purposes.
+_VOLATILE_TALLY_FIELDS = {
+    "ALTERID",        # increments on every Tally modification
+    "REMOTEALTERID",  # same, for remote sync
+    "ALTEREDON",      # timestamp of last alteration
+    "ALTEREDBY",      # who altered
+    "UPDATEDDATETIME",# last update timestamp
+    "SORTPOSITION",   # internal ordering, changes unpredictably
+}
+
+
+def stable_hash(data: Any) -> str:
+    """
+    Compute a hash of Tally data excluding volatile fields that Tally
+    changes automatically (ALTERID, ALTEREDON, etc.) without any real
+    data change. This prevents unnecessary re-syncs when only those
+    internal fields changed.
+    """
+    if isinstance(data, dict):
+        filtered = {k: v for k, v in data.items() if k not in _VOLATILE_TALLY_FIELDS}
+        return sha256_text(json_dumps(filtered))
+    return sha256_text(json_dumps(data))
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=120.0)  # 120 second timeout for locks (increased for product sync)
     conn.row_factory = sqlite3.Row
@@ -420,12 +445,30 @@ def ensure_sync_status(
              last_error, last_response_json, payload_hash, created_at, updated_at)
         VALUES (?, ?, 0, NULL, NULL, NULL, NULL, ?, ?, ?)
         ON CONFLICT(delivery_note_id) DO UPDATE SET
-            is_synced = excluded.is_synced,
-            attempts = 0,
-            last_attempt_at = NULL,
-            synced_at = NULL,
-            last_error = NULL,
-            last_response_json = NULL,
+            is_synced = CASE
+                WHEN sync_status.payload_hash != excluded.payload_hash THEN excluded.is_synced
+                ELSE sync_status.is_synced
+            END,
+            attempts = CASE
+                WHEN sync_status.payload_hash != excluded.payload_hash THEN 0
+                ELSE sync_status.attempts
+            END,
+            last_attempt_at = CASE
+                WHEN sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE sync_status.last_attempt_at
+            END,
+            synced_at = CASE
+                WHEN sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE sync_status.synced_at
+            END,
+            last_error = CASE
+                WHEN sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE sync_status.last_error
+            END,
+            last_response_json = CASE
+                WHEN sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE sync_status.last_response_json
+            END,
             payload_hash = excluded.payload_hash,
             updated_at = excluded.updated_at
         """,
@@ -448,12 +491,30 @@ def ensure_ledger_sync_status(
              last_error, last_response_json, payload_hash, created_at, updated_at)
         VALUES (?, ?, 0, NULL, NULL, NULL, NULL, ?, ?, ?)
         ON CONFLICT(ledger_id) DO UPDATE SET
-            is_synced = excluded.is_synced,
-            attempts = 0,
-            last_attempt_at = NULL,
-            synced_at = NULL,
-            last_error = NULL,
-            last_response_json = NULL,
+            is_synced = CASE
+                WHEN ledger_sync_status.payload_hash != excluded.payload_hash THEN excluded.is_synced
+                ELSE ledger_sync_status.is_synced
+            END,
+            attempts = CASE
+                WHEN ledger_sync_status.payload_hash != excluded.payload_hash THEN 0
+                ELSE ledger_sync_status.attempts
+            END,
+            last_attempt_at = CASE
+                WHEN ledger_sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE ledger_sync_status.last_attempt_at
+            END,
+            synced_at = CASE
+                WHEN ledger_sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE ledger_sync_status.synced_at
+            END,
+            last_error = CASE
+                WHEN ledger_sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE ledger_sync_status.last_error
+            END,
+            last_response_json = CASE
+                WHEN ledger_sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE ledger_sync_status.last_response_json
+            END,
             payload_hash = excluded.payload_hash,
             updated_at = excluded.updated_at
         """,
@@ -476,12 +537,30 @@ def ensure_stock_sync_status(
              last_error, last_response_json, payload_hash, created_at, updated_at)
         VALUES (?, ?, 0, NULL, NULL, NULL, NULL, ?, ?, ?)
         ON CONFLICT(stock_item_id) DO UPDATE SET
-            is_synced = excluded.is_synced,
-            attempts = 0,
-            last_attempt_at = NULL,
-            synced_at = NULL,
-            last_error = NULL,
-            last_response_json = NULL,
+            is_synced = CASE
+                WHEN stock_sync_status.payload_hash != excluded.payload_hash THEN excluded.is_synced
+                ELSE stock_sync_status.is_synced
+            END,
+            attempts = CASE
+                WHEN stock_sync_status.payload_hash != excluded.payload_hash THEN 0
+                ELSE stock_sync_status.attempts
+            END,
+            last_attempt_at = CASE
+                WHEN stock_sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE stock_sync_status.last_attempt_at
+            END,
+            synced_at = CASE
+                WHEN stock_sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE stock_sync_status.synced_at
+            END,
+            last_error = CASE
+                WHEN stock_sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE stock_sync_status.last_error
+            END,
+            last_response_json = CASE
+                WHEN stock_sync_status.payload_hash != excluded.payload_hash THEN NULL
+                ELSE stock_sync_status.last_response_json
+            END,
             payload_hash = excluded.payload_hash,
             updated_at = excluded.updated_at
         """,
@@ -507,22 +586,22 @@ def get_last_fetch_date(conn: sqlite3.Connection, company_id: int, data_type: st
 def update_last_fetch_date(conn: sqlite3.Connection, company_id: int, data_type: str, fetch_date: str):
     """
     Update the last fetch date for a specific data type
-    
+
     Args:
         company_id: Company ID
         data_type: Type of data (e.g., 'delivery_notes', 'ledgers', 'stock_items')
         fetch_date: Date in YYYYMMDD format
     """
-    now = utcnow()
-    
+    now = now_ts()
+
     existing = conn.execute(
         "SELECT id FROM fetch_metadata WHERE company_id = ? AND data_type = ?",
         (company_id, data_type)
     ).fetchone()
-    
+
     if existing:
         conn.execute(
-            """UPDATE fetch_metadata 
+            """UPDATE fetch_metadata
                SET last_fetch_date = ?, last_fetch_at = ?, updated_at = ?
                WHERE company_id = ? AND data_type = ?""",
             (fetch_date, now, now, company_id, data_type)
@@ -533,3 +612,414 @@ def update_last_fetch_date(conn: sqlite3.Connection, company_id: int, data_type:
                VALUES (?, ?, ?, ?, ?, ?)""",
             (company_id, data_type, fetch_date, now, now, now)
         )
+
+
+# =============================================================================
+# DATABASE CLASS — arasan-style master data (customers / products)
+# =============================================================================
+
+import logging as _logging
+_db_logger = _logging.getLogger(__name__)
+
+
+class Database:
+    """
+    Manages customers and products master-data tables.
+    Works alongside the functional DC helpers above in the same SQLite file.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self._create_tables()
+
+    def execute(self, query, params=()):
+        """Execute a write query and commit."""
+        cursor = self.conn.cursor()
+        cursor.execute(query, params)
+        self.conn.commit()
+        return cursor
+
+    def query(self, query, params=()):
+        """Execute a SELECT and return one row."""
+        cursor = self.conn.cursor()
+        cursor.execute(query, params)
+        return cursor.fetchone()
+
+    def query_all(self, query, params=()):
+        """Execute a SELECT and return all rows."""
+        cursor = self.conn.cursor()
+        cursor.execute(query, params)
+        return cursor.fetchall()
+
+    def _create_tables(self):
+        cur = self.conn.cursor()
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS customers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tally_guid TEXT,
+                name TEXT UNIQUE NOT NULL,
+                tally_company TEXT NOT NULL,
+                gstin TEXT,
+                pan TEXT,
+                address TEXT,
+                state TEXT,
+                city TEXT,
+                pincode TEXT,
+                phone TEXT,
+                email TEXT,
+                data_json TEXT,
+                sync_request_json TEXT,
+                last_response_json TEXT,
+                first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_synced INTEGER DEFAULT 0,
+                catalytics_id INTEGER,
+                sync_attempts INTEGER DEFAULT 0,
+                last_sync_error TEXT,
+                last_sync_at TIMESTAMP
+            )
+        """)
+
+        # name_canonical is the UNIQUE key — handles spacing variations like "1.5CUM" vs "1.5 CUM"
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tally_guid TEXT,
+                name TEXT NOT NULL,
+                name_canonical TEXT UNIQUE NOT NULL,
+                tally_company TEXT NOT NULL,
+                hsn_code TEXT,
+                unit TEXT,
+                rate REAL,
+                description TEXT,
+                data_json TEXT,
+                product_master_name TEXT,
+                variant_name TEXT,
+                unit_name TEXT,
+                product_type_code TEXT,
+                product_type_name TEXT,
+                gst_applicable TEXT,
+                gst_rate REAL,
+                igst_rate REAL,
+                cgst_rate REAL,
+                sgst_rate REAL,
+                sync_request_json TEXT,
+                last_response_json TEXT,
+                first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_synced INTEGER DEFAULT 0,
+                catalytics_id INTEGER,
+                sync_attempts INTEGER DEFAULT 0,
+                last_sync_error TEXT,
+                last_sync_at TIMESTAMP
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS duplicate_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_name TEXT NOT NULL,
+                tally_company TEXT NOT NULL,
+                owned_by_company TEXT NOT NULL,
+                logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                details TEXT
+            )
+        """)
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_products_name ON products(name_canonical)")
+
+        self.conn.commit()
+        self._migrate_master_tables()
+
+    def _migrate_master_tables(self):
+        """Add missing columns to existing tables when upgrading schema."""
+        cur = self.conn.cursor()
+        prod_cols = {row[1] for row in cur.execute("PRAGMA table_info(products)").fetchall()}
+        if 'name_canonical' not in prod_cols:
+            cur.execute("ALTER TABLE products ADD COLUMN name_canonical TEXT")
+        cust_cols = {row[1] for row in cur.execute("PRAGMA table_info(customers)").fetchall()}
+        if 'delivery_addresses_json' not in cust_cols:
+            cur.execute("ALTER TABLE customers ADD COLUMN delivery_addresses_json TEXT")
+        self.conn.commit()
+
+    # ========================================================================
+    # CUSTOMER OPERATIONS
+    # ========================================================================
+
+    def customer_exists_by_guid(self, guid: str):
+        """Look up customer by tally_guid. Returns row or None."""
+        if not guid:
+            return None
+        return self.query(
+            "SELECT id, tally_company, name FROM customers WHERE tally_guid = ?",
+            (guid.strip(),)
+        )
+
+    def customer_exists(self, name: str):
+        """Check if customer name already exists (ignores whitespace differences)."""
+        normalized = ''.join((name or '').split())
+        return self.query(
+            "SELECT id, tally_company FROM customers WHERE REPLACE(name, ' ', '') = ?",
+            (normalized,)
+        )
+
+    def insert_customer(self, data: dict):
+        self.execute("""
+            INSERT INTO customers (
+                tally_guid, name, tally_company, gstin, pan,
+                address, state, city, pincode, phone, email,
+                delivery_addresses_json, data_json, first_fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            data.get('tally_guid'), data.get('name'), data.get('tally_company'),
+            data.get('gstin'), data.get('pan'), data.get('address'),
+            data.get('state'), data.get('city'), data.get('pincode'),
+            data.get('phone'), data.get('email'),
+            data.get('delivery_addresses_json'), data.get('data_json'),
+        ))
+
+    def update_customer(self, customer_id: int, data: dict):
+        """Update existing customer with fresh Tally data (GUID, name, GSTIN, address, etc.)
+        and mark for re-sync."""
+        self.execute("""
+            UPDATE customers
+            SET tally_guid = ?, name = ?, gstin = ?, pan = ?,
+                address = ?, state = ?, city = ?, pincode = ?,
+                phone = ?, email = ?, delivery_addresses_json = ?,
+                data_json = ?,
+                is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
+                last_updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (
+            data.get('tally_guid'),
+            data.get('name'),
+            data.get('gstin'),
+            data.get('pan'),
+            data.get('address'),
+            data.get('state'),
+            data.get('city'),
+            data.get('pincode'),
+            data.get('phone'),
+            data.get('email'),
+            data.get('delivery_addresses_json'),
+            data.get('data_json'),
+            customer_id,
+        ))
+
+    # ========================================================================
+    # PRODUCT OPERATIONS
+    # ========================================================================
+
+    def product_exists(self, name: str):
+        """Check if product exists by exact name."""
+        return self.query(
+            "SELECT id, tally_company FROM products WHERE name = ?", (name,)
+        )
+
+    def product_exists_by_guid(self, guid: str):
+        """Look up product by tally_guid. Returns row or None."""
+        if not guid:
+            return None
+        return self.query(
+            "SELECT id, tally_company, name, name_canonical FROM products WHERE tally_guid = ?",
+            (guid.strip(),)
+        )
+
+    def product_exists_normalized(self, canonical_name: str):
+        """Check if product exists by canonical name (handles spacing variations)."""
+        return self.query(
+            "SELECT id, tally_company, name FROM products WHERE name_canonical = ?",
+            (canonical_name,)
+        )
+
+    def insert_product(self, data: dict):
+        self.execute("""
+            INSERT INTO products (
+                tally_guid, name, name_canonical, tally_company, hsn_code, unit,
+                rate, description, data_json,
+                product_master_name, variant_name, unit_name,
+                product_type_code, product_type_name,
+                gst_applicable, gst_rate, igst_rate, cgst_rate, sgst_rate,
+                first_fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            data.get('tally_guid'),
+            data.get('name'),
+            data.get('name_canonical'),
+            data.get('tally_company'),
+            data.get('hsn_code'),
+            data.get('unit'),
+            data.get('rate'),
+            data.get('description'),
+            data.get('data_json'),
+            data.get('product_master_name'),
+            data.get('variant_name'),
+            data.get('unit_name'),
+            data.get('product_type_code'),
+            data.get('product_type_name'),
+            data.get('gst_applicable'),
+            data.get('gst_rate', 0.0),
+            data.get('igst_rate', 0.0),
+            data.get('cgst_rate', 0.0),
+            data.get('sgst_rate', 0.0),
+        ))
+
+    def update_product(self, product_id: int, data: dict):
+        """Update existing product with fresh Tally data (GUID, name, HSN, GST, etc.)
+        and mark for re-sync."""
+        self.execute("""
+            UPDATE products
+            SET tally_guid = ?, name = ?, name_canonical = ?, hsn_code = ?, unit = ?,
+                rate = ?, description = ?, data_json = ?,
+                product_master_name = ?, variant_name = ?, unit_name = ?,
+                product_type_code = ?, product_type_name = ?,
+                gst_applicable = ?, gst_rate = ?, igst_rate = ?, cgst_rate = ?, sgst_rate = ?,
+                is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
+                last_updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (
+            data.get('tally_guid'),
+            data.get('name'),
+            data.get('name_canonical'),
+            data.get('hsn_code'),
+            data.get('unit'),
+            data.get('rate'),
+            data.get('description'),
+            data.get('data_json'),
+            data.get('product_master_name'),
+            data.get('variant_name'),
+            data.get('unit_name'),
+            data.get('product_type_code'),
+            data.get('product_type_name'),
+            data.get('gst_applicable'),
+            data.get('gst_rate', 0.0),
+            data.get('igst_rate', 0.0),
+            data.get('cgst_rate', 0.0),
+            data.get('sgst_rate', 0.0),
+            product_id,
+        ))
+
+    def get_unsynced_customers(self, limit=None):
+        """Get customers that haven't been synced yet."""
+        if limit is None:
+            return self.query_all("""
+                SELECT * FROM customers
+                WHERE is_synced = 0
+                ORDER BY first_fetched_at
+            """)
+        return self.query_all("""
+            SELECT * FROM customers
+            WHERE is_synced = 0
+            ORDER BY first_fetched_at
+            LIMIT ?
+        """, (limit,))
+
+    def mark_customer_synced(self, customer_id, catalytics_id, response_json=None):
+        """Mark customer as successfully synced."""
+        self.execute("""
+            UPDATE customers
+            SET is_synced = 1,
+                catalytics_id = ?,
+                last_response_json = ?,
+                last_sync_at = CURRENT_TIMESTAMP,
+                last_sync_error = NULL
+            WHERE id = ?
+        """, (catalytics_id, response_json, customer_id))
+
+    def mark_customer_sync_failed(self, customer_id, error_msg, response_json=None):
+        """Mark customer sync as failed, incrementing attempts."""
+        self.execute("""
+            UPDATE customers
+            SET sync_attempts = sync_attempts + 1,
+                last_sync_error = ?,
+                last_response_json = ?,
+                last_sync_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (error_msg, response_json, customer_id))
+
+    def get_unsynced_products(self, limit=50):
+        """Get products that haven't been synced yet."""
+        return self.query_all("""
+            SELECT * FROM products
+            WHERE is_synced = 0
+            ORDER BY first_fetched_at
+            LIMIT ?
+        """, (limit,))
+
+    def mark_product_synced(self, product_id, catalytics_id, response_json=None):
+        """Mark product as successfully synced."""
+        if catalytics_id is None and response_json:
+            try:
+                import json as _json
+                data = _json.loads(response_json)
+                payload = data.get('data', {}) if isinstance(data, dict) else {}
+                catalytics_id = payload.get('product_id') or payload.get('id')
+                if not catalytics_id:
+                    results = payload.get('results', [])
+                    if isinstance(results, list) and results:
+                        first = results[0]
+                        if isinstance(first, dict):
+                            catalytics_id = first.get('product_id') or first.get('id')
+            except Exception:
+                pass
+        self.execute("""
+            UPDATE products
+            SET is_synced = 1,
+                catalytics_id = ?,
+                last_response_json = ?,
+                last_sync_at = CURRENT_TIMESTAMP,
+                last_sync_error = NULL
+            WHERE id = ?
+        """, (catalytics_id, response_json, product_id))
+
+    def mark_product_sync_failed(self, product_id, error_msg, response_json=None):
+        """Mark product sync as failed, incrementing attempts."""
+        self.execute("""
+            UPDATE products
+            SET sync_attempts = sync_attempts + 1,
+                last_sync_error = ?,
+                last_response_json = ?,
+                last_sync_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (error_msg, response_json, product_id))
+
+    def log_duplicate(self, entity_type, entity_name, tally_company, owned_by_company, details=''):
+        self.execute("""
+            INSERT INTO duplicate_log (entity_type, entity_name, tally_company, owned_by_company, details)
+            VALUES (?, ?, ?, ?, ?)
+        """, (entity_type, entity_name, tally_company, owned_by_company, details))
+
+    def get_statistics(self):
+        total_customers = self.query("SELECT COUNT(*) FROM customers")[0]
+        synced_customers = self.query("SELECT COUNT(*) FROM customers WHERE is_synced = 1")[0]
+        total_products = self.query("SELECT COUNT(*) FROM products")[0]
+        synced_products = self.query("SELECT COUNT(*) FROM products WHERE is_synced = 1")[0]
+
+        customers_by_company = {
+            row[0]: row[1]
+            for row in self.query_all("SELECT tally_company, COUNT(*) FROM customers GROUP BY tally_company")
+        }
+        products_by_company = {
+            row[0]: row[1]
+            for row in self.query_all("SELECT tally_company, COUNT(*) FROM products GROUP BY tally_company")
+        }
+
+        return {
+            'total_customers': total_customers,
+            'synced_customers': synced_customers,
+            'total_products': total_products,
+            'synced_products': synced_products,
+            'customers_by_company': customers_by_company,
+            'products_by_company': products_by_company,
+        }
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
