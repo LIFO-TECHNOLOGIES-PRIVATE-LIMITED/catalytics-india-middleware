@@ -87,11 +87,17 @@ else:
 _env_path = BASE_DIR / '.env'
 load_env_file(str(_env_path))
 
+# Allow .env to use ENTITY_ID as the single key — alias to CATALYTICS_ENTITY_ID
+if os.environ.get('ENTITY_ID') and not os.environ.get('CATALYTICS_ENTITY_ID'):
+    os.environ['CATALYTICS_ENTITY_ID'] = os.environ['ENTITY_ID']
+
 
 class Config:
     """Configuration for CO Middleware — multi-company Tally support"""
 
     ENTITY_NAME = os.getenv('ENTITY_NAME', 'Chennai Oxygen')
+
+    # Entity ID — read from ENTITY_ID (single source of truth in .env)
     ENTITY_ID = int(os.getenv('ENTITY_ID', '1'))
 
     CATALYTICS_API_BASE = os.getenv('CATALYTICS_API_BASE_URL', 'http://localhost:8000/')
@@ -108,8 +114,10 @@ class Config:
 
     TALLY_COMPANY_ACTIVE = os.getenv('TALLY_COMPANY_ACTIVE', 'COMPANY_1').split(',')
 
-    FETCH_CUSTOMERS_INTERVAL_MINUTES = int(os.getenv('FETCH_CUSTOMERS_INTERVAL_MINUTES', '10'))
-    FETCH_PRODUCTS_INTERVAL_MINUTES = int(os.getenv('FETCH_PRODUCTS_INTERVAL_MINUTES', '10'))
+    # Automation intervals
+    FETCH_MASTER_INTERVAL_MINUTES = int(os.getenv('FETCH_MASTER_INTERVAL_MINUTES', '10'))
+    FETCH_INVOICES_INTERVAL_SECONDS = int(os.getenv('FETCH_INVOICES_INTERVAL_SECONDS', '40'))
+    SYNC_INVOICES_INTERVAL_SECONDS = int(os.getenv('SYNC_INVOICES_INTERVAL_SECONDS', '60'))
 
     SQLITE_DB_PATH = str(BASE_DIR / os.getenv('SQLITE_DB_PATH', 'chennai.sqlite'))
 

@@ -12,12 +12,45 @@ if ROOT_DIR not in sys.path:
 import requests
 
 import config as cfg
+from config import BASE_DIR
 import db
 from logging_utils import setup_logging
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
 
 logger = logging.getLogger("catalytics_sync")
+
+
+def _attach_dc_sync_file_handler():
+    """Log DC sync operations to a dedicated file."""
+    log_path = BASE_DIR / 'logs' / 'dc_sync.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'dc_sync_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'dc_sync_file'
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+def _attach_dc_sync_error_handler():
+    """Log DC sync errors to a dedicated file."""
+    log_path = BASE_DIR / 'logs' / 'dc_sync_errors.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'dc_sync_error_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'dc_sync_error_file'
+    fh.setLevel(logging.ERROR)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+_attach_dc_sync_file_handler()
+_attach_dc_sync_error_handler()
 
 
 @dataclass
@@ -110,10 +143,14 @@ _NON_PO_VALUES = {
     'shipment', 'yes', 'no', 'standard', 'normal', 'express',
     'not applicable', 'n/a', 'na', 'nil', 'none', '-',
     'customer pickup', 'customerpickup', 'pickup', 'self pickup', 'selfpickup', 'self',
+    # DC reference type keywords — delivery type indicators, not PO numbers
+    'customer pik up', 'customerpikup', 'supplier', 'traders', 'trader',
 }
 _NON_PO_KEYWORDS = (
     'customer pickup', 'customerpickup', 'pickup', 'self pickup',
     'selfpickup', 'self', 'delivery', 'dispatch', 'challan',
+    # DC reference type keywords
+    'customer pik up', 'supplier', 'traders',
 )
 _PO_FIELDS = [
     'PARTYORDERNO', 'AGGREMENTORDERNO',
@@ -154,11 +191,27 @@ def _enrich_voucher(
     note: Dict[str, Any],
     items: List[Dict[str, Any]],
 ) -> None:
-    """Enrich voucher with fields the backend expects, matching arasan patterns."""
+    """Enrich voucher with fields the backend expects, matching Arasan patterns exactly."""
     # Ensure basic identity fields
     voucher.setdefault("VOUCHERNUMBER", note.get("dc_no") or "")
     voucher.setdefault("DATE", note.get("voucher_date") or "")
     voucher.setdefault("PARTYLEDGERNAME", note.get("party_ledger_name") or "")
+
+    # ADDRESSES — billing address (from voucher data or party)
+    if not voucher.get("ADDRESSES"):
+        addr = (voucher.get("ADDRESS") or voucher.get("MAILINGNAME") or "").strip()
+        if addr:
+            voucher["ADDRESSES"] = [addr]
+
+    # CONSIGNEE — delivery/ship-to address
+    if not voucher.get("CONSIGNEE"):
+        consignee_addr = (
+            voucher.get("DELIVERYADDRESS") or
+            voucher.get("SHIPPINGADDRESS") or
+            voucher.get("CONSIGNEEADDRESS") or ""
+        ).strip()
+        if consignee_addr:
+            voucher["CONSIGNEE"] = {"ADDRESS": consignee_addr}
 
     # FILLINGSTATION: voucher godown > item godown > env default
     if not voucher.get("FILLINGSTATION"):
@@ -197,10 +250,29 @@ def _enrich_voucher(
         voucher.pop("PARTYORDERDATE", None)
         voucher.pop("PODATE", None)
 
-    # Terms of delivery (customer pickup detection)
-    other_ref = str(voucher.get("BASICORDERREF") or "").strip().lower()
-    if "customer pickup" in other_ref or "pickup" in other_ref:
-        voucher.setdefault("TERMSOFDELIVERY", "Customer Pickup")
+    # TERMSOFDELIVERY — mandatory field, derived from reference fields
+    all_refs = " ".join([
+        str(voucher.get("BASICORDERREF") or ""),
+        str(voucher.get("OTHERREFERENCE") or ""),
+        str(voucher.get("TERMSOFDELIVERY") or ""),
+        str(note.get("reference") or ""),
+    ]).strip().lower()
+    if "customer pickup" in all_refs or "customer pik up" in all_refs or "pickup" in all_refs:
+        voucher["TERMSOFDELIVERY"] = "Customer Pickup"
+    elif "supplier" in all_refs:
+        voucher["TERMSOFDELIVERY"] = "Supplier"
+    elif "trader" in all_refs:
+        voucher["TERMSOFDELIVERY"] = "Traders"
+    elif "delivery" in all_refs:
+        voucher["TERMSOFDELIVERY"] = "Delivery"
+    else:
+        # Fallback — use whatever Tally stored, or default to Delivery
+        if not voucher.get("TERMSOFDELIVERY"):
+            voucher["TERMSOFDELIVERY"] = "Delivery"
+
+    # INVENTORY — ensure items are attached
+    if not voucher.get("INVENTORY"):
+        voucher["INVENTORY"] = items
 
     # LEDGERENTRIES fallback
     if not voucher.get("LEDGERENTRIES"):
@@ -342,9 +414,8 @@ def _sync_deleted_dcs(
         return {"sent": 0, "ok": 0, "failed": 0}
 
     endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-delete/"
-    headers = {}
-    if config.api_key:
-        headers["X-API-Key"] = config.api_key
+    # Payload endpoints use AllowAny permission — no auth header needed
+    headers = {"Content-Type": "application/json"}
 
     total_sent = 0
     total_ok = 0
@@ -469,141 +540,127 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         return {"sent": 0, "ok": 0, "failed": 0}
 
     endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-payload/"
-    headers = {}
-    if config.api_key:
-        headers["X-API-Key"] = config.api_key
+    # Payload endpoints use AllowAny permission — no auth header needed
+    headers = {"Content-Type": "application/json"}
 
     total_sent = 0
     total_ok = 0
     total_fail = 0
 
-    for i in range(0, len(notes), config.batch_size):
-        batch = notes[i : i + config.batch_size]
-        payload_hashes: Dict[str, str] = {}
-        vouchers: List[Dict[str, Any]] = []
-        ledgers_map: Dict[str, Any] = {}
-        stock_map: Dict[str, Any] = {}
-
-        for note in batch:
-            try:
-                payload, payload_hash = _build_payload_for_note(
-                    conn,
-                    note,
-                    entity_id=config.entity_id,
-                    company_name=company_name,
-                    allow_tally_fetch=config.allow_tally_fetch,
-                )
-            except Exception as exc:
-                logger.exception("Failed to build payload for DC id=%s dc_no=%s", note.get("id"), note.get("dc_no"))
-                _update_sync_status(
-                    conn,
-                    delivery_note_id=note["id"],
-                    success=False,
-                    payload_hash="",
-                    response_json=None,
-                    error_text=f"payload_build_error: {exc}",
-                )
-                total_fail += 1
-                continue
-            voucher = payload["voucher"]
-            vouchers.append(voucher)
-            ledgers_map.update(payload.get("ledgers") or {})
-            stock_map.update(payload.get("stock_items") or {})
-            dc_no_raw = note.get("dc_no") or voucher.get("VOUCHERNUMBER") or ""
-            dc_no = _norm_dc_no(dc_no_raw)
-            if dc_no:
-                payload_hashes[dc_no] = payload_hash
-            logger.info(
-                "  DC #%s | party=%s | date=%s | filling_station=%s | po=%s | items=%d",
-                dc_no or "?",
-                voucher.get("PARTYLEDGERNAME") or "?",
-                voucher.get("DATE") or "?",
-                voucher.get("FILLINGSTATION") or "[EMPTY]",
-                voucher.get("PARTYORDERNO") or "[EMPTY]",
-                len(voucher.get("INVENTORY") or []),
+    for note in notes:
+        dc_no = _norm_dc_no(note.get("dc_no"))
+        try:
+            payload, payload_hash = _build_payload_for_note(
+                conn,
+                note,
+                entity_id=config.entity_id,
+                company_name=company_name,
+                allow_tally_fetch=config.allow_tally_fetch,
             )
+        except Exception as exc:
+            logger.exception("Failed to build payload for DC id=%s dc_no=%s", note.get("id"), dc_no)
+            _update_sync_status(
+                conn,
+                delivery_note_id=note["id"],
+                success=False,
+                payload_hash="",
+                response_json=None,
+                error_text=f"payload_build_error: {exc}",
+            )
+            conn.commit()
+            total_fail += 1
+            continue
 
-        batch_payload = {
-            "vouchers": vouchers,
-            "ledgers": ledgers_map,
-            "stock_items": stock_map,
+        voucher = payload["voucher"]
+        logger.info(
+            "Syncing DC #%s | party=%s | date=%s | filling_station=%s | po=%s | items=%d | terms=%s",
+            dc_no or "?",
+            voucher.get("PARTYLEDGERNAME") or "?",
+            voucher.get("DATE") or "?",
+            voucher.get("FILLINGSTATION") or "[EMPTY]",
+            voucher.get("PARTYORDERNO") or "[EMPTY]",
+            len(voucher.get("INVENTORY") or []),
+            voucher.get("TERMSOFDELIVERY") or "[EMPTY]",
+        )
+
+        # Send single voucher per request — matching Arasan's sync_invoices_to_dc pattern
+        request_payload = {
+            "entity_id": config.entity_id,
+            "company_name": company_name,
+            "voucher": voucher,
+            "ledgers": payload.get("ledgers") or {},
+            "stock_items": payload.get("stock_items") or {},
             "allow_tally_fetch": config.allow_tally_fetch,
         }
-        if config.entity_id:
-            batch_payload["entity_id"] = config.entity_id
-        if company_name:
-            batch_payload["company_name"] = company_name
 
         if config.dry_run:
-            logger.info("Dry-run: would send %d vouchers", len(vouchers))
-            for note in batch:
-                payload_hash = payload_hashes.get(_norm_dc_no(note.get("dc_no")), "")
-                _update_sync_status(
-                    conn,
-                    delivery_note_id=note["id"],
-                    success=False,
-                    payload_hash=payload_hash,
-                    response_json={"dry_run": True},
-                    error_text="dry_run",
-                )
+            logger.info("Dry-run: would send DC #%s", dc_no)
+            _update_sync_status(
+                conn,
+                delivery_note_id=note["id"],
+                success=False,
+                payload_hash=payload_hash,
+                response_json={"dry_run": True},
+                error_text="dry_run",
+            )
             conn.commit()
             continue
 
         try:
-            resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
-            total_sent += len(vouchers)
+            resp = requests.post(endpoint, json=request_payload, headers=headers, timeout=60)
+            total_sent += 1
         except Exception as exc:
-            logger.exception("API request failed")
-            for note in batch:
-                payload_hash = payload_hashes.get(_norm_dc_no(note.get("dc_no")), "")
-                _update_sync_status(
-                    conn,
-                    delivery_note_id=note["id"],
-                    success=False,
-                    payload_hash=payload_hash,
-                    response_json=None,
-                    error_text=str(exc),
-                )
+            logger.exception("API request failed for DC #%s", dc_no)
+            _update_sync_status(
+                conn,
+                delivery_note_id=note["id"],
+                success=False,
+                payload_hash=payload_hash,
+                response_json=None,
+                error_text=str(exc),
+            )
             conn.commit()
-            total_fail += len(batch)
+            total_fail += 1
             continue
 
         response_json = None
         try:
             response_json = resp.json()
         except Exception:
-            response_json = {"status": "error", "message": resp.text}
+            response_json = {"status": "error", "message": resp.text[:500]}
 
-        results = (response_json.get("data") or {}).get("results") or []
-        results_map = {
-            _norm_dc_no(r.get("dc_no")): r
-            for r in results
-            if isinstance(r, dict) and r.get("dc_no") is not None
-        }
+        if resp.status_code in (200, 201) and response_json.get("status") == "success":
+            data = response_json.get("data", {})
+            created = data.get("created", 0)
+            updated = data.get("updated", 0)
+            errors = data.get("errors", 0)
 
-        for note in batch:
-            dc_no = _norm_dc_no(note.get("dc_no"))
-            res = results_map.get(dc_no) if dc_no else None
-            if res is None and len(results) == 1 and len(batch) == 1:
-                res = results[0]
-            status_val = (res or {}).get("status")
-            success = status_val in ("created", "updated")
-            payload_hash = payload_hashes.get(dc_no, "")
-            error_text = None
-            if not success:
-                error_text = (res or {}).get("message") or response_json.get("message") or "sync_failed"
-            _update_sync_status(
-                conn,
-                delivery_note_id=note["id"],
-                success=success,
-                payload_hash=payload_hash,
-                response_json=response_json,
-                error_text=error_text,
-            )
-            if success:
-                total_ok += 1
-            else:
+            if errors > 0:
+                results_list = data.get("results", [{}])
+                first = results_list[0] if results_list else {}
+                error_msg = first.get("message") or first.get("error_details") or "API error"
+                logger.error("Sync error DC #%s: %s", dc_no, error_msg)
+                _update_sync_status(conn, delivery_note_id=note["id"], success=False,
+                                    payload_hash=payload_hash, response_json=response_json, error_text=error_msg)
                 total_fail += 1
+            elif created == 0 and updated == 0:
+                error_msg = "DC not created or updated"
+                logger.error("Sync failed DC #%s: %s", dc_no, error_msg)
+                _update_sync_status(conn, delivery_note_id=note["id"], success=False,
+                                    payload_hash=payload_hash, response_json=response_json, error_text=error_msg)
+                total_fail += 1
+            else:
+                status_word = "created" if created else "updated"
+                logger.info("SUCCESS DC #%s (%s) | party=%s", dc_no, status_word, voucher.get("PARTYLEDGERNAME"))
+                _update_sync_status(conn, delivery_note_id=note["id"], success=True,
+                                    payload_hash=payload_hash, response_json=response_json, error_text=None)
+                total_ok += 1
+        else:
+            error_msg = response_json.get("message") or f"HTTP {resp.status_code}"
+            logger.error("Sync failed DC #%s: %s", dc_no, error_msg)
+            _update_sync_status(conn, delivery_note_id=note["id"], success=False,
+                                payload_hash=payload_hash, response_json=response_json, error_text=error_msg)
+            total_fail += 1
 
         conn.commit()
 

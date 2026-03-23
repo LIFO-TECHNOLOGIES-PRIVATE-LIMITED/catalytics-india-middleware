@@ -2,8 +2,10 @@ import argparse
 from dataclasses import dataclass
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import os
+import sqlite3
 import sys
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -11,6 +13,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import config as cfg
+from config import BASE_DIR
 import db
 import tally_api
 from logging_utils import setup_logging
@@ -18,6 +21,38 @@ from logging_utils import setup_logging
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
 
 logger = logging.getLogger("tally_invoice_fetcher")
+
+
+def _attach_dc_fetch_file_handler():
+    """Log DC fetch operations to a dedicated file."""
+    log_path = BASE_DIR / 'logs' / 'dc_fetch.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'dc_fetch_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'dc_fetch_file'
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+def _attach_dc_fetch_error_handler():
+    """Log DC fetch errors to a dedicated file."""
+    log_path = BASE_DIR / 'logs' / 'dc_fetch_errors.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in logger.handlers:
+        if getattr(handler, 'name', '') == 'dc_fetch_error_file':
+            return
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.name = 'dc_fetch_error_file'
+    fh.setLevel(logging.ERROR)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(fh)
+
+
+_attach_dc_fetch_file_handler()
+_attach_dc_fetch_error_handler()
 
 
 @dataclass
@@ -34,6 +69,8 @@ class FetchConfig:
     log_level: str
     log_json: bool
     log_file: Optional[str]
+    reference_keywords: List[str]  # only fetch DCs whose reference fields contain one of these
+    master_db_path: str  # SQLITE_DB_PATH — has customers + products tables
 
 
 def _normalize_dc_no(voucher: Dict[str, Any]) -> str:
@@ -67,6 +104,11 @@ def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
     return fy_start.strftime("%Y%m%d"), now.strftime("%Y%m%d")
 
 
+def _normalize_name_key(value: str) -> str:
+    """Normalize a name for lookup: strip, lowercase, remove spaces."""
+    return str(value or '').replace(' ', '').strip().lower()
+
+
 def _build_payload_hash(
     voucher: Dict[str, Any],
     inventory_items: List[Dict[str, Any]],
@@ -85,6 +127,13 @@ def _build_payload_hash(
     return db.sha256_text(db.json_dumps(payload))
 
 
+def _parse_reference_keywords(raw: Optional[str]) -> List[str]:
+    """Parse comma-separated keywords from env var, lowercase stripped."""
+    if not raw:
+        return []
+    return [kw.strip().lower() for kw in raw.split(',') if kw.strip()]
+
+
 def build_config(args: argparse.Namespace) -> FetchConfig:
     env_path = getattr(args, "config", None) or DEFAULT_ENV_PATH
     cfg.load_env_file(env_path)
@@ -101,6 +150,14 @@ def build_config(args: argparse.Namespace) -> FetchConfig:
         log_level=args.log_level or cfg.get_env("LOG_LEVEL", "INFO"),
         log_json=bool(args.log_json) or cfg.get_env_bool("LOG_JSON", False),
         log_file=args.log_file or cfg.get_env("LOG_FILE"),
+        reference_keywords=_parse_reference_keywords(
+            cfg.get_env("DC_REFERENCE_KEYWORDS", "delivery,customer pickup,supplier,traders")
+        ),
+        master_db_path=str(
+            BASE_DIR / cfg.get_env("SQLITE_DB_PATH")
+            if cfg.get_env("SQLITE_DB_PATH") and not os.path.isabs(cfg.get_env("SQLITE_DB_PATH", ""))
+            else cfg.get_env("SQLITE_DB_PATH") or ""
+        ),
     )
 
 
@@ -112,6 +169,14 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
     conn = db.connect(config.db_path)
     db.init_db(conn)
+
+    # Master DB (chennai4.sqlite) has customers + products tables for validation
+    master_conn = None
+    if config.master_db_path and os.path.exists(config.master_db_path):
+        master_conn = sqlite3.connect(config.master_db_path)
+        master_conn.row_factory = sqlite3.Row
+    else:
+        logger.warning("master_db_path not found (%s) — customer/product validation disabled", config.master_db_path)
 
     # Get company
     companies = tally_api.get_companies(config.tally_url)
@@ -173,8 +238,15 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     created = 0
     updated = 0
     skipped = 0
+    skipped_ref_filter = 0
+    skipped_missing_customer = 0
+    skipped_missing_product = 0
     ledgers_fetched = 0
     stock_items_fetched = 0
+
+    # Per-run caches: avoid re-querying SQLite for the same name
+    ledger_cache: Dict[str, bool] = {}   # normalized name -> exists in ledgers table
+    stock_cache: Dict[str, bool] = {}    # normalized name -> exists in stock_items table
 
     for voucher_raw in vouchers:
         voucher = dict(voucher_raw)
@@ -199,6 +271,70 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         party_name = voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME") or ""
         reference = voucher.get("REFERENCE") or voucher.get("PONUMBER") or ""
 
+        # --- Reference keyword filter (strict: PONUMBER only) ---
+        # PONUMBER = Tally's "Reference" field — the only field users fill with delivery type
+        if config.reference_keywords:
+            ponumber_val = (voucher.get("PONUMBER") or "").strip().lower()
+            if not any(kw in ponumber_val for kw in config.reference_keywords):
+                skipped += 1
+                skipped_ref_filter += 1
+                logger.info(
+                    "[SKIP REF FILTER] DC %s (%s) - PONUMBER='%s' has no keyword match %s",
+                    dc_no, party_name, ponumber_val or "(empty)", config.reference_keywords,
+                )
+                continue
+
+        # --- Customer must exist in customers table (master DB: chennai4.sqlite) ---
+        normalized_party = _normalize_name_key(party_name)
+        if not normalized_party:
+            logger.warning("Skipping DC %s: empty party name", dc_no)
+            skipped += 1
+            continue
+
+        if master_conn is not None:
+            if normalized_party not in ledger_cache:
+                row = master_conn.execute(
+                    "SELECT id FROM customers WHERE lower(replace(name, ' ', '')) = ?",
+                    (normalized_party,),
+                ).fetchone()
+                ledger_cache[normalized_party] = row is not None
+
+            if not ledger_cache[normalized_party]:
+                skipped_missing_customer += 1
+                logger.info(
+                    "[SKIP MISSING CUSTOMER] DC %s (%s) - customer not found in master customers table",
+                    dc_no, party_name,
+                )
+                continue
+
+        # --- All products must exist in products table (master DB: chennai4.sqlite) ---
+        inventory_items = voucher.get("INVENTORY") or []
+        missing_products = []
+        for item in inventory_items:
+            stock_name = (item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
+            if not stock_name:
+                missing_products.append("<empty>")
+                continue
+            normalized_stock = _normalize_name_key(stock_name)
+            if master_conn is not None:
+                if normalized_stock not in stock_cache:
+                    row = master_conn.execute(
+                        "SELECT id FROM products WHERE lower(replace(name, ' ', '')) = ?",
+                        (normalized_stock,),
+                    ).fetchone()
+                    stock_cache[normalized_stock] = row is not None
+            if master_conn is not None and not stock_cache.get(normalized_stock, True):
+                missing_products.append(stock_name)
+
+        if missing_products:
+            skipped_missing_product += 1
+            logger.info(
+                "[SKIP MISSING PRODUCT] DC %s (%s) - missing products: %s",
+                dc_no, party_name,
+                ", ".join(sorted(set(missing_products)))[:200],
+            )
+            continue
+
         dn_id = db.upsert_delivery_note(
             conn,
             company_id=company_id,
@@ -209,11 +345,9 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             data=voucher,
         )
 
-        inventory_items = voucher.get("INVENTORY") or []
         db.replace_delivery_note_items(conn, delivery_note_id=dn_id, items=inventory_items)
 
-        # Only fetch ledger and stock items if fetch_stock is enabled
-        # This speeds up DC fetch significantly (avoids 10+ second cooldowns per fetch)
+        # Only fetch full ledger/stock details from Tally if fetch_stock is enabled
         ledger_data = None
         if config.fetch_stock and party_name:
             ledger_data = tally_api.get_ledger_by_name(company_name, party_name, config.tally_url)
@@ -340,15 +474,17 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             conn.commit()
 
     logger.info(
-        "Done. created=%d updated=%d skipped=%d deleted=%d ledgers=%d stock_items=%d",
-        created,
-        updated,
-        skipped,
-        deleted,
-        ledgers_fetched,
-        stock_items_fetched,
+        "Done. created=%d updated=%d skipped=%d "
+        "(ref_filter=%d missing_customer=%d missing_product=%d) "
+        "deleted=%d ledgers=%d stock_items=%d",
+        created, updated, skipped,
+        skipped_ref_filter, skipped_missing_customer, skipped_missing_product,
+        deleted, ledgers_fetched, stock_items_fetched,
     )
     
+    if master_conn is not None:
+        master_conn.close()
+
     return {"created": created, "updated": updated, "skipped": skipped, "deleted": deleted}
 
 

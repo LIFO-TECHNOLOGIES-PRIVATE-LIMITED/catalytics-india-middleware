@@ -54,11 +54,21 @@ _attach_file_handler()
 # Handles spacing variations: "1.5CUM" and "1.5 CUM" both match
 STOCK_NAME_PATTERN = re.compile(r'^(.+?)\s+(\d+(?:\.\d+)?)\s*(\w+)\s+\((\w+)\)$')
 
+# Fallback regex: <PRODUCT NAME> (<TYPE_CODE>) — no quantity/unit
+STOCK_NAME_PATTERN_NO_VARIANT = re.compile(r'^(.+?)\s+\((\w+)\)$')
+
+# Default variant when product name has type code but no quantity/unit
+DEFAULT_VARIANT = '7 Cum'
+DEFAULT_UNIT = 'Cum'
+
 
 def parse_stock_item_name(name: str):
     """
     Parse a Tally stock item name into product components.
-    Handles spacing variations in quantity/unit (e.g., "1.5CUM" vs "1.5 CUM").
+
+    Primary pattern:   <NAME> <QTY> <UNIT> (<TYPE_CODE>)  e.g. "Oxygen Gas 7 Cum (CYL)"
+    Fallback pattern:  <NAME> (<TYPE_CODE>)                e.g. "Oxygen Gas (CYL)"
+      → fallback uses default variant '7 Cum'
 
     Returns dict with product_master_name, variant_name, unit_name,
     product_type_code, product_type_name, canonical_name
@@ -69,34 +79,53 @@ def parse_stock_item_name(name: str):
 
     # Normalize: collapse multiple spaces into single space
     normalized_name = ' '.join(name.strip().split())
-
-    match = STOCK_NAME_PATTERN.match(normalized_name)
-    if not match:
-        return None
-
-    product_master_name = match.group(1).strip()
-    quantity = match.group(2).strip()
-    unit_name = match.group(3).strip()
-    type_code = match.group(4).strip().upper()
-
     type_map = config.PRODUCT_TYPE_MAP
-    if type_code not in type_map:
-        return None
 
-    # Canonical variant always has space between quantity and unit
-    canonical_variant = f"{quantity} {unit_name}"
+    # --- Primary pattern: name includes quantity and unit ---
+    match = STOCK_NAME_PATTERN.match(normalized_name)
+    if match:
+        product_master_name = match.group(1).strip()
+        quantity = match.group(2).strip()
+        unit_name = match.group(3).strip()
+        type_code = match.group(4).strip().upper()
 
-    # Canonical name for uniqueness — ensures "1.5CUM" and "1.5 CUM" are the same product
-    canonical_name = f"{product_master_name} {canonical_variant} ({type_code})"
+        if type_code not in type_map:
+            return None
 
-    return {
-        'product_master_name': product_master_name,
-        'unit_name': unit_name,
-        'variant_name': canonical_variant,
-        'product_type_code': type_code,
-        'product_type_name': type_map[type_code],
-        'canonical_name': canonical_name,
-    }
+        canonical_variant = f"{quantity} {unit_name}"
+        canonical_name = f"{product_master_name} {canonical_variant} ({type_code})"
+
+        return {
+            'product_master_name': product_master_name,
+            'unit_name': unit_name,
+            'variant_name': canonical_variant,
+            'product_type_code': type_code,
+            'product_type_name': type_map[type_code],
+            'canonical_name': canonical_name,
+        }
+
+    # --- Fallback pattern: name ends with (TYPE_CODE) but has no quantity/unit ---
+    match_no_var = STOCK_NAME_PATTERN_NO_VARIANT.match(normalized_name)
+    if match_no_var:
+        product_master_name = match_no_var.group(1).strip()
+        type_code = match_no_var.group(2).strip().upper()
+
+        if type_code not in type_map:
+            return None
+
+        canonical_name = f"{product_master_name} {DEFAULT_VARIANT} ({type_code})"
+
+        return {
+            'product_master_name': product_master_name,
+            'unit_name': DEFAULT_UNIT,
+            'variant_name': DEFAULT_VARIANT,
+            'product_type_code': type_code,
+            'product_type_name': type_map[type_code],
+            'canonical_name': canonical_name,
+            'variant_defaulted': True,  # flag so caller can log it
+        }
+
+    return None
 
 
 def _safe_float(value) -> float:
@@ -193,8 +222,9 @@ def fetch_products_from_all_companies():
                 overall_stats['matched'] += 1
                 canonical_name = parsed['canonical_name']
                 tally_guid = (item.get('GUID') or item.get('MASTERID') or item.get('REMOTEID') or '').strip()
+                variant_note = " [DEFAULT VARIANT 7 Cum]" if parsed.get('variant_defaulted') else ""
                 logger.info(
-                    f"[PARSED] '{product_name}' -> "
+                    f"[PARSED{variant_note}] '{product_name}' -> "
                     f"product={parsed['product_master_name']}, "
                     f"variant={parsed['variant_name']}, "
                     f"unit={parsed['unit_name']}, "

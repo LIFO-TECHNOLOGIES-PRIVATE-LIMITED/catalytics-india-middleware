@@ -102,9 +102,8 @@ def run_once(sync_config: SyncConfig) -> Dict[str, int]:
         return {'sent': 0, 'ok': 0, 'failed': 0}
 
     endpoint = sync_config.api_base_url.rstrip('/') + '/tally-product_name-payload/'
+    # Payload endpoints use AllowAny permission — no auth header needed
     headers = {'Content-Type': 'application/json'}
-    if sync_config.api_key:
-        headers['X-API-Key'] = sync_config.api_key
 
     total_sent = 0
     total_ok = 0

@@ -19,6 +19,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import config as cfg
+from config import config
 
 # Setup logging
 logging.basicConfig(
@@ -36,11 +37,11 @@ except ImportError:
 # State file path
 STATE_FILE = Path(ROOT_DIR) / 'automation_state.json'
 
-# Default intervals (in seconds)
+# Default intervals (in seconds) — read from .env via config
 DEFAULT_INTERVALS = {
-    'fetch_invoices': 40,   # 40 seconds - DCs
-    'sync': 60,  # 60 seconds (1 minute)
-    'fetch_master': 14400,  # 4 hours - products + customers
+    'fetch_master': config.FETCH_MASTER_INTERVAL_MINUTES * 60,
+    'fetch_invoices': config.FETCH_INVOICES_INTERVAL_SECONDS,
+    'sync': config.SYNC_INVOICES_INTERVAL_SECONDS,
 }
 
 INITIAL_DELAYS = {
@@ -73,12 +74,6 @@ class AutomationManager:
         self.threads = {}
         self.stop_flags = {}
         self.lock = threading.Lock()
-
-        # Load intervals from .env if available
-        sync_interval = cfg.get_env_int("SYNC_INTERVAL")
-        if sync_interval and sync_interval > 0:
-            self.state['intervals']['sync'] = sync_interval
-            logger.info(f"Using SYNC_INTERVAL from .env: {sync_interval} seconds")
 
         # Reset status on startup — threads don't survive process restart
         if self.state['status'] == 'running':

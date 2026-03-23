@@ -1,5 +1,5 @@
 """
-Fetch customers (Sundry Debtors) from all active Tally companies.
+Fetch all customers (all ledger groups) from all active Tally companies.
 Implements duplicate prevention based on customer name (first-come-first-served).
 """
 import json
@@ -105,7 +105,7 @@ def _map_ledger_to_customer(ledger: dict, company_name: str) -> dict:
 
 def fetch_customers_from_all_companies():
     """
-    Fetch customers from all active Tally companies.
+    Fetch all customers (all ledger groups) from all active Tally companies.
     First-come-first-served duplicate prevention by customer name.
     """
     db = Database(config.SQLITE_DB_PATH)
@@ -118,17 +118,6 @@ def fetch_customers_from_all_companies():
     logger.info(f"Starting customer fetch from {len(active_companies)} companies")
     logger.info(f"Active companies: {', '.join(active_companies)}")
 
-    groups_env = os.getenv('CUSTOMER_LEDGER_GROUPS', 'Sundry Debtors')
-    allowed_groups = [g.strip().lower() for g in groups_env.replace(';', ',').split(',') if g.strip()]
-
-    def _is_allowed_group(parent_group: str) -> bool:
-        if not allowed_groups:
-            return True
-        pg = (parent_group or '').strip().lower()
-        if not pg:
-            return False
-        return any(g in pg for g in allowed_groups)
-
     overall_stats = {'total_fetched': 0, 'new_saved': 0, 'updated': 0, 'duplicates_skipped': 0, 'errors': 0}
 
     for company_name in active_companies:
@@ -138,7 +127,7 @@ def fetch_customers_from_all_companies():
         logger.info(f"{'='*60}")
 
         try:
-            ledgers = tally_api.get_sundry_debtors(company_name, config.TALLY_URL)
+            ledgers = tally_api.get_ledgers(company_name, config.TALLY_URL)
             overall_stats['total_fetched'] += len(ledgers)
 
             if not ledgers:
@@ -149,17 +138,9 @@ def fetch_customers_from_all_companies():
 
             for ledger in ledgers:
                 customer_name = _normalize_customer_name(ledger.get('NAME') or ledger.get('LEDGERNAME') or '')
-                parent_group = (ledger.get('PARENT') or '').strip()
 
                 if not customer_name:
                     logger.warning("Skipping customer with empty name")
-                    continue
-
-                if not _is_allowed_group(parent_group):
-                    logger.info(
-                        f"[GROUP SKIP] '{customer_name}' (company: {company_name}) "
-                        f"under '{parent_group}' not in allowed groups: {', '.join(allowed_groups)}"
-                    )
                     continue
 
                 guid = (ledger.get('GUID') or ledger.get('MASTERID') or ledger.get('REMOTEID') or '').strip()

@@ -527,10 +527,10 @@ def api_automation_status():
 
 @app.route('/api/logs/recent')
 def api_logs_recent():
-    """Get recent logs - alias for /api/logs"""
+    """Get recent logs for the terminal panel"""
     lines = int(request.args.get('lines', 100))
-    logs = dashboard_logger.get_logs(lines)
-    return jsonify({'lines': logs, 'total': len(logs)})
+    log_lines = dashboard_logger.get_logs(lines)
+    return jsonify({'logs': '\n'.join(log_lines), 'total': len(log_lines)})
 
 
 @app.route('/api/logs/clear', methods=['POST'])
@@ -1198,12 +1198,10 @@ def _sync_one_customer(customer_id: int) -> dict:
                 ledger[k] = ledger[k].lstrip(':')
 
         api_base = cfg.get_env('CATALYTICS_API_BASE_URL', '')
-        api_key = cfg.get_env('CATALYTICS_API_KEY', '')
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
         endpoint = api_base.rstrip('/') + '/tally-customer-payload/'
+        # Payload endpoints use AllowAny permission — no auth header needed
         headers = {'Content-Type': 'application/json'}
-        if api_key:
-            headers['X-API-Key'] = api_key
 
         payload = {'entity_id': entity_id, 'ledger': ledger}
         company = cfg.get_env('TALLY_COMPANY')
@@ -1280,12 +1278,10 @@ def _sync_one_product(product_id: int) -> dict:
                 pass
 
         api_base = cfg.get_env('CATALYTICS_API_BASE_URL', '')
-        api_key = cfg.get_env('CATALYTICS_API_KEY', '')
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
         endpoint = api_base.rstrip('/') + '/tally-product_name-payload/'
+        # Payload endpoints use AllowAny permission — no auth header needed
         headers = {'Content-Type': 'application/json'}
-        if api_key:
-            headers['X-API-Key'] = api_key
 
         payload = {
             'entity_id': entity_id,
@@ -1382,13 +1378,11 @@ def _sync_one_invoice(invoice_id: int) -> dict:
         dc_no = note.get('dc_no') or str(invoice_id)
 
         api_base = cfg.get_env('CATALYTICS_API_BASE_URL', '')
-        api_key = cfg.get_env('CATALYTICS_API_KEY', '')
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
         company = cfg.get_env('TALLY_COMPANY')
         endpoint = api_base.rstrip('/') + '/tally-delivery-challan-payload/'
+        # Payload endpoints use AllowAny permission — no auth header needed
         headers = {'Content-Type': 'application/json'}
-        if api_key:
-            headers['X-API-Key'] = api_key
 
         payload, payload_hash = _build_payload_for_note(
             conn, note,
@@ -2139,6 +2133,18 @@ if __name__ == '__main__':
         level=getattr(logging, log_level),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+
+    # Route ALL Python logging (from every module/thread) to the dashboard terminal
+    class _DashboardLogHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                dashboard_logger.write_raw(self.format(record))
+            except Exception:
+                pass
+
+    _dh = _DashboardLogHandler()
+    _dh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logging.getLogger().addHandler(_dh)
 
     # Initialize DC database (TALLY_DB_PATH)
     db_path = cfg.get_env("TALLY_DB_PATH")
