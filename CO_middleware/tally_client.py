@@ -1,4 +1,5 @@
-import logging
+﻿import logging
+import os
 import re
 import time
 import threading
@@ -21,8 +22,17 @@ _tally_lock = threading.Lock()
 # CRITICAL: DO NOT REDUCE THIS VALUE!
 # On 8GB RAM systems, reducing cooldown causes "c0000005 Memory Access Violation" crashes.
 # 10 seconds is the MINIMUM safe interval for remote Tally access.
-_TALLY_REQUEST_COOLDOWN = 10.0
+def _read_tally_cooldown() -> float:
+    raw = os.getenv("TALLY_REQUEST_COOLDOWN", "").strip()
+    if not raw:
+        return 10.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 10.0
+    return max(10.0, value)
 
+_TALLY_REQUEST_COOLDOWN = _read_tally_cooldown()
 
 def send_request(xml_request: str, url: Optional[str] = None, timeout: int = 60) -> str:
     """Send request to Tally with cooldown period to prevent crashes"""
@@ -312,7 +322,7 @@ def parse_ledgers(response_xml: str):
 
 def get_sundry_debtors(company_name: str, url: Optional[str] = None, group_name: str = "Sundry Debtors"):
     """Fetch only Sundry Debtors ledgers (including sub-groups) from Tally.
-    Uses CHILDOF + BELONGSTO to filter at Tally level — much more efficient
+    Uses CHILDOF + BELONGSTO to filter at Tally level â€” much more efficient
     than fetching all ledgers and filtering in Python."""
     from xml.sax.saxutils import escape as xml_escape
     safe_company = xml_escape(company_name)
@@ -630,7 +640,7 @@ def parse_delivery_notes(response_xml: str):
     vouchers = []
     root = ET.fromstring(_clean_invalid_char_refs(response_xml))
     for voucher in root.findall(".//VOUCHER"):
-        # Skip count-only <VOUCHER>N</VOUCHER> elements from <CMPINFO> — they have no child elements
+        # Skip count-only <VOUCHER>N</VOUCHER> elements from <CMPINFO> â€” they have no child elements
         if not list(voucher):
             continue
         data = {}
@@ -837,8 +847,8 @@ def parse_delivery_notes(response_xml: str):
         if po_number:
             data["PONUMBER"] = po_number
 
-        # "Order No(s)" field — customer's PO / order number in Tally Prime
-        # Tally stores this in SALESORDERDETAILS.LIST → ORDERNO or PARTYORDERNO
+        # "Order No(s)" field â€” customer's PO / order number in Tally Prime
+        # Tally stores this in SALESORDERDETAILS.LIST â†’ ORDERNO or PARTYORDERNO
         order_no = (
             voucher.findtext(".//PARTYORDERNO") or
             voucher.findtext(".//SALESORDERNO") or
@@ -855,7 +865,7 @@ def parse_delivery_notes(response_xml: str):
         if order_no:
             data["PARTYORDERNO"] = order_no
 
-        # "Order Date" field — PO date matching the Order No(s)
+        # "Order Date" field â€” PO date matching the Order No(s)
         order_date = (
             voucher.findtext(".//PARTYORDERDATE") or
             voucher.findtext(".//BASICORDERDATE") or
@@ -871,7 +881,7 @@ def parse_delivery_notes(response_xml: str):
         if order_date:
             data["PARTYORDERDATE"] = order_date
 
-        # "Other References" field — free text reference (e.g. "Delivery")
+        # "Other References" field â€” free text reference (e.g. "Delivery")
         other_ref = (
             voucher.findtext(".//VOUCHERREFERENCE") or
             voucher.findtext(".//REFERENCE2") or
@@ -1284,7 +1294,7 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
     Fetch Delivery Notes from TallyPrime using the Day Book report export.
 
     TallyPrime's custom TDL Collection filters (SVFROMDATE/SVTODATE, $$IsInRange)
-    are NOT executed via the HTTP API — Tally ignores them and dumps all vouchers,
+    are NOT executed via the HTTP API â€” Tally ignores them and dumps all vouchers,
     causing memory crashes on large datasets.
 
     The Day Book report is a built-in TallyPrime report that natively respects
@@ -1304,7 +1314,7 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
     logger.info("get_delivery_notes called with from_date=%s (%s), to_date=%s (%s)",
                 from_date, _from_tally, to_date, _to_tally)
 
-    # Use Day Book report — TallyPrime's built-in date-aware report.
+    # Use Day Book report â€” TallyPrime's built-in date-aware report.
     # Unlike custom TDL collections, this DOES filter by SVFROMDATE/SVTODATE at source.
     xml = f"""<ENVELOPE>
   <HEADER>
@@ -1352,16 +1362,16 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
         extra = len(dc_vouchers) - len(date_filtered)
 
         if extra > 0:
-            # Day Book did NOT filter by date on this Tally instance — it returned all DCs.
+            # Day Book did NOT filter by date on this Tally instance â€” it returned all DCs.
             # If total DCs returned is large (>50), this is crash-prone. Switch to chunked fetch.
             logger.warning(
-                "Day Book ignored SVFROMDATE/SVTODATE — returned %d DCs, only %d are in %s–%s. "
+                "Day Book ignored SVFROMDATE/SVTODATE â€” returned %d DCs, only %d are in %sâ€“%s. "
                 "Tally is not filtering by date at source.",
                 len(dc_vouchers), len(date_filtered), from_date, to_date,
             )
             if len(dc_vouchers) > 50:
                 logger.warning(
-                    "Large dataset (%d DCs) with no Tally-side date filtering — "
+                    "Large dataset (%d DCs) with no Tally-side date filtering â€” "
                     "crash risk on low-RAM systems. Consider upgrading TallyPrime.",
                     len(dc_vouchers),
                 )
@@ -1604,7 +1614,7 @@ class TallyClient:
         """
         try:
             rate_str = str(rate_str).replace(",", "").strip()
-            # Tally RATE field is "amount/unit", e.g. "500.00/Cyl" — take only the numeric part
+            # Tally RATE field is "amount/unit", e.g. "500.00/Cyl" â€” take only the numeric part
             if "/" in rate_str:
                 rate_str = rate_str.split("/")[0].strip()
             # Tally AMOUNT fields can have a trailing unit separated by space
@@ -1666,7 +1676,7 @@ class TallyClient:
                 ledger_name = ledger_entry.get("LEDGERNAME", "").upper()
                 if any(tax in ledger_name for tax in ["CGST", "SGST", "IGST", "GST"]):
                     invoice['tax_amount'] += abs(amount)
-                elif amount != 0:  # Non-zero non-tax entry — party debit (positive) or sales credit (negative)
+                elif amount != 0:  # Non-zero non-tax entry â€” party debit (positive) or sales credit (negative)
                     candidate = abs(amount)
                     if candidate > invoice['total_amount']:
                         invoice['total_amount'] = candidate
@@ -1687,3 +1697,6 @@ class TallyClient:
             return float(qty_str)
         except (ValueError, TypeError, IndexError):
             return 0.0
+
+
+

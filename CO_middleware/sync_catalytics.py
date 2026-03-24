@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 from dataclasses import dataclass
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,6 +51,16 @@ def _attach_dc_sync_error_handler():
 
 _attach_dc_sync_file_handler()
 _attach_dc_sync_error_handler()
+
+def _ensure_dc_sync_log_files():
+    for name in ('dc_sync.log', 'dc_sync_errors.log'):
+        try:
+            log_path = BASE_DIR / 'logs' / name
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if not log_path.exists():
+                log_path.touch()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -143,12 +153,14 @@ _NON_PO_VALUES = {
     'shipment', 'yes', 'no', 'standard', 'normal', 'express',
     'not applicable', 'n/a', 'na', 'nil', 'none', '-',
     'customer pickup', 'customerpickup', 'pickup', 'self pickup', 'selfpickup', 'self',
-    # DC reference type keywords — delivery type indicators, not PO numbers
+    'dealer pickup', 'dealers pickup',
+    # DC reference type keywords â€” delivery type indicators, not PO numbers
     'customer pik up', 'customerpikup', 'supplier', 'traders', 'trader',
 }
 _NON_PO_KEYWORDS = (
     'customer pickup', 'customerpickup', 'pickup', 'self pickup',
     'selfpickup', 'self', 'delivery', 'dispatch', 'challan',
+    'dealer pickup', 'dealers pickup',
     # DC reference type keywords
     'customer pik up', 'supplier', 'traders',
 )
@@ -197,13 +209,13 @@ def _enrich_voucher(
     voucher.setdefault("DATE", note.get("voucher_date") or "")
     voucher.setdefault("PARTYLEDGERNAME", note.get("party_ledger_name") or "")
 
-    # ADDRESSES — billing address (from voucher data or party)
+    # ADDRESSES â€” billing address (from voucher data or party)
     if not voucher.get("ADDRESSES"):
         addr = (voucher.get("ADDRESS") or voucher.get("MAILINGNAME") or "").strip()
         if addr:
             voucher["ADDRESSES"] = [addr]
 
-    # CONSIGNEE — delivery/ship-to address
+    # CONSIGNEE â€” delivery/ship-to address
     if not voucher.get("CONSIGNEE"):
         consignee_addr = (
             voucher.get("DELIVERYADDRESS") or
@@ -257,7 +269,9 @@ def _enrich_voucher(
         str(voucher.get("TERMSOFDELIVERY") or ""),
         str(note.get("reference") or ""),
     ]).strip().lower()
-    if "customer pickup" in all_refs or "customer pik up" in all_refs or "pickup" in all_refs:
+    if "dealers pickup" in all_refs or "dealer pickup" in all_refs:
+        voucher["TERMSOFDELIVERY"] = "Dealers Pickup"
+    elif "customer pickup" in all_refs or "customer pik up" in all_refs or "pickup" in all_refs:
         voucher["TERMSOFDELIVERY"] = "Customer Pickup"
     elif "supplier" in all_refs:
         voucher["TERMSOFDELIVERY"] = "Supplier"
@@ -266,11 +280,11 @@ def _enrich_voucher(
     elif "delivery" in all_refs:
         voucher["TERMSOFDELIVERY"] = "Delivery"
     else:
-        # Fallback — use whatever Tally stored, or default to Delivery
+        # Fallback — use whatever Tally stored, or default to Delivery â€” use whatever Tally stored, or default to Delivery
         if not voucher.get("TERMSOFDELIVERY"):
             voucher["TERMSOFDELIVERY"] = "Delivery"
 
-    # INVENTORY — ensure items are attached
+    # INVENTORY â€” ensure items are attached
     if not voucher.get("INVENTORY"):
         voucher["INVENTORY"] = items
 
@@ -414,7 +428,7 @@ def _sync_deleted_dcs(
         return {"sent": 0, "ok": 0, "failed": 0}
 
     endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-delete/"
-    # Payload endpoints use AllowAny permission — no auth header needed
+    # Payload endpoints use AllowAny permission â€” no auth header needed
     headers = {"Content-Type": "application/json"}
 
     total_sent = 0
@@ -517,7 +531,9 @@ def build_config(args: argparse.Namespace) -> SyncConfig:
 
 
 def run_once(config: SyncConfig) -> Dict[str, int]:
+    _ensure_dc_sync_log_files()
     setup_logging(level=config.log_level, json_output=config.log_json, file_path=config.log_file)
+
 
     if not config.db_path or not config.api_base_url:
         raise ValueError("db_path and api_base_url are required")
@@ -540,7 +556,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         return {"sent": 0, "ok": 0, "failed": 0}
 
     endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-payload/"
-    # Payload endpoints use AllowAny permission — no auth header needed
+    # Payload endpoints use AllowAny permission â€” no auth header needed
     headers = {"Content-Type": "application/json"}
 
     total_sent = 0
@@ -583,7 +599,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             voucher.get("TERMSOFDELIVERY") or "[EMPTY]",
         )
 
-        # Send single voucher per request — matching Arasan's sync_invoices_to_dc pattern
+        # Send single voucher per request â€” matching Arasan's sync_invoices_to_dc pattern
         request_payload = {
             "entity_id": config.entity_id,
             "company_name": company_name,
@@ -651,7 +667,16 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 total_fail += 1
             else:
                 status_word = "created" if created else "updated"
-                logger.info("SUCCESS DC #%s (%s) | party=%s", dc_no, status_word, voucher.get("PARTYLEDGERNAME"))
+
+                resolved_dc_no = dc_no
+                results_list = (response_json.get("data") or {}).get("results") or []
+                if isinstance(results_list, list):
+                    for entry in results_list:
+                        if isinstance(entry, dict) and entry.get("dc_no"):
+                            resolved_dc_no = str(entry.get("dc_no")).strip()
+                            break
+                if not resolved_dc_no:
+                    resolved_dc_no = str(voucher.get("VOUCHERNUMBER") or "").strip() or dc_no                logger.info("SUCCESS DC #%s (%s) | party=%s", resolved_dc_no or dc_no, status_word, voucher.get("PARTYLEDGERNAME"))
                 _update_sync_status(conn, delivery_note_id=note["id"], success=True,
                                     payload_hash=payload_hash, response_json=response_json, error_text=None)
                 total_ok += 1
@@ -718,3 +743,16 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,4 +1,4 @@
-"""
+﻿"""
 CO Middleware - Web Dashboard
 Provides real-time monitoring and control interface for the middleware
 Single company version (adapted from arasan_gas)
@@ -15,6 +15,7 @@ import subprocess
 import requests
 import time
 from datetime import datetime
+from pathlib import Path
 from flask import Flask, render_template, jsonify, request
 from flask_cors import CORS
 from collections import deque
@@ -30,7 +31,7 @@ from config import config, BASE_DIR
 from automation_manager import get_manager
 from log_capture import dashboard_logger
 
-# Determine template folder — inside _MEIPASS when frozen, else default
+# Determine template folder â€” inside _MEIPASS when frozen, else default
 if getattr(sys, 'frozen', False):
     _template_folder = os.path.join(sys._MEIPASS, 'templates')
 else:
@@ -67,6 +68,20 @@ def check_catalytics_connection():
         return response.status_code < 500
     except:
         return False
+
+
+
+def get_recent_file_logs(log_file, lines=20):
+    """Get recent lines from a log file"""
+    try:
+        log_path = Path(BASE_DIR) / 'logs' / log_file
+        if not log_path.exists():
+            return []
+        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            all_lines = f.readlines()
+            return [line.strip() for line in all_lines[-lines:]]
+    except Exception:
+        return []
 
 
 def get_log_excerpt_by_keyword(log_file, keyword, lines=80):
@@ -152,11 +167,9 @@ def stop_dashboard_process_async(exit_delay_seconds: float = 0.5) -> None:
 @app.route('/')
 def index():
     """Main dashboard page"""
-    company_name = cfg.get_env("TALLY_COMPANY", "Unknown Company")
-    entity_id = cfg.get_env_int("CATALYTICS_ENTITY_ID", 0)
     return render_template('dashboard.html',
-                         company_name=company_name,
-                         entity_id=entity_id)
+                         entity_name=config.ENTITY_NAME,
+                         entity_id=config.ENTITY_ID)
 
 
 @app.route('/api/status')
@@ -488,10 +501,40 @@ def api_automation_intervals():
 @app.route('/api/logs')
 def api_logs():
     """Get recent log entries"""
-    lines = int(request.args.get('lines', 100))
-    log_type = request.args.get('type', 'main')  # main, fetch, sync
-    logs = dashboard_logger.get_logs(lines)
-    return jsonify({'lines': logs, 'total': len(logs)})
+    log_type = request.args.get('type', 'main')
+    lines = int(request.args.get('lines', 50))
+
+    log_files = {
+        'main': ['app.log'],
+        'fetch_master': ['product_fetch.log', 'customer_fetch.log'],
+        'fetch_invoices': ['dc_fetch.log'],
+        'sync': ['dc_sync.log', 'customer_sync.log', 'product_sync.log'],
+    }
+
+    files = log_files.get(log_type, [])
+    if isinstance(files, str):
+        files = [files]
+
+    logs = []
+    for fname in files:
+        part = get_recent_file_logs(fname, lines)
+        if not part:
+            continue
+        if len(files) > 1:
+            logs.append(f"--- {fname} ---")
+        logs.extend(part)
+
+    if not logs:
+        logs = dashboard_logger.get_logs(lines)
+
+    if len(logs) > lines:
+        logs = logs[-lines:]
+
+    return jsonify({
+        'log_type': log_type,
+        'log_file': files,
+        'lines': logs
+    })
 
 
 @app.route('/api/activity')
@@ -527,17 +570,27 @@ def api_automation_status():
 
 @app.route('/api/logs/recent')
 def api_logs_recent():
-    """Get recent logs for the terminal panel"""
-    lines = int(request.args.get('lines', 100))
-    log_lines = dashboard_logger.get_logs(lines)
-    return jsonify({'logs': '\n'.join(log_lines), 'total': len(log_lines)})
+    '''Get recent logs for the terminal panel'''
+    try:
+        lines = request.args.get('lines', 100, type=int)
+        logs = dashboard_logger.get_recent_logs(lines)
+        return jsonify({
+            'success': True,
+            'logs': logs,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/logs/clear', methods=['POST'])
 def api_logs_clear():
-    """Clear logs"""
-    dashboard_logger.clear()
-    return jsonify({'success': True, 'message': 'Logs cleared'})
+    '''Clear logs'''
+    try:
+        dashboard_logger.clear_logs()
+        return jsonify({'success': True, 'message': 'Logs cleared'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/trigger/fetch_invoices', methods=['POST'])
@@ -1185,7 +1238,7 @@ def _sync_one_customer(customer_id: int) -> dict:
         name = row['name'] or ''
         data_json = row['data_json'] or ''
         if not data_json:
-            return {'success': False, 'error': f'No Tally data for "{name}" — run fetch first'}
+            return {'success': False, 'error': f'No Tally data for "{name}" â€” run fetch first'}
 
         try:
             ledger = _json.loads(data_json)
@@ -1200,7 +1253,7 @@ def _sync_one_customer(customer_id: int) -> dict:
         api_base = cfg.get_env('CATALYTICS_API_BASE_URL', '')
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
         endpoint = api_base.rstrip('/') + '/tally-customer-payload/'
-        # Payload endpoints use AllowAny permission — no auth header needed
+        # Payload endpoints use AllowAny permission â€” no auth header needed
         headers = {'Content-Type': 'application/json'}
 
         payload = {'entity_id': entity_id, 'ledger': ledger}
@@ -1267,7 +1320,7 @@ def _sync_one_product(product_id: int) -> dict:
 
         name = row['name'] or ''
         if not row['product_master_name']:
-            return {'success': False, 'error': f'No parsed fields for "{name}" — run fetch first'}
+            return {'success': False, 'error': f'No parsed fields for "{name}" â€” run fetch first'}
 
         guid = ''
         if row['data_json']:
@@ -1280,7 +1333,7 @@ def _sync_one_product(product_id: int) -> dict:
         api_base = cfg.get_env('CATALYTICS_API_BASE_URL', '')
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
         endpoint = api_base.rstrip('/') + '/tally-product_name-payload/'
-        # Payload endpoints use AllowAny permission — no auth header needed
+        # Payload endpoints use AllowAny permission â€” no auth header needed
         headers = {'Content-Type': 'application/json'}
 
         payload = {
@@ -1381,7 +1434,7 @@ def _sync_one_invoice(invoice_id: int) -> dict:
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
         company = cfg.get_env('TALLY_COMPANY')
         endpoint = api_base.rstrip('/') + '/tally-delivery-challan-payload/'
-        # Payload endpoints use AllowAny permission — no auth header needed
+        # Payload endpoints use AllowAny permission â€” no auth header needed
         headers = {'Content-Type': 'application/json'}
 
         payload, payload_hash = _build_payload_for_note(
@@ -1908,9 +1961,146 @@ def api_diagnostics():
 
 @app.route('/api/verify/data-match', methods=['POST'])
 def verify_data_match():
-    """Verify data match between Tally and Catalytics"""
-    return jsonify({'success': True, 'message': 'Verification endpoint - not implemented'})
+    """Run data matching verification"""
+    try:
+        with activity_lock:
+            activity_log.appendleft({
+                'time': datetime.now().isoformat(),
+                'action': 'Data Matching Started',
+                'status': 'started',
+                'detail': 'Verifying SQLite → Catalytics consistency'
+            })
 
+        # Local SQLite counts (customers + products)
+        cust_total = cust_synced = cust_unsynced = 0
+        prod_total = prod_synced = prod_unsynced = 0
+
+        try:
+            conn = sqlite3.connect(config.SQLITE_DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM customers")
+            cust_total = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM customers WHERE is_synced = 1")
+            cust_synced = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM customers WHERE is_synced = 0")
+            cust_unsynced = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM products")
+            prod_total = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM products WHERE is_synced = 1")
+            prod_synced = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM products WHERE is_synced = 0")
+            prod_unsynced = cursor.fetchone()[0]
+            conn.close()
+        except Exception as exc:
+            logger.warning(f"Data match local SQLite read failed: {exc}")
+
+        # Local DC counts (delivery_notes)
+        inv_total = inv_synced = inv_unsynced = 0
+        try:
+            tally_db_path = cfg.get_env("TALLY_DB_PATH")
+            if tally_db_path:
+                conn2 = db.connect(tally_db_path)
+                inv_total = conn2.execute("SELECT COUNT(*) FROM delivery_notes").fetchone()[0]
+                inv_synced = conn2.execute(
+                    "SELECT COUNT(*) FROM delivery_notes dn LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id WHERE COALESCE(ss.is_synced, 0) = 1"
+                ).fetchone()[0]
+                inv_unsynced = conn2.execute(
+                    "SELECT COUNT(*) FROM delivery_notes dn LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id WHERE COALESCE(ss.is_synced, 0) = 0"
+                ).fetchone()[0]
+                conn2.close()
+        except Exception as exc:
+            logger.warning(f"Data match DC SQLite read failed: {exc}")
+
+        # Catalytics counts (PostgreSQL) - optional
+        cat_cust = cat_prod = cat_inv = 0
+        pg_error = None
+        try:
+            import psycopg2
+            pg_host = cfg.get_env("POSTGRES_HOST")
+            pg_port = cfg.get_env("POSTGRES_PORT")
+            pg_db = cfg.get_env("POSTGRES_DB")
+            pg_user = cfg.get_env("POSTGRES_USER")
+            pg_password = cfg.get_env("POSTGRES_PASSWORD")
+
+            if not all([pg_host, pg_port, pg_db, pg_user, pg_password]):
+                raise ValueError("PostgreSQL env vars missing (POSTGRES_HOST/PORT/DB/USER/PASSWORD)")
+
+            pg_conn = psycopg2.connect(
+                host=pg_host,
+                port=pg_port,
+                database=pg_db,
+                user=pg_user,
+                password=pg_password,
+            )
+            pg_cursor = pg_conn.cursor()
+            pg_cursor.execute('SELECT COUNT(*) FROM "master.Customer"')
+            cat_cust = pg_cursor.fetchone()[0]
+            pg_cursor.execute('SELECT COUNT(*) FROM "master.product"')
+            cat_prod = pg_cursor.fetchone()[0]
+            pg_cursor.execute('SELECT COUNT(*) FROM "transaction.delivery_challan"')
+            cat_inv = pg_cursor.fetchone()[0]
+            pg_conn.close()
+        except Exception as exc:
+            pg_error = str(exc)
+            logger.warning(f"PostgreSQL data match skipped: {pg_error}")
+
+        results = {
+            'entity_name': config.ENTITY_NAME,
+            'entity_id': config.ENTITY_ID,
+            'timestamp': datetime.now().isoformat(),
+            'customers': {
+                'sqlite_total': cust_total,
+                'sqlite_synced': cust_synced,
+                'sqlite_unsynced': cust_unsynced,
+                'catalytics_total': cat_cust,
+                'count_match': cust_synced == cat_cust,
+                'difference': cust_synced - cat_cust,
+            },
+            'products': {
+                'sqlite_total': prod_total,
+                'sqlite_synced': prod_synced,
+                'sqlite_unsynced': prod_unsynced,
+                'catalytics_total': cat_prod,
+                'count_match': prod_synced == cat_prod,
+                'difference': prod_synced - cat_prod,
+            },
+            'invoices': {
+                'sqlite_total': inv_total,
+                'sqlite_synced': inv_synced,
+                'sqlite_unsynced': inv_unsynced,
+                'catalytics_total': cat_inv,
+                'count_match': inv_synced == cat_inv,
+                'difference': inv_synced - cat_inv,
+            },
+            'overall_match': False,
+            'pg_error': pg_error,
+        }
+
+        results['overall_match'] = (
+            results['customers']['count_match']
+            and results['products']['count_match']
+            and results['invoices']['count_match']
+        )
+
+        status = 'success' if results.get('overall_match') else 'warning'
+        with activity_lock:
+            activity_log.appendleft({
+                'time': datetime.now().isoformat(),
+                'action': 'Data Matching Complete',
+                'status': status,
+                'detail': f"Overall: {'All Match' if results.get('overall_match') else 'Mismatches Found'}"
+            })
+
+        return jsonify({'success': True, 'results': results})
+
+    except Exception as e:
+        with activity_lock:
+            error_log.appendleft({
+                'time': datetime.now().isoformat(),
+                'error': f'Data matching failed: {str(e)}'
+            })
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/open-db', methods=['POST'])
 def open_db():
@@ -1958,7 +2148,7 @@ def open_db():
                 subprocess.Popen(['xdg-open', folder])
             return jsonify({
                 'success': True,
-                'message': f'DB Browser not found — opened folder: {folder}. Install DB Browser for SQLite to open files directly.'
+                'message': f'DB Browser not found â€” opened folder: {folder}. Install DB Browser for SQLite to open files directly.'
             })
 
         return jsonify({'success': True, 'message': f'Opened {label}: {os.path.basename(db_path)}'})
@@ -2182,3 +2372,11 @@ if __name__ == '__main__':
     maybe_start_automation()
     maybe_open_dashboard_browser()
     app.run(host=config.WEB_UI_HOST, port=config.WEB_UI_PORT, debug=dashboard_debug, use_reloader=False)
+
+
+
+
+
+
+
+

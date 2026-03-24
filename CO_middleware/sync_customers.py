@@ -1,4 +1,4 @@
-"""
+﻿"""
 Sync customers to Catalytics using tally-customer-payload endpoint.
 Reads from 'customers' table (populated by fetch_customers.py).
 Matches arasan_gas sync_to_catalytics.sync_customers() logic.
@@ -130,7 +130,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         return {'sent': 0, 'ok': 0, 'failed': 0}
 
     endpoint = config.api_base_url.rstrip('/') + '/tally-customer-payload/'
-    # Payload endpoints use AllowAny permission — no auth header needed
+    # Payload endpoints use AllowAny permission â€” no auth header needed
     headers = {'Content-Type': 'application/json'}
 
     total_sent = 0
@@ -148,7 +148,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             ledger = _build_ledger_from_customer(customer)
 
             if not ledger:
-                raise ValueError(f"No ledger data in data_json for '{name}' — re-run fetch_customers.py")
+                raise ValueError(f"No ledger data in data_json for '{name}' â€” re-run fetch_customers.py")
 
             # Clean GSTIN fields
             _clean_gstin(ledger)
@@ -257,28 +257,16 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 if created == 0 and updated == 0:
                     raise ValueError("Customer not created or updated")
 
-                # Extract catalytics_id from results
                 catalytics_id = None
-                results_list = data.get('results', [])
-                if results_list and isinstance(results_list, list):
-                    first = results_list[0]
-                    if isinstance(first, dict):
-                        catalytics_id = first.get('customer_id')
-
-                if catalytics_id:
-                    logger.info(f"  Customer ID from API: {catalytics_id}")
-                else:
-                    logger.warning(f"  No customer_id returned from API for '{name}'")
 
                 db.mark_customer_synced(customer_id, catalytics_id, response_json)
                 total_ok += 1
                 logger.info(
                     f"SUCCESS: '{name}' synced "
-                    f"(SQLite ID={customer_id}, Catalytics ID={catalytics_id}, "
+                    f"(SQLite ID={customer_id}, GUID={tally_guid or 'N/A'}, "
                     f"GSTIN={gstin or 'N/A'}, "
                     f"status={'created' if created else 'updated'})"
                 )
-
             else:
                 error_msg = f"HTTP {resp.status_code}"
                 error_response_json = None
@@ -336,3 +324,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

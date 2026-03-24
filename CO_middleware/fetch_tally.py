@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 from dataclasses import dataclass
 import logging
 from datetime import datetime, timedelta
@@ -47,6 +47,22 @@ def _normalize_dc_no(voucher: Dict[str, Any]) -> str:
         "VOUCHERKEY",
         "MASTERID",
         "REMOTEID",
+    ):
+        value = voucher.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _extract_tally_guid(voucher: Dict[str, Any]) -> str:
+    for key in (
+        "GUID",
+        "MASTERID",
+        "REMOTEID",
+        "REMOTEGUID",
+        "REMOTEALTGUID",
+        "VCHGUID",
+        "VOUCHERGUID",
     ):
         value = voucher.get(key)
         if value:
@@ -149,16 +165,34 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     stock_items_fetched = 0
 
     for voucher in vouchers:
+        tally_guid = _extract_tally_guid(voucher)
         dc_no = _normalize_dc_no(voucher)
         if not dc_no:
             skipped += 1
             continue
 
-        existing = conn.execute(
-            "SELECT data_json FROM delivery_notes WHERE company_id = ? AND dc_no = ?",
-            (company_id, dc_no),
-        ).fetchone()
-        existing_json = existing["data_json"] if existing else None
+        existing_json = None
+        if tally_guid:
+            existing_by_guid = conn.execute(
+                "SELECT id, dc_no, data_json FROM delivery_notes WHERE company_id = ? AND tally_guid = ?",
+                (company_id, tally_guid),
+            ).fetchone()
+            if existing_by_guid:
+                existing_json = existing_by_guid["data_json"]
+                existing_dc_no = (existing_by_guid["dc_no"] or "").strip()
+                if existing_dc_no and existing_dc_no != dc_no:
+                    logger.warning(
+                        "[GUID MATCH] DC GUID %s has db_no=%s, tally_no=%s - using db_no for update",
+                        tally_guid, existing_dc_no, dc_no,
+                    )
+                    dc_no = existing_dc_no
+
+        if existing_json is None:
+            existing = conn.execute(
+                "SELECT data_json FROM delivery_notes WHERE company_id = ? AND dc_no = ?",
+                (company_id, dc_no),
+            ).fetchone()
+            existing_json = existing["data_json"] if existing else None
 
         voucher_date = voucher.get("DATE") or ""
         party_name = voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME") or ""
@@ -170,6 +204,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             dc_no=dc_no,
             voucher_date=voucher_date,
             party_ledger_name=party_name,
+            tally_guid=tally_guid,
             reference=reference,
             data=voucher,
         )
@@ -341,3 +376,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+

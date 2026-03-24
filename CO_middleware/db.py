@@ -1,4 +1,4 @@
-import hashlib
+﻿import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS delivery_notes (
     dc_no TEXT NOT NULL,
     voucher_date TEXT,
     party_ledger_name TEXT,
+    tally_guid TEXT,
     reference TEXT,
     data_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -166,6 +167,19 @@ def migrate_db(conn: sqlite3.Connection) -> None:
                     )
                 except Exception:
                     pass  # Column may already exist from concurrent migration
+    # Ensure delivery_notes.tally_guid exists for GUID-based updates
+    try:
+        existing_dn = {row[1] for row in conn.execute("PRAGMA table_info(delivery_notes)").fetchall()}
+        if "tally_guid" not in existing_dn:
+            conn.execute("ALTER TABLE delivery_notes ADD COLUMN tally_guid TEXT")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_notes_guid ON delivery_notes(company_id, tally_guid)")
+    except Exception:
+        pass
+
     _soft_delete_ready = True
 
 
@@ -322,16 +336,17 @@ def upsert_delivery_note(
     conn.execute(
         f"""
         INSERT INTO delivery_notes
-            (company_id, dc_no, voucher_date, party_ledger_name, reference, data_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (company_id, dc_no, voucher_date, party_ledger_name, tally_guid, reference, data_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(company_id, dc_no) DO UPDATE SET
             voucher_date = excluded.voucher_date,
             party_ledger_name = excluded.party_ledger_name,
+            tally_guid = excluded.tally_guid,
             reference = excluded.reference,
             data_json = excluded.data_json,
             updated_at = excluded.updated_at{restore_clause}
         """,
-        (company_id, dc_no, voucher_date, party_ledger_name, reference, data_json, ts, ts),
+        (company_id, dc_no, voucher_date, party_ledger_name, tally_guid, reference, data_json, ts, ts),
     )
     row = conn.execute(
         "SELECT id FROM delivery_notes WHERE company_id = ? AND dc_no = ?",
@@ -615,7 +630,7 @@ def update_last_fetch_date(conn: sqlite3.Connection, company_id: int, data_type:
 
 
 # =============================================================================
-# DATABASE CLASS — arasan-style master data (customers / products)
+# DATABASE CLASS â€” arasan-style master data (customers / products)
 # =============================================================================
 
 import logging as _logging
@@ -685,7 +700,7 @@ class Database:
             )
         """)
 
-        # name_canonical is the UNIQUE key — handles spacing variations like "1.5CUM" vs "1.5 CUM"
+        # name_canonical is the UNIQUE key â€” handles spacing variations like "1.5CUM" vs "1.5 CUM"
         cur.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -923,6 +938,7 @@ class Database:
 
     def mark_customer_synced(self, customer_id, catalytics_id, response_json=None):
         """Mark customer as successfully synced."""
+        catalytics_id = None
         self.execute("""
             UPDATE customers
             SET is_synced = 1,
@@ -955,20 +971,7 @@ class Database:
 
     def mark_product_synced(self, product_id, catalytics_id, response_json=None):
         """Mark product as successfully synced."""
-        if catalytics_id is None and response_json:
-            try:
-                import json as _json
-                data = _json.loads(response_json)
-                payload = data.get('data', {}) if isinstance(data, dict) else {}
-                catalytics_id = payload.get('product_id') or payload.get('id')
-                if not catalytics_id:
-                    results = payload.get('results', [])
-                    if isinstance(results, list) and results:
-                        first = results[0]
-                        if isinstance(first, dict):
-                            catalytics_id = first.get('product_id') or first.get('id')
-            except Exception:
-                pass
+        catalytics_id = None
         self.execute("""
             UPDATE products
             SET is_synced = 1,
@@ -1023,3 +1026,11 @@ class Database:
     def close(self):
         if self.conn:
             self.conn.close()
+
+
+
+
+
+
+
+

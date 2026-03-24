@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 from dataclasses import dataclass
 import logging
 from datetime import datetime, timedelta
@@ -54,6 +54,16 @@ def _attach_dc_fetch_error_handler():
 _attach_dc_fetch_file_handler()
 _attach_dc_fetch_error_handler()
 
+def _ensure_dc_log_files():
+    for name in ('dc_fetch.log', 'dc_fetch_errors.log'):
+        try:
+            log_path = BASE_DIR / 'logs' / name
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if not log_path.exists():
+                log_path.touch()
+        except Exception:
+            pass
+
 
 @dataclass
 class FetchConfig:
@@ -70,7 +80,7 @@ class FetchConfig:
     log_json: bool
     log_file: Optional[str]
     reference_keywords: List[str]  # only fetch DCs whose reference fields contain one of these
-    master_db_path: str  # SQLITE_DB_PATH — has customers + products tables
+    master_db_path: str  # SQLITE_DB_PATH â€” has customers + products tables
 
 
 def _normalize_dc_no(voucher: Dict[str, Any]) -> str:
@@ -91,9 +101,25 @@ def _normalize_dc_no(voucher: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_tally_guid(voucher: Dict[str, Any]) -> str:
+    for key in (
+        "GUID",
+        "MASTERID",
+        "REMOTEID",
+        "REMOTEGUID",
+        "REMOTEALTGUID",
+        "VCHGUID",
+        "VOUCHERGUID",
+    ):
+        value = voucher.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
 def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
     now = datetime.now()
-    # Use `is not None` — days_back=0 means "today only" which is valid and must not fall through
+    # Use `is not None` â€” days_back=0 means "today only" which is valid and must not fall through
     if days_back is not None:
         from_dt = now - timedelta(days=days_back)
         return from_dt.strftime("%Y%m%d"), now.strftime("%Y%m%d")
@@ -107,6 +133,26 @@ def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
 def _normalize_name_key(value: str) -> str:
     """Normalize a name for lookup: strip, lowercase, remove spaces."""
     return str(value or '').replace(' ', '').strip().lower()
+
+
+_TANK_PRODUCT_KEY = _normalize_name_key("Tank of (Tnk)")
+
+
+def _override_tank_qty(inventory_items: List[Dict[str, Any]]) -> int:
+    """Force qty=1 for the Tank of (Tnk) item when Tally sends blank/invalid qty."""
+    if not inventory_items:
+        return 0
+    changed = 0
+    for item in inventory_items:
+        stock_name = (item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
+        if not stock_name:
+            continue
+        if _normalize_name_key(stock_name) == _TANK_PRODUCT_KEY:
+            # Ensure numeric qty for DB + payloads.
+            item["BILLEDQTY"] = "1"
+            item["ACTUALQTY"] = "1"
+            changed += 1
+    return changed
 
 
 def _build_payload_hash(
@@ -134,6 +180,28 @@ def _parse_reference_keywords(raw: Optional[str]) -> List[str]:
     return [kw.strip().lower() for kw in raw.split(',') if kw.strip()]
 
 
+
+def _extract_reference_text(voucher: Dict[str, Any]) -> str:
+    """Combine reference-like fields for keyword filtering."""
+    if not voucher:
+        return ""
+    fields = (
+        "PONUMBER",
+        "REFERENCE",
+        "OTHERREFERENCE",
+        "BASICORDERREF",
+        "VOUCHERREFERENCE",
+        "ORDERREF",
+        "ORDERINGNO",
+    )
+    parts = []
+    for key in fields:
+        value = voucher.get(key)
+        if value:
+            parts.append(str(value))
+    return " ".join(parts).strip().lower()
+
+
 def build_config(args: argparse.Namespace) -> FetchConfig:
     env_path = getattr(args, "config", None) or DEFAULT_ENV_PATH
     cfg.load_env_file(env_path)
@@ -151,7 +219,7 @@ def build_config(args: argparse.Namespace) -> FetchConfig:
         log_json=bool(args.log_json) or cfg.get_env_bool("LOG_JSON", False),
         log_file=args.log_file or cfg.get_env("LOG_FILE"),
         reference_keywords=_parse_reference_keywords(
-            cfg.get_env("DC_REFERENCE_KEYWORDS", "delivery,customer pickup,supplier,traders")
+            cfg.get_env("DC_REFERENCE_KEYWORDS", "delivery,customer pickup,supplier,traders,dealers pickup")
         ),
         master_db_path=str(
             BASE_DIR / cfg.get_env("SQLITE_DB_PATH")
@@ -162,6 +230,7 @@ def build_config(args: argparse.Namespace) -> FetchConfig:
 
 
 def run_once(config: FetchConfig) -> Dict[str, int]:
+    _ensure_dc_log_files()
     setup_logging(level=config.log_level, json_output=config.log_json, file_path=config.log_file)
 
     if not config.db_path or not config.company:
@@ -176,7 +245,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         master_conn = sqlite3.connect(config.master_db_path)
         master_conn.row_factory = sqlite3.Row
     else:
-        logger.warning("master_db_path not found (%s) — customer/product validation disabled", config.master_db_path)
+        logger.warning("master_db_path not found (%s) â€” customer/product validation disabled", config.master_db_path)
 
     # Get company
     companies = tally_api.get_companies(config.tally_url)
@@ -250,40 +319,58 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
     for voucher_raw in vouchers:
         voucher = dict(voucher_raw)
+        tally_guid = _extract_tally_guid(voucher)
+
         source_doc_no = _normalize_dc_no(voucher)
         dc_no = source_doc_no
         if not dc_no:
             skipped += 1
             continue
+
+        existing_json = None
+        if tally_guid:
+            existing_by_guid = conn.execute(
+                "SELECT id, dc_no, data_json FROM delivery_notes WHERE company_id = ? AND tally_guid = ?",
+                (company_id, tally_guid),
+            ).fetchone()
+            if existing_by_guid:
+                existing_json = existing_by_guid["data_json"]
+                existing_dc_no = (existing_by_guid["dc_no"] or "").strip()
+                if existing_dc_no and existing_dc_no != dc_no:
+                    logger.warning(
+                        "[GUID MATCH] DC GUID %s has db_no=%s, tally_no=%s - using db_no for update",
+                        tally_guid, existing_dc_no, dc_no,
+                    )
+                    dc_no = existing_dc_no
+
         # Keep a copy of original Tally data for stable hash computation
         voucher_for_hash = dict(voucher)
         voucher["SOURCE_DOC_TYPE"] = "SALES_INVOICE"
         voucher["SOURCE_DOC_NO"] = source_doc_no
         voucher["VOUCHERNUMBER"] = dc_no
 
-        existing = conn.execute(
-            "SELECT data_json FROM delivery_notes WHERE company_id = ? AND dc_no = ?",
-            (company_id, dc_no),
-        ).fetchone()
-        existing_json = existing["data_json"] if existing else None
+        if existing_json is None:
+            existing = conn.execute(
+                "SELECT data_json FROM delivery_notes WHERE company_id = ? AND dc_no = ?",
+                (company_id, dc_no),
+            ).fetchone()
+            existing_json = existing["data_json"] if existing else None
 
         voucher_date = voucher.get("DATE") or ""
         party_name = voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME") or ""
         reference = voucher.get("REFERENCE") or voucher.get("PONUMBER") or ""
 
-        # --- Reference keyword filter (strict: PONUMBER only) ---
-        # PONUMBER = Tally's "Reference" field — the only field users fill with delivery type
+        # --- Reference keyword filter (reference fields) ---
         if config.reference_keywords:
-            ponumber_val = (voucher.get("PONUMBER") or "").strip().lower()
-            if not any(kw in ponumber_val for kw in config.reference_keywords):
+            ref_text = _extract_reference_text(voucher)
+            if not any(kw in ref_text for kw in config.reference_keywords):
                 skipped += 1
                 skipped_ref_filter += 1
                 logger.info(
-                    "[SKIP REF FILTER] DC %s (%s) - PONUMBER='%s' has no keyword match %s",
-                    dc_no, party_name, ponumber_val or "(empty)", config.reference_keywords,
+                    "[SKIP REF FILTER] DC %s (%s) - REF='%s' has no keyword match %s",
+                    dc_no, party_name, ref_text or "(empty)", config.reference_keywords,
                 )
                 continue
-
         # --- Customer must exist in customers table (master DB: chennai4.sqlite) ---
         normalized_party = _normalize_name_key(party_name)
         if not normalized_party:
@@ -309,6 +396,9 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
         # --- All products must exist in products table (master DB: chennai4.sqlite) ---
         inventory_items = voucher.get("INVENTORY") or []
+        tank_overrides = _override_tank_qty(inventory_items)
+        if tank_overrides:
+            logger.info("Adjusted qty=1 for %d item(s) Tank of (Tnk) in DC %s", tank_overrides, dc_no)
         missing_products = []
         for item in inventory_items:
             stock_name = (item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
@@ -341,6 +431,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             dc_no=dc_no,
             voucher_date=voucher_date,
             party_ledger_name=party_name,
+            tally_guid=tally_guid,
             reference=reference,
             data=voucher,
         )
@@ -516,3 +607,15 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
+
+
+
+
+

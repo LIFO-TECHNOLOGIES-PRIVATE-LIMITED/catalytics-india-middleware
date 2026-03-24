@@ -1,8 +1,8 @@
-"""
+﻿"""
 Sync products to Catalytics using tally-product_name-payload endpoint.
 Reads from 'products' table (populated by fetch_products.py).
 Uses pre-parsed fields (product_master_name, variant_name, unit_name, etc.)
-— no re-parsing needed. Matches arasan_gas sync_to_catalytics.sync_products() logic.
+â€” no re-parsing needed. Matches arasan_gas sync_to_catalytics.sync_products() logic.
 """
 import argparse
 import json
@@ -102,7 +102,7 @@ def run_once(sync_config: SyncConfig) -> Dict[str, int]:
         return {'sent': 0, 'ok': 0, 'failed': 0}
 
     endpoint = sync_config.api_base_url.rstrip('/') + '/tally-product_name-payload/'
-    # Payload endpoints use AllowAny permission — no auth header needed
+    # Payload endpoints use AllowAny permission â€” no auth header needed
     headers = {'Content-Type': 'application/json'}
 
     total_sent = 0
@@ -125,7 +125,7 @@ def run_once(sync_config: SyncConfig) -> Dict[str, int]:
 
             if not product_master_name:
                 raise ValueError(
-                    f"Product '{name}' has no parsed fields — "
+                    f"Product '{name}' has no parsed fields â€” "
                     f"re-run fetch_products.py to populate"
                 )
 
@@ -208,29 +208,15 @@ def run_once(sync_config: SyncConfig) -> Dict[str, int]:
                 if created == 0 and updated == 0:
                     raise ValueError("Product not created or updated")
 
-                # Extract catalytics_id
-                catalytics_id = data.get('product_id') or data.get('id')
-                if not catalytics_id:
-                    results_list = data.get('results', [])
-                    if results_list and isinstance(results_list, list):
-                        first = results_list[0]
-                        if isinstance(first, dict):
-                            catalytics_id = first.get('product_id') or first.get('id')
-
-                if catalytics_id:
-                    logger.info(f"  Product ID from API: {catalytics_id}")
-                else:
-                    logger.warning(f"  API did not return product_id for '{name}'")
+                catalytics_id = None
 
                 db.mark_product_synced(product_id, catalytics_id, response_json)
                 total_ok += 1
                 logger.info(
                     f"SUCCESS: '{name}' synced "
-                    f"(SQLite ID={product_id}, Catalytics ID={catalytics_id}, "
-                    f"GUID={guid or 'N/A'}, "
+                    f"(SQLite ID={product_id}, GUID={guid or 'N/A'}, "
                     f"status={'created' if created else 'updated'})"
                 )
-
             else:
                 error_msg = f"HTTP {resp.status_code}"
                 error_response_json = None
@@ -288,3 +274,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
