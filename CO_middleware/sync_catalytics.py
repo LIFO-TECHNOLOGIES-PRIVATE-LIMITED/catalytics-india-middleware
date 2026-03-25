@@ -9,6 +9,8 @@ ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+import sqlite3
+
 import requests
 
 import config as cfg
@@ -66,6 +68,7 @@ def _ensure_dc_sync_log_files():
 @dataclass
 class SyncConfig:
     db_path: str
+    master_db_path: str          # SQLITE_DB_PATH — has the products table
     api_base_url: str
     api_key: Optional[str]
     entity_id: Optional[int]
@@ -296,6 +299,68 @@ def _enrich_voucher(
             voucher["LEDGERENTRIES"] = [{"LEDGERNAME": party, "AMOUNT": str(amount)}]
 
 
+def _build_liquid_name_map(master_db_path: str) -> Dict[str, str]:
+    """
+    Build a mapping of  liquid product_master_name -> canonical name
+    from the local products table.
+
+    e.g.  "LIQUID OXYGEN" -> "LIQUID OXYGEN 3000 Ltr"
+
+    If multiple variants exist for the same master name, the most recently
+    inserted one (highest id) is used — in practice there should be only one.
+    """
+    name_map: Dict[str, str] = {}
+    if not master_db_path or not os.path.exists(master_db_path):
+        return name_map
+    try:
+        mconn = sqlite3.connect(master_db_path, timeout=10)
+        mconn.row_factory = sqlite3.Row
+        rows = mconn.execute(
+            """
+            SELECT product_master_name, name_canonical
+            FROM products
+            WHERE lower(product_master_name) LIKE 'liquid%'
+              AND name_canonical IS NOT NULL
+              AND name_canonical != ''
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        for row in rows:
+            master = (row["product_master_name"] or "").strip()
+            canonical = (row["name_canonical"] or "").strip()
+            if master and canonical:
+                # Later rows overwrite earlier ones (most recent variant wins)
+                name_map[master.lower()] = canonical
+        mconn.close()
+    except Exception as exc:
+        logger.warning("Could not build liquid name map from master DB: %s", exc)
+    return name_map
+
+
+def _remap_liquid_inventory_items(
+    items: List[Dict[str, Any]],
+    liquid_name_map: Dict[str, str],
+) -> None:
+    """
+    For each inventory item whose STOCKITEMNAME starts with 'liquid',
+    replace STOCKITEMNAME with the canonical product name stored in
+    the master DB (e.g. "LIQUID OXYGEN" -> "LIQUID OXYGEN 3000 Ltr (TNK)").
+    Mutates items in-place.
+    """
+    for item in items:
+        stock_name = (item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
+        if not stock_name.lower().startswith("liquid"):
+            continue
+        canonical = liquid_name_map.get(stock_name.lower())
+        if canonical and canonical != stock_name:
+            logger.info(
+                "[LIQUID REMAP] DC item '%s' -> '%s'", stock_name, canonical
+            )
+            item["STOCKITEMNAME"] = canonical
+            if "ITEMNAME" in item:
+                item["ITEMNAME"] = canonical
+
+
 def _build_payload_for_note(
     conn,
     note: Dict[str, Any],
@@ -303,9 +368,15 @@ def _build_payload_for_note(
     entity_id: Optional[int],
     company_name: Optional[str],
     allow_tally_fetch: bool,
+    liquid_name_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], str]:
     voucher = db.json_loads(note["data_json"]) or {}
     items = _load_items(conn, note["id"])
+
+    # Remap liquid product names to their canonical form before syncing
+    if liquid_name_map:
+        _remap_liquid_inventory_items(items, liquid_name_map)
+
     voucher["INVENTORY"] = items
 
     # Enrich voucher with all fields the backend expects
@@ -513,8 +584,12 @@ def _sync_deleted_dcs(
 def build_config(args: argparse.Namespace) -> SyncConfig:
     env_path = getattr(args, "config", None) or DEFAULT_ENV_PATH
     cfg.load_env_file(env_path)
+    _master_db = cfg.get_env("SQLITE_DB_PATH") or ""
+    if _master_db and not os.path.isabs(_master_db):
+        _master_db = str(BASE_DIR / _master_db)
     return SyncConfig(
         db_path=args.db_path or cfg.get_env("TALLY_DB_PATH") or "",
+        master_db_path=_master_db,
         api_base_url=args.api_base_url or cfg.get_env("CATALYTICS_API_BASE_URL") or "",
         api_key=args.api_key or cfg.get_env("CATALYTICS_API_KEY"),
         entity_id=args.entity_id or cfg.get_env_int("CATALYTICS_ENTITY_ID"),
@@ -555,6 +630,11 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("No unsynced delivery notes found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
+    # Build liquid product name map once for this sync run
+    liquid_name_map = _build_liquid_name_map(config.master_db_path)
+    if liquid_name_map:
+        logger.info("Liquid product name map loaded: %s", liquid_name_map)
+
     endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-payload/"
     # Payload endpoints use AllowAny permission â€” no auth header needed
     headers = {"Content-Type": "application/json"}
@@ -572,6 +652,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 entity_id=config.entity_id,
                 company_name=company_name,
                 allow_tally_fetch=config.allow_tally_fetch,
+                liquid_name_map=liquid_name_map,
             )
         except Exception as exc:
             logger.exception("Failed to build payload for DC id=%s dc_no=%s", note.get("id"), dc_no)
@@ -676,7 +757,8 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                             resolved_dc_no = str(entry.get("dc_no")).strip()
                             break
                 if not resolved_dc_no:
-                    resolved_dc_no = str(voucher.get("VOUCHERNUMBER") or "").strip() or dc_no                logger.info("SUCCESS DC #%s (%s) | party=%s", resolved_dc_no or dc_no, status_word, voucher.get("PARTYLEDGERNAME"))
+                    resolved_dc_no = str(voucher.get("VOUCHERNUMBER") or "").strip() or dc_no
+                logger.info("SUCCESS DC #%s (%s) | party=%s", resolved_dc_no or dc_no, status_word, voucher.get("PARTYLEDGERNAME"))
                 _update_sync_status(conn, delivery_note_id=note["id"], success=True,
                                     payload_hash=payload_hash, response_json=response_json, error_text=None)
                 total_ok += 1

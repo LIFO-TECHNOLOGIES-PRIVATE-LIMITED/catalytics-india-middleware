@@ -267,6 +267,14 @@ class Config:
             _code, _full = _pair.split(':', 1)
             PRODUCT_TYPE_MAP[_code.strip().upper()] = _full.strip()
 
+    # Exact-keyword product fetch: stock items whose names contain any of these
+    # words (case-insensitive) are saved as-is, without requiring a type code.
+    PRODUCT_EXACT_KEYWORDS: list = [
+        kw.strip().lower()
+        for kw in os.getenv('PRODUCT_EXACT_KEYWORDS', '').split(',')
+        if kw.strip()
+    ]
+
     # Web UI
     WEB_UI_HOST = os.getenv('WEB_UI_HOST', 'localhost')
     WEB_UI_PORT = int(os.getenv('WEB_UI_PORT', '8787'))

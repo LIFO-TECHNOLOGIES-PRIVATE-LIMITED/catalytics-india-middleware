@@ -212,12 +212,31 @@ def fetch_products_from_all_companies():
                 parsed = parse_stock_item_name(product_name)
 
                 if not parsed:
-                    logger.debug(
-                        f"[SKIPPED] '{product_name}' — no matching type code "
-                        f"(expected one of: {list(config.PRODUCT_TYPE_MAP.keys())})"
+                    # Check if the name matches any PRODUCT_EXACT_KEYWORDS
+                    name_lower = product_name.lower()
+                    matched_keyword = next(
+                        (kw for kw in config.PRODUCT_EXACT_KEYWORDS if kw in name_lower),
+                        None
                     )
-                    overall_stats['skipped_no_type'] += 1
-                    continue
+                    if matched_keyword:
+                        parsed = {
+                            'product_master_name': product_name,
+                            'variant_name': '',
+                            'unit_name': '',
+                            'product_type_code': '',
+                            'product_type_name': '',
+                            'canonical_name': product_name,
+                        }
+                        logger.info(
+                            f"[EXACT KEYWORD MATCH] '{product_name}' matched keyword '{matched_keyword}' — saved as-is"
+                        )
+                    else:
+                        logger.debug(
+                            f"[SKIPPED] '{product_name}' — no matching type code "
+                            f"(expected one of: {list(config.PRODUCT_TYPE_MAP.keys())})"
+                        )
+                        overall_stats['skipped_no_type'] += 1
+                        continue
 
                 overall_stats['matched'] += 1
                 canonical_name = parsed['canonical_name']

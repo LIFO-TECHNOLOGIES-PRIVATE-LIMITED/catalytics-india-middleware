@@ -325,6 +325,7 @@ def upsert_delivery_note(
     dc_no: str,
     voucher_date: Optional[str],
     party_ledger_name: Optional[str],
+    tally_guid: Optional[str],
     reference: Optional[str],
     data: Dict[str, Any],
 ) -> int:

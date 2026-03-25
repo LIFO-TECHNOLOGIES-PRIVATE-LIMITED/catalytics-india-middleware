@@ -12,9 +12,12 @@ ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+import json
+import requests
 import config as cfg
 from config import BASE_DIR
 import db
+from db import Database as MasterDatabase
 import tally_api
 from logging_utils import setup_logging
 
@@ -155,6 +158,182 @@ def _override_tank_qty(inventory_items: List[Dict[str, Any]]) -> int:
     return changed
 
 
+def _parse_billedqty(qty_str: str):
+    """
+    Parse Tally's BILLEDQTY string into (qty, unit).
+
+    Examples:
+      "7.00 Kl"  -> ("7.00", "Kl")
+      "3000 Ltr" -> ("3000", "Ltr")
+      "7"        -> ("7", "")
+    """
+    s = (qty_str or '').strip()
+    if not s:
+        return '', ''
+    parts = s.split(None, 1)
+    qty = parts[0]
+    unit = parts[1].strip() if len(parts) > 1 else ''
+    return qty, unit
+
+
+def _ensure_liquid_product(
+    master_db_path: str,
+    stock_name: str,
+    item: Dict[str, Any],
+    company_name: str,
+    entity_id: Optional[int],
+    api_base_url: str,
+) -> bool:
+    """
+    For a DC line item whose stock name starts with 'liquid':
+      1. Build canonical name from stock_name + variant (NO type-code suffix)
+         e.g.  "LIQUID OXYGEN" + "3000 Ltr" -> "LIQUID OXYGEN 3000 Ltr"
+      2. Check local SQLite first — if already there, return True (no API call)
+      3. If not found: POST to /tally-product_name-payload/ with the same
+         payload format used by sync_products.py
+      4. On API success: insert into SQLite with is_synced = 1
+      5. Return True on success, False on any failure
+    """
+    qty_str = (item.get('BILLEDQTY') or item.get('ACTUALQTY') or '').strip()
+    qty, unit = _parse_billedqty(qty_str)
+
+    if not qty:
+        logger.warning(
+            "[LIQUID PRODUCT] '%s' — cannot determine variant: no qty in DC item. DC will be skipped.",
+            stock_name,
+        )
+        return False
+
+    variant_name = f"{qty} {unit}".strip()
+
+    # Liquid products in Tally have no type-code suffix in their name.
+    # canonical_name = the name exactly as it should exist in SQLite and server.
+    tank_type_code = 'TNK'
+    tank_type_name = cfg.config.PRODUCT_TYPE_MAP.get(tank_type_code, 'TANK')
+    canonical_name = f"{stock_name} {variant_name}"   # NO "(TNK)" suffix
+
+    master_db = None
+    try:
+        master_db = MasterDatabase(master_db_path)
+
+        # --- 1. Check local SQLite first ---
+        existing = master_db.product_exists_normalized(canonical_name)
+        if existing:
+            logger.info(
+                "[LIQUID PRODUCT] '%s' already in local DB (canonical='%s') — skipping API call",
+                stock_name, canonical_name,
+            )
+            return True
+
+        # --- 2. Save to SQLite first (is_synced=0) ---
+        product_data = {
+            'tally_guid': '',
+            'name': canonical_name,
+            'name_canonical': canonical_name,
+            'tally_company': company_name,
+            'hsn_code': '',
+            'unit': unit,
+            'rate': 0.0,
+            'description': f'Auto-created from DC liquid product: {stock_name}',
+            'data_json': json.dumps({'source': 'liquid_dc', 'original_name': stock_name}),
+            'product_master_name': stock_name,
+            'variant_name': variant_name,
+            'unit_name': unit,
+            'product_type_code': tank_type_code,
+            'product_type_name': tank_type_name,
+            'gst_applicable': '',
+            'gst_rate': 0.0,
+            'igst_rate': 0.0,
+            'cgst_rate': 0.0,
+            'sgst_rate': 0.0,
+        }
+        master_db.insert_product(product_data)
+        logger.info(
+            "[LIQUID PRODUCT] '%s' saved to local SQLite (canonical='%s', is_synced=0)",
+            stock_name, canonical_name,
+        )
+
+        # --- 3. Sync to Catalytics server ---
+        endpoint = api_base_url.rstrip('/') + '/tally-product_name-payload/'
+        payload = {
+            'entity_id': entity_id,
+            'stock_item_name': canonical_name,        # "LIQUID OXYGEN 3000 Ltr"
+            'product_master_name': stock_name,        # "LIQUID OXYGEN"
+            'unit_master_name': unit,                 # "Ltr"
+            'variant_name': variant_name,             # "3000 Ltr"
+            'product_type_code': tank_type_code,      # "TNK"
+            'product_type_name': tank_type_name,      # "TANK"
+            'hsn_code': '',
+            'guid': '',
+            'rate': 0.0,
+            'gst_applicable': '',
+            'gst_rate': 0.0,
+            'igst_rate': 0.0,
+            'cgst_rate': 0.0,
+            'sgst_rate': 0.0,
+            'tally_company': company_name,
+        }
+        logger.info(
+            "[LIQUID PRODUCT] Syncing '%s' to server — variant='%s', unit='%s', type=%s",
+            stock_name, variant_name, unit, tank_type_code,
+        )
+
+        resp = requests.post(
+            endpoint,
+            json=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=30,
+        )
+
+        prod_row = master_db.product_exists_normalized(canonical_name)
+
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "[LIQUID PRODUCT] Server sync failed for '%s': HTTP %d — %s. "
+                "Product saved in SQLite (is_synced=0), sync_products will retry.",
+                stock_name, resp.status_code, resp.text[:300],
+            )
+            return True   # SQLite has it — DC can proceed, sync will retry
+
+        result = resp.json()
+        if result.get('status') != 'success':
+            logger.error(
+                "[LIQUID PRODUCT] Server returned non-success for '%s': %s. "
+                "Product saved in SQLite (is_synced=0), sync_products will retry.",
+                stock_name, result.get('message'),
+            )
+            return True   # SQLite has it — DC can proceed, sync will retry
+
+        data = result.get('data', {})
+        if data.get('errors', 0) > 0:
+            results_list = data.get('results', [{}])
+            err_msg = results_list[0].get('message', 'Unknown') if results_list else 'Unknown'
+            logger.error(
+                "[LIQUID PRODUCT] Server error for '%s': %s. "
+                "Product saved in SQLite (is_synced=0), sync_products will retry.",
+                stock_name, err_msg,
+            )
+            return True   # SQLite has it — DC can proceed, sync will retry
+
+        # --- 4. API success: mark as synced ---
+        if prod_row:
+            master_db.mark_product_synced(prod_row['id'], None, json.dumps(result))
+        logger.info(
+            "[LIQUID PRODUCT] '%s' synced to server and marked is_synced=1 (canonical='%s')",
+            stock_name, canonical_name,
+        )
+        return True
+
+    except Exception as exc:
+        logger.error(
+            "[LIQUID PRODUCT] Unexpected error for '%s': %s", stock_name, exc, exc_info=True,
+        )
+        return False
+    finally:
+        if master_db is not None:
+            master_db.close()
+
+
 def _build_payload_hash(
     voucher: Dict[str, Any],
     inventory_items: List[Dict[str, Any]],
@@ -221,10 +400,10 @@ def build_config(args: argparse.Namespace) -> FetchConfig:
         reference_keywords=_parse_reference_keywords(
             cfg.get_env("DC_REFERENCE_KEYWORDS", "delivery,customer pickup,supplier,traders,dealers pickup")
         ),
-        master_db_path=str(
-            BASE_DIR / cfg.get_env("SQLITE_DB_PATH")
-            if cfg.get_env("SQLITE_DB_PATH") and not os.path.isabs(cfg.get_env("SQLITE_DB_PATH", ""))
-            else cfg.get_env("SQLITE_DB_PATH") or ""
+        master_db_path=(
+            str(BASE_DIR / cfg.config.SQLITE_DB_PATH)
+            if cfg.config.SQLITE_DB_PATH and not os.path.isabs(cfg.config.SQLITE_DB_PATH)
+            else cfg.config.SQLITE_DB_PATH or ""
         ),
     )
 
@@ -360,7 +539,46 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         party_name = voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME") or ""
         reference = voucher.get("REFERENCE") or voucher.get("PONUMBER") or ""
 
-        # --- Reference keyword filter (reference fields) ---
+        # --- Liquid product pre-creation (BEFORE any validation so it always runs) ---
+        inventory_items = voucher.get("INVENTORY") or []
+        _api_url = cfg.get_env('CATALYTICS_API_BASE_URL', '') or ''
+        if not _api_url:
+            logger.warning("[LIQUID] CATALYTICS_API_BASE_URL not set — liquid product creation skipped for DC %s", dc_no)
+        elif not config.master_db_path:
+            logger.warning("[LIQUID] master_db_path (SQLITE_DB_PATH) not set — liquid product creation skipped for DC %s", dc_no)
+        else:
+            for item in inventory_items:
+                _sname = (item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
+                if not _sname.lower().startswith('liquid'):
+                    continue
+
+                _nkey = _normalize_name_key(_sname)
+                _qty_str = (item.get('BILLEDQTY') or item.get('ACTUALQTY') or '').strip()
+
+                logger.info(
+                    "[LIQUID] DC %s | Found liquid product '%s' | BILLEDQTY='%s' | master_db='%s'",
+                    dc_no, _sname, _qty_str, config.master_db_path,
+                )
+
+                if stock_cache.get(_nkey):
+                    logger.info("[LIQUID] DC %s | '%s' already handled this run — skipping", dc_no, _sname)
+                    continue
+
+                _created = _ensure_liquid_product(
+                    master_db_path=config.master_db_path,
+                    stock_name=_sname,
+                    item=item,
+                    company_name=company_name,
+                    entity_id=config.entity_id,
+                    api_base_url=_api_url,
+                )
+                stock_cache[_nkey] = _created
+                logger.info(
+                    "[LIQUID] DC %s | '%s' result: %s",
+                    dc_no, _sname, "OK" if _created else "FAILED",
+                )
+
+        # --- Reference keyword filter ---
         if config.reference_keywords:
             ref_text = _extract_reference_text(voucher)
             if not any(kw in ref_text for kw in config.reference_keywords):
@@ -371,6 +589,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                     dc_no, party_name, ref_text or "(empty)", config.reference_keywords,
                 )
                 continue
+
         # --- Customer must exist in customers table (master DB: chennai4.sqlite) ---
         normalized_party = _normalize_name_key(party_name)
         if not normalized_party:
@@ -395,10 +614,10 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 continue
 
         # --- All products must exist in products table (master DB: chennai4.sqlite) ---
-        inventory_items = voucher.get("INVENTORY") or []
         tank_overrides = _override_tank_qty(inventory_items)
         if tank_overrides:
             logger.info("Adjusted qty=1 for %d item(s) Tank of (Tnk) in DC %s", tank_overrides, dc_no)
+
         missing_products = []
         for item in inventory_items:
             stock_name = (item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
