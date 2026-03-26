@@ -1,0 +1,20 @@
+{
+  "status": "stopped",
+  "intervals": {
+    "fetch_master": 600,
+    "fetch_invoices": 30,
+    "sync": 30
+  },
+  "last_runs": {
+    "fetch_master": "2026-03-06T12:46:27.834386",
+    "fetch_invoices": "2026-03-06T12:52:07.293444",
+    "sync": "2026-03-06T12:52:00.563046"
+  },
+  "next_runs": {
+    "fetch_master": "2026-03-06T12:56:15.604819",
+    "fetch_invoices": "2026-03-06T12:52:33.065393",
+    "sync": "2026-03-06T12:52:30.465680"
+  },
+  "started_at": "2026-03-05T23:00:30.311107",
+  "stopped_at": "2026-03-01T16:14:25.067879"
+}
