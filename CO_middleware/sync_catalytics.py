@@ -290,29 +290,26 @@ def _enrich_voucher(
     # Tally fills GODOWNNAME with "Main Location" / "Main Godown" when no
     # specific location is selected — treat those as "not set" and fall
     # through to DEFAULT_FILLING_STATION so the server uses the correct ID.
-    _TALLY_DEFAULT_GODOWNS = {
-        'main location', 'main godown', 'main', 'not applicable', 'n/a',
-    }
     default_fs = os.getenv("DEFAULT_FILLING_STATION", "").strip()
-
-    def _is_tally_default_godown(name: str) -> bool:
-        return name.strip().lower() in _TALLY_DEFAULT_GODOWNS
 
     if not voucher.get("FILLINGSTATION"):
         for key in ("GODOWNNAME", "LOCATIONNAME"):
             val = (voucher.get(key) or "").strip()
-            if val and not _is_tally_default_godown(val):
+            if val and val.lower() not in _TALLY_DEFAULT_GODOWNS_SET:
                 voucher["FILLINGSTATION"] = val
                 break
     if not voucher.get("FILLINGSTATION"):
         for item in items:
             godown = (item.get("GODOWNNAME") or "").strip()
-            if godown and not _is_tally_default_godown(godown):
+            if godown and godown.lower() not in _TALLY_DEFAULT_GODOWNS_SET:
                 voucher["FILLINGSTATION"] = godown
                 break
     if not voucher.get("FILLINGSTATION"):
         if default_fs:
             voucher["FILLINGSTATION"] = default_fs
+            # Send numeric ID so backend can look up the station directly
+            if default_fs.isdigit():
+                voucher["FILLINGSTATIONID"] = default_fs
 
     # PO number
     po_number = _extract_po_number(voucher)
@@ -555,6 +552,59 @@ def _fetch_deleted_unsynced(
         tuple(params),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+_TALLY_DEFAULT_GODOWNS_SET = {'main location', 'main godown', 'main', 'not applicable', 'n/a'}
+
+
+def _server_base_url(api_base_url: str) -> str:
+    """Strip /import suffix to get the server root URL."""
+    return api_base_url.rstrip("/").rsplit("/import", 1)[0]
+
+
+def _lookup_dc_id_by_no(api_base_url: str, entity_id: Optional[int], dc_no: str) -> Optional[int]:
+    """GET /transaction/delivery_challan?dc_no=... to find the DC's server ID."""
+    if not dc_no:
+        return None
+    try:
+        params: Dict[str, Any] = {"dc_no": dc_no}
+        if entity_id:
+            params["entity_id"] = entity_id
+        url = _server_base_url(api_base_url) + "/transaction/delivery_challan"
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data if isinstance(data, list) else data.get("data") or data.get("results") or []
+            if isinstance(items, list) and items:
+                dc_id = items[0].get("id")
+                if dc_id:
+                    return int(dc_id)
+            logger.debug("DC id lookup: no results for dc_no=%s (response: %s)", dc_no, str(data)[:200])
+    except Exception as exc:
+        logger.debug("DC id lookup failed for dc_no=%s: %s", dc_no, exc)
+    return None
+
+
+def _update_dc_fill_station(api_base_url: str, dc_id: int, fill_station_id: str) -> bool:
+    """POST /transaction/delivery_challan/<id> with fill_station to update."""
+    if not dc_id or not fill_station_id:
+        return False
+    try:
+        fs_int = int(fill_station_id)
+    except (ValueError, TypeError):
+        return False
+    try:
+        url = _server_base_url(api_base_url) + f"/transaction/delivery_challan/{dc_id}"
+        resp = requests.post(url, json={"id": dc_id, "fill_station": fs_int},
+                             headers={"Content-Type": "application/json"}, timeout=15)
+        if resp.status_code in (200, 201):
+            logger.info("Fill station updated: DC server_id=%s fill_station=%s", dc_id, fs_int)
+            return True
+        logger.warning("Fill station update HTTP %s for DC server_id=%s: %s",
+                       resp.status_code, dc_id, resp.text[:200])
+    except Exception as exc:
+        logger.warning("Fill station update failed for DC server_id=%s: %s", dc_id, exc)
+    return False
 
 
 def _sync_deleted_dcs(
@@ -838,6 +888,20 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 _update_sync_status(conn, delivery_note_id=note["id"], success=True,
                                     payload_hash=payload_hash, response_json=response_json, error_text=None)
                 total_ok += 1
+
+                # Step 2: Update fill_station (same as arasan) when Tally godown is default/main
+                default_fs = os.getenv("DEFAULT_FILLING_STATION", "").strip()
+                voucher_fs = str(voucher.get("FILLINGSTATION") or "").strip()
+                _needs_fs_update = (
+                    default_fs
+                    and (not voucher_fs or voucher_fs.lower() in _TALLY_DEFAULT_GODOWNS_SET or voucher_fs == default_fs)
+                )
+                if _needs_fs_update:
+                    _dc_server_id = _lookup_dc_id_by_no(config.api_base_url, config.entity_id, resolved_dc_no or dc_no)
+                    if _dc_server_id:
+                        _update_dc_fill_station(config.api_base_url, _dc_server_id, default_fs)
+                    else:
+                        logger.debug("Could not look up server DC id for fill_station update (dc_no=%s)", resolved_dc_no or dc_no)
         else:
             error_msg = response_json.get("message") or f"HTTP {resp.status_code}"
             logger.error("Sync failed DC #%s: %s", dc_no, error_msg)
