@@ -151,14 +151,72 @@ def _load_stock_items(conn, company_id: int, inventory_items: List[Dict[str, Any
     return stock_map
 
 
+# ---------------------------------------------------------------------------
+# Delivery-term resolution — identical to the one in fetch_invoices.py.
+# Maps abbreviations / typos in OTHERREFERENCE to a standard term.
+# Single-letter: d→delivery, c→customer pickup, s→supplier, t→traders
+# ---------------------------------------------------------------------------
+_REF_TERM_EXACT: Dict[str, str] = {
+    'd': 'delivery',
+    'c': 'customer pickup',
+    's': 'supplier',
+    't': 'traders',
+    'del': 'delivery',
+    'deliv': 'delivery',
+    'cust': 'customer pickup',
+    'sup': 'supplier',
+    'supp': 'supplier',
+    'tr': 'traders',
+    'trd': 'traders',
+}
+
+_REF_TERM_CONTAINS: List[tuple] = [
+    ('dealers pickup',   'dealers pickup'),
+    ('dealer pickup',    'dealers pickup'),
+    ('customer pik up',  'customer pickup'),
+    ('customer pickup',  'customer pickup'),
+    ('cust pickup',      'customer pickup'),
+    ('pickup',           'customer pickup'),
+    ('supplier',         'supplier'),
+    ('traders',          'traders'),
+    ('trader',           'traders'),
+    ('delivery',         'delivery'),
+]
+
+
+def _resolve_ref_term(ref: str) -> str:
+    """
+    Resolve a raw OTHERREFERENCE value to a standard delivery term.
+    Handles single-letter abbreviations, short forms, and full words.
+    Returns '' if the value cannot be mapped.
+    """
+    t = ref.strip().lower()
+    if not t:
+        return ''
+    if t in _REF_TERM_EXACT:
+        return _REF_TERM_EXACT[t]
+    for keyword, term in _REF_TERM_CONTAINS:
+        if keyword in t:
+            return term
+    # Token-level match: handle repeated/spaced abbreviations like "d d", "D D"
+    for token in t.split():
+        if token in _REF_TERM_EXACT:
+            return _REF_TERM_EXACT[token]
+    return ''
+
+
 _NON_PO_VALUES = {
     'delivery', 'invoice', 'sales', 'bill', 'challan', 'dc', 'dispatch',
     'shipment', 'yes', 'no', 'standard', 'normal', 'express',
     'not applicable', 'n/a', 'na', 'nil', 'none', '-',
     'customer pickup', 'customerpickup', 'pickup', 'self pickup', 'selfpickup', 'self',
     'dealer pickup', 'dealers pickup',
-    # DC reference type keywords â€” delivery type indicators, not PO numbers
+    # DC reference type keywords — delivery type indicators, not PO numbers
     'customer pik up', 'customerpikup', 'supplier', 'traders', 'trader',
+    # Single-letter abbreviations used in OTHERREFERENCE
+    'd', 'c', 's', 't',
+    # Short-form abbreviations
+    'del', 'deliv', 'cust', 'sup', 'supp', 'tr', 'trd',
 }
 _NON_PO_KEYWORDS = (
     'customer pickup', 'customerpickup', 'pickup', 'self pickup',
@@ -212,13 +270,13 @@ def _enrich_voucher(
     voucher.setdefault("DATE", note.get("voucher_date") or "")
     voucher.setdefault("PARTYLEDGERNAME", note.get("party_ledger_name") or "")
 
-    # ADDRESSES â€” billing address (from voucher data or party)
+    # ADDRESSES â€" billing address (from voucher data or party)
     if not voucher.get("ADDRESSES"):
         addr = (voucher.get("ADDRESS") or voucher.get("MAILINGNAME") or "").strip()
         if addr:
             voucher["ADDRESSES"] = [addr]
 
-    # CONSIGNEE â€” delivery/ship-to address
+    # CONSIGNEE â€" delivery/ship-to address
     if not voucher.get("CONSIGNEE"):
         consignee_addr = (
             voucher.get("DELIVERYADDRESS") or
@@ -229,20 +287,30 @@ def _enrich_voucher(
             voucher["CONSIGNEE"] = {"ADDRESS": consignee_addr}
 
     # FILLINGSTATION: voucher godown > item godown > env default
+    # Tally fills GODOWNNAME with "Main Location" / "Main Godown" when no
+    # specific location is selected — treat those as "not set" and fall
+    # through to DEFAULT_FILLING_STATION so the server uses the correct ID.
+    _TALLY_DEFAULT_GODOWNS = {
+        'main location', 'main godown', 'main', 'not applicable', 'n/a',
+    }
+    default_fs = os.getenv("DEFAULT_FILLING_STATION", "").strip()
+
+    def _is_tally_default_godown(name: str) -> bool:
+        return name.strip().lower() in _TALLY_DEFAULT_GODOWNS
+
     if not voucher.get("FILLINGSTATION"):
         for key in ("GODOWNNAME", "LOCATIONNAME"):
             val = (voucher.get(key) or "").strip()
-            if val:
+            if val and not _is_tally_default_godown(val):
                 voucher["FILLINGSTATION"] = val
                 break
     if not voucher.get("FILLINGSTATION"):
         for item in items:
             godown = (item.get("GODOWNNAME") or "").strip()
-            if godown:
+            if godown and not _is_tally_default_godown(godown):
                 voucher["FILLINGSTATION"] = godown
                 break
     if not voucher.get("FILLINGSTATION"):
-        default_fs = os.getenv("DEFAULT_FILLING_STATION", "").strip()
         if default_fs:
             voucher["FILLINGSTATION"] = default_fs
 
@@ -265,29 +333,37 @@ def _enrich_voucher(
         voucher.pop("PARTYORDERDATE", None)
         voucher.pop("PODATE", None)
 
-    # TERMSOFDELIVERY — mandatory field, derived from reference fields
-    all_refs = " ".join([
-        str(voucher.get("BASICORDERREF") or ""),
-        str(voucher.get("OTHERREFERENCE") or ""),
-        str(voucher.get("TERMSOFDELIVERY") or ""),
-        str(note.get("reference") or ""),
-    ]).strip().lower()
-    if "dealers pickup" in all_refs or "dealer pickup" in all_refs:
-        voucher["TERMSOFDELIVERY"] = "Dealers Pickup"
-    elif "customer pickup" in all_refs or "customer pik up" in all_refs or "pickup" in all_refs:
-        voucher["TERMSOFDELIVERY"] = "Customer Pickup"
-    elif "supplier" in all_refs:
-        voucher["TERMSOFDELIVERY"] = "Supplier"
-    elif "trader" in all_refs:
-        voucher["TERMSOFDELIVERY"] = "Traders"
-    elif "delivery" in all_refs:
-        voucher["TERMSOFDELIVERY"] = "Delivery"
-    else:
-        # Fallback — use whatever Tally stored, or default to Delivery â€” use whatever Tally stored, or default to Delivery
-        if not voucher.get("TERMSOFDELIVERY"):
-            voucher["TERMSOFDELIVERY"] = "Delivery"
+    # TERMSOFDELIVERY — mandatory field, derived from reference fields.
+    # Resolution order:
+    #   1. Try OTHERREFERENCE first — supports abbreviations (d/c/s/t) and full words
+    #   2. Fall back to combined reference text for full-word matching
+    #   3. Default to "Delivery" if nothing matched
+    _other_ref_raw = (voucher.get("OTHERREFERENCE") or "").strip()
+    _resolved = _resolve_ref_term(_other_ref_raw)
 
-    # INVENTORY â€” ensure items are attached
+    if not _resolved:
+        # Fallback: check combined reference fields for full words
+        all_refs = " ".join([
+            str(voucher.get("BASICORDERREF") or ""),
+            str(voucher.get("OTHERREFERENCE") or ""),
+            str(voucher.get("TERMSOFDELIVERY") or ""),
+            str(note.get("reference") or ""),
+        ]).strip().lower()
+        _resolved = _resolve_ref_term(all_refs) or ''
+
+    _TERM_DISPLAY = {
+        'dealers pickup':  'Dealers Pickup',
+        'customer pickup': 'Customer Pickup',
+        'supplier':        'Supplier',
+        'traders':         'Traders',
+        'delivery':        'Delivery',
+    }
+    if _resolved in _TERM_DISPLAY:
+        voucher["TERMSOFDELIVERY"] = _TERM_DISPLAY[_resolved]
+    elif not voucher.get("TERMSOFDELIVERY"):
+        voucher["TERMSOFDELIVERY"] = "Delivery"
+
+    # INVENTORY â€" ensure items are attached
     if not voucher.get("INVENTORY"):
         voucher["INVENTORY"] = items
 
@@ -499,7 +575,7 @@ def _sync_deleted_dcs(
         return {"sent": 0, "ok": 0, "failed": 0}
 
     endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-delete/"
-    # Payload endpoints use AllowAny permission â€” no auth header needed
+    # Payload endpoints use AllowAny permission â€" no auth header needed
     headers = {"Content-Type": "application/json"}
 
     total_sent = 0
@@ -584,7 +660,7 @@ def _sync_deleted_dcs(
 def build_config(args: argparse.Namespace) -> SyncConfig:
     env_path = getattr(args, "config", None) or DEFAULT_ENV_PATH
     cfg.load_env_file(env_path)
-    _master_db = cfg.get_env("SQLITE_DB_PATH") or ""
+    _master_db = cfg.config.SQLITE_DB_PATH or ""
     if _master_db and not os.path.isabs(_master_db):
         _master_db = str(BASE_DIR / _master_db)
     return SyncConfig(
@@ -636,7 +712,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("Liquid product name map loaded: %s", liquid_name_map)
 
     endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-payload/"
-    # Payload endpoints use AllowAny permission â€” no auth header needed
+    # Payload endpoints use AllowAny permission â€" no auth header needed
     headers = {"Content-Type": "application/json"}
 
     total_sent = 0
@@ -680,7 +756,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             voucher.get("TERMSOFDELIVERY") or "[EMPTY]",
         )
 
-        # Send single voucher per request â€” matching Arasan's sync_invoices_to_dc pattern
+        # Send single voucher per request â€" matching Arasan's sync_invoices_to_dc pattern
         request_payload = {
             "entity_id": config.entity_id,
             "company_name": company_name,

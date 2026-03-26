@@ -45,9 +45,9 @@ DEFAULT_INTERVALS = {
 }
 
 INITIAL_DELAYS = {
-    'fetch_master': 10,  # Products + Customers start at 0:10 (customers skip full fetch if already have details)
-    'fetch_invoices': 60,   # DCs start at 1:00
-    'sync': 120,  # Sync starts at 2:00
+    'fetch_master': 0,    # Products + Customers run immediately on startup
+    'fetch_invoices': 0,  # DCs run immediately on startup, then every 30s
+    'sync': 30,           # Sync starts after 30s (give DC fetch time to run first)
 }
 
 
@@ -74,6 +74,9 @@ class AutomationManager:
         self.threads = {}
         self.stop_flags = {}
         self.lock = threading.Lock()
+        # Signalled after the very first product+customer fetch completes.
+        # DC fetch waits on this so it only starts once master data is ready.
+        self._master_initial_done = threading.Event()
 
         # Reset status on startup — threads don't survive process restart
         if self.state['status'] == 'running':
@@ -244,12 +247,7 @@ class AutomationManager:
 
         task = 'fetch_master'
         consecutive_errors = 0
-
-        # Initial delay to avoid hitting Tally immediately on startup
-        initial_delay = INITIAL_DELAYS[task]
-        logger.info(f"{task}: Waiting {initial_delay} seconds before first run...")
-        if self.stop_flags[task].wait(timeout=initial_delay):
-            return  # Stop flag was set during initial delay
+        _first_run = True
 
         while not self.stop_flags[task].is_set():
             try:
@@ -310,6 +308,12 @@ class AutomationManager:
                 logger.info(f"{task} completed")
                 consecutive_errors = 0  # reset on success
 
+                # Signal DC fetch that initial master data is ready
+                if _first_run:
+                    _first_run = False
+                    self._master_initial_done.set()
+                    logger.info(f"{task}: Initial master fetch done — DC fetch unblocked")
+
                 # Wait for interval or stop signal
                 self.stop_flags[task].wait(timeout=interval)
 
@@ -319,6 +323,11 @@ class AutomationManager:
                 backoff = min(30 * consecutive_errors, 120)
                 logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
                 self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA ERROR: {e} (retry in {backoff}s) ===")
+                # Also signal DC fetch even on error so it isn't blocked forever
+                if _first_run:
+                    _first_run = False
+                    self._master_initial_done.set()
+                    logger.warning(f"{task}: Master fetch failed on first run — DC fetch unblocked anyway")
                 self.stop_flags[task].wait(timeout=backoff)
 
     def _fetch_invoices_loop(self):
@@ -329,11 +338,13 @@ class AutomationManager:
         task = 'fetch_invoices'
         consecutive_errors = 0
 
-        # Initial delay to avoid hitting Tally immediately on startup
-        initial_delay = INITIAL_DELAYS[task]
-        logger.info(f"{task}: Waiting {initial_delay} seconds before first run...")
-        if self.stop_flags[task].wait(timeout=initial_delay):
-            return  # Stop flag was set during initial delay
+        # Wait until initial master data (products + customers) fetch completes
+        logger.info(f"{task}: Waiting for initial master data fetch to complete...")
+        self._master_initial_done.wait()
+        if self.stop_flags[task].is_set():
+            return  # Stopped while waiting
+
+        logger.info(f"{task}: Master data ready — starting DC fetch loop")
 
         while not self.stop_flags[task].is_set():
             try:

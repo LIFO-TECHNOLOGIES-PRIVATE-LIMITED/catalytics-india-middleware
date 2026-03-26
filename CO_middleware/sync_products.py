@@ -63,7 +63,7 @@ def build_config(args: argparse.Namespace) -> SyncConfig:
     env_path = getattr(args, 'config', None) or DEFAULT_ENV_PATH
     cfg.load_env_file(env_path)
     # Use SQLITE_DB_PATH for master data (products table), not TALLY_DB_PATH (DC tables)
-    db_path = cfg.get_env("SQLITE_DB_PATH") or ""
+    db_path = cfg.config.SQLITE_DB_PATH or ""
     if db_path and not os.path.isabs(db_path):
         db_path = str(Path(ROOT_DIR) / db_path)
     return SyncConfig(
