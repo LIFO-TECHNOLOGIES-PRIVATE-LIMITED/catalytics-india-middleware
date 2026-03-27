@@ -205,6 +205,7 @@ def _ensure_liquid_product(
     master_db_path: str,
     stock_name: str,
     item: Dict[str, Any],
+    original_qty: str,
     company_name: str,
     entity_id: Optional[int],
     api_base_url: str,
@@ -223,8 +224,9 @@ def _ensure_liquid_product(
     # Normalize stock_name to uppercase — Tally may send mixed/lower case
     stock_name = stock_name.strip().upper()
 
-    # Save original qty before overwriting — needed for fallback variant lookup
-    _orig_billedqty = (item.get('BILLEDQTY') or item.get('ACTUALQTY') or '').strip()
+    # Save original qty before overwriting — needed for fallback variant lookup.
+    # Use caller-provided original DC qty first (captured before any qty=1 override).
+    _orig_billedqty = (original_qty or item.get('BILLEDQTY') or item.get('ACTUALQTY') or '').strip()
 
     # Always set DC item qty to 1 — tank product, mandatory
     item['BILLEDQTY'] = '1'
@@ -799,6 +801,9 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         # --- Liquid product pre-creation (BEFORE any validation so it always runs) ---
         inventory_items = voucher.get("INVENTORY") or []
         _api_url = cfg.get_env('CATALYTICS_API_BASE_URL', '') or ''
+        # Per-voucher tracking for liquid rows: whether pre-creation succeeded.
+        # Keyed by object id(item) so each line is tracked independently.
+        liquid_item_created: Dict[int, bool] = {}
 
         # Point 3: delivery DCs use their own liquid tanks — force qty=1 for canonical name.
         # Check ALL reference fields (not just OTHERREFERENCE) because Tally users may put
@@ -831,6 +836,11 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                     continue
 
                 _qty_str = (item.get('BILLEDQTY') or item.get('ACTUALQTY') or '').strip()
+                # Preserve original DC qty for downstream sync remapping.
+                # Sync forces qty=1 for tank movement, but still needs original
+                # variant qty to choose the correct canonical liquid product name.
+                if _qty_str and not item.get("ORIGINAL_BILLEDQTY"):
+                    item["ORIGINAL_BILLEDQTY"] = _qty_str
 
                 # Always force qty=1 for liquid/tank products — mandatory regardless of cache
                 item['BILLEDQTY'] = '1'
@@ -846,7 +856,8 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                     dc_no, _sname, _qty_str, config.master_db_path,
                 )
 
-                if stock_cache.get(_nkey):
+                if _nkey in stock_cache:
+                    liquid_item_created[id(item)] = bool(stock_cache.get(_nkey))
                     logger.info("[LIQUID] DC %s | '%s' qty='%s' already handled this run — skipping API", dc_no, _sname, _qty_str)
                     continue
 
@@ -854,11 +865,13 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                     master_db_path=config.master_db_path,
                     stock_name=_sname,
                     item=item,
+                    original_qty=_qty_str,
                     company_name=company_name,
                     entity_id=config.entity_id,
                     api_base_url=_api_url,
                 )
                 stock_cache[_nkey] = _created
+                liquid_item_created[id(item)] = _created
                 logger.info(
                     "[LIQUID] DC %s | '%s' qty='%s' result: %s",
                     dc_no, _sname, _qty_str, "OK" if _created else "FAILED",
@@ -936,6 +949,12 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 if stock_name.lower().startswith('liquid'):
                     # Liquid products are handled in the pre-creation block above.
                     # If still missing here, pre-creation failed → skip DC.
+                    if liquid_item_created.get(id(item)) is True:
+                        logger.info(
+                            "[PRODUCT CHECK] DC %s | Liquid '%s' accepted via pre-creation",
+                            dc_no, stock_name,
+                        )
+                        continue
                     logger.warning(
                         "[PRODUCT CHECK] DC %s | Liquid '%s' still missing after pre-creation block",
                         dc_no, stock_name,
@@ -1171,9 +1190,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
 
 
 

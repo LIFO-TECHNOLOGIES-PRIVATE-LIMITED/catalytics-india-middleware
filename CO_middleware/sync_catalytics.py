@@ -372,25 +372,31 @@ def _enrich_voucher(
             voucher["LEDGERENTRIES"] = [{"LEDGERNAME": party, "AMOUNT": str(amount)}]
 
 
-def _build_liquid_name_map(master_db_path: str) -> Dict[str, str]:
+def _normalize_name_key(value: Any) -> str:
+    return str(value or "").replace(" ", "").strip().lower()
+
+
+def _build_liquid_name_maps(master_db_path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Build a mapping of  liquid product_master_name -> canonical name
-    from the local products table.
+    Build liquid canonical lookup maps from local products table:
+      1) master map: product_master_name -> canonical
+      2) variant map: product_master_name + variant_name -> canonical
 
     e.g.  "LIQUID OXYGEN" -> "LIQUID OXYGEN 3000 Ltr"
 
     If multiple variants exist for the same master name, the most recently
     inserted one (highest id) is used — in practice there should be only one.
     """
-    name_map: Dict[str, str] = {}
+    master_map: Dict[str, str] = {}
+    variant_map: Dict[str, str] = {}
     if not master_db_path or not os.path.exists(master_db_path):
-        return name_map
+        return master_map, variant_map
     try:
         mconn = sqlite3.connect(master_db_path, timeout=10)
         mconn.row_factory = sqlite3.Row
         rows = mconn.execute(
             """
-            SELECT product_master_name, name_canonical
+            SELECT product_master_name, variant_name, name_canonical
             FROM products
             WHERE lower(product_master_name) LIKE 'liquid%'
               AND name_canonical IS NOT NULL
@@ -400,19 +406,23 @@ def _build_liquid_name_map(master_db_path: str) -> Dict[str, str]:
         ).fetchall()
         for row in rows:
             master = (row["product_master_name"] or "").strip()
+            variant = (row["variant_name"] or "").strip()
             canonical = (row["name_canonical"] or "").strip()
             if master and canonical:
                 # Later rows overwrite earlier ones (most recent variant wins)
-                name_map[master.lower()] = canonical
+                master_map[master.lower()] = canonical
+                if variant:
+                    variant_map[_normalize_name_key(f"{master} {variant}")] = canonical
         mconn.close()
     except Exception as exc:
-        logger.warning("Could not build liquid name map from master DB: %s", exc)
-    return name_map
+        logger.warning("Could not build liquid name maps from master DB: %s", exc)
+    return master_map, variant_map
 
 
 def _remap_liquid_inventory_items(
     items: List[Dict[str, Any]],
-    liquid_name_map: Dict[str, str],
+    liquid_master_map: Dict[str, str],
+    liquid_variant_map: Dict[str, str],
 ) -> None:
     """
     For each inventory item whose STOCKITEMNAME starts with 'liquid':
@@ -430,7 +440,17 @@ def _remap_liquid_inventory_items(
         item["BILLEDQTY"] = "1"
         item["ACTUALQTY"] = "1"
 
-        canonical = liquid_name_map.get(stock_name.lower())
+        original_qty = (
+            (item.get("ORIGINAL_BILLEDQTY") or item.get("ORIGINAL_ACTUALQTY") or "")
+        ).strip()
+
+        canonical = None
+        if original_qty:
+            canonical = liquid_variant_map.get(
+                _normalize_name_key(f"{stock_name} {original_qty}")
+            )
+        if not canonical:
+            canonical = liquid_master_map.get(stock_name.lower())
         if canonical and canonical != stock_name:
             logger.info(
                 "[LIQUID REMAP] DC item '%s' -> '%s' (qty forced to 1)", stock_name, canonical
@@ -451,14 +471,15 @@ def _build_payload_for_note(
     entity_id: Optional[int],
     company_name: Optional[str],
     allow_tally_fetch: bool,
-    liquid_name_map: Optional[Dict[str, str]] = None,
+    liquid_master_map: Optional[Dict[str, str]] = None,
+    liquid_variant_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], str]:
     voucher = db.json_loads(note["data_json"]) or {}
     items = _load_items(conn, note["id"])
 
     # Remap liquid product names to their canonical form before syncing
-    if liquid_name_map:
-        _remap_liquid_inventory_items(items, liquid_name_map)
+    if liquid_master_map is not None and liquid_variant_map is not None:
+        _remap_liquid_inventory_items(items, liquid_master_map, liquid_variant_map)
 
     voucher["INVENTORY"] = items
 
@@ -767,9 +788,13 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         return {"sent": 0, "ok": 0, "failed": 0}
 
     # Build liquid product name map once for this sync run
-    liquid_name_map = _build_liquid_name_map(config.master_db_path)
-    if liquid_name_map:
-        logger.info("Liquid product name map loaded: %s", liquid_name_map)
+    liquid_master_map, liquid_variant_map = _build_liquid_name_maps(config.master_db_path)
+    if liquid_master_map or liquid_variant_map:
+        logger.info(
+            "Liquid product maps loaded: master=%d variant=%d",
+            len(liquid_master_map),
+            len(liquid_variant_map),
+        )
 
     endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-payload/"
     # Payload endpoints use AllowAny permission â€" no auth header needed
@@ -788,7 +813,8 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 entity_id=config.entity_id,
                 company_name=company_name,
                 allow_tally_fetch=config.allow_tally_fetch,
-                liquid_name_map=liquid_name_map,
+                liquid_master_map=liquid_master_map,
+                liquid_variant_map=liquid_variant_map,
             )
         except Exception as exc:
             logger.exception("Failed to build payload for DC id=%s dc_no=%s", note.get("id"), dc_no)
@@ -975,8 +1001,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
 
 
 
