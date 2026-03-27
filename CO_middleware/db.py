@@ -849,9 +849,9 @@ class Database:
         )
 
     def product_exists_normalized(self, canonical_name: str):
-        """Check if product exists by canonical name (handles spacing variations)."""
+        """Check if product exists by canonical name (case-insensitive, handles spacing variations)."""
         return self.query(
-            "SELECT id, tally_company, name FROM products WHERE name_canonical = ?",
+            "SELECT id, tally_company, name FROM products WHERE name_canonical = ? COLLATE NOCASE",
             (canonical_name,)
         )
 

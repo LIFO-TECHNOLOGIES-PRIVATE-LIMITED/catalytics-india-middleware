@@ -38,16 +38,17 @@ except ImportError:
 STATE_FILE = Path(ROOT_DIR) / 'automation_state.json'
 
 # Default intervals (in seconds) — read from .env via config
+# Master (products + customers): once per day (1440 min default)
+# DC fetch: every 20 seconds (FETCH_INVOICES_INTERVAL_SECONDS default)
+# DC sync runs inline after each DC fetch — no separate sync timer needed
 DEFAULT_INTERVALS = {
-    'fetch_master': config.FETCH_MASTER_INTERVAL_MINUTES * 60,
-    'fetch_invoices': config.FETCH_INVOICES_INTERVAL_SECONDS,
-    'sync': config.SYNC_INVOICES_INTERVAL_SECONDS,
+    'fetch_master': config.FETCH_MASTER_INTERVAL_MINUTES * 60,   # default 1440 min = 1 day
+    'fetch_invoices': config.FETCH_INVOICES_INTERVAL_SECONDS,    # default 20s
 }
 
 INITIAL_DELAYS = {
     'fetch_master': 0,    # Products + Customers run immediately on startup
-    'fetch_invoices': 0,  # DCs run immediately on startup, then every 30s
-    'sync': 30,           # Sync starts after 30s (give DC fetch time to run first)
+    'fetch_invoices': 0,  # DCs run immediately after master data is ready
 }
 
 
@@ -100,12 +101,10 @@ class AutomationManager:
             'last_runs': {
                 'fetch_master': None,
                 'fetch_invoices': None,
-                'sync': None
             },
             'next_runs': {
                 'fetch_master': None,
                 'fetch_invoices': None,
-                'sync': None
             },
             'started_at': None,
             'stopped_at': None
@@ -127,7 +126,7 @@ class AutomationManager:
             # Calculate time until next runs
             if self.state['status'] == 'running':
                 now = datetime.now()
-                for task in ['fetch_master', 'fetch_invoices', 'sync']:
+                for task in ['fetch_master', 'fetch_invoices']:
                     if self.state['next_runs'][task]:
                         next_run = datetime.fromisoformat(self.state['next_runs'][task])
                         seconds_until = max(0, (next_run - now).total_seconds())
@@ -162,15 +161,11 @@ class AutomationManager:
                 self.state['next_runs'][task] = (now + timedelta(seconds=delay)).isoformat()
             self._save_state()
 
-        # Start all automation threads immediately
-        # Each thread has its own initial delay (5s, 10s, 15s) to stagger Tally requests
-        logger.info("Starting automation threads (each has built-in delay to protect Tally)...")
-        
+        logger.info("Starting automation threads...")
         self._start_thread('fetch_master', self._fetch_master_loop)
         self._start_thread('fetch_invoices', self._fetch_invoices_loop)
-        self._start_thread('sync', self._sync_loop)
 
-        logger.info("Automation started - threads will begin after their initial delays")
+        logger.info("Automation started — master fetch once/day, DC fetch+sync every 20s")
         return True
 
     def stop(self):
@@ -185,7 +180,6 @@ class AutomationManager:
             self.state['next_runs'] = {
                 'fetch_master': None,
                 'fetch_invoices': None,
-                'sync': None
             }
             self._save_state()
 
@@ -241,9 +235,15 @@ class AutomationManager:
             root.removeHandler(handler)
 
     def _fetch_master_loop(self):
-        """Continuous loop for fetching master data (customers + products)"""
+        """
+        Once-per-day loop: fetch products + customers from Tally,
+        then immediately sync any pending ones to the server.
+        """
         from fetch_products import fetch_products_from_all_companies
         from fetch_customers import fetch_customers_from_all_companies
+        from sync_customers import build_config as build_sync_customers_config, run_once as sync_customers_once
+        from sync_products import build_config as build_sync_products_config, run_once as sync_products_once
+        from types import SimpleNamespace
 
         task = 'fetch_master'
         consecutive_errors = 0
@@ -251,79 +251,90 @@ class AutomationManager:
 
         while not self.stop_flags[task].is_set():
             try:
-                # Update next run time
                 interval = self.state['intervals'][task]
                 next_run = datetime.now() + timedelta(seconds=interval)
                 with self.lock:
                     self.state['next_runs'][task] = next_run.isoformat()
                     self._save_state()
 
-                # Run fetch
                 logger.info(f"Running {task}...")
                 self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA STARTED ===")
 
-                # Fetch products FIRST
-                ok2 = True
-                prod_new = 0
-                prod_updated = 0
+                # --- Fetch products ---
+                ok_prod = True
+                prod_new = prod_updated = 0
                 try:
                     result = fetch_products_from_all_companies()
                     prod_new = result.get('new_saved', 0)
                     prod_updated = result.get('updated', 0)
                 except Exception as e:
                     logger.error(f"Product fetch failed: {e}", exc_info=True)
-                    ok2 = False
+                    ok_prod = False
 
-                # Add extra delay between products and customers to protect Tally
-                logger.info(f"{task}: Waiting 10 seconds before fetching customers...")
                 if self.stop_flags[task].wait(timeout=10):
-                    return  # Stop flag was set during delay
+                    return
 
-                # Fetch customers SECOND
-                ok1 = True
-                cust_new = 0
-                cust_updated = 0
+                # --- Fetch customers ---
+                ok_cust = True
+                cust_new = cust_updated = 0
                 try:
                     result = fetch_customers_from_all_companies()
                     cust_new = result.get('new_saved', 0)
                     cust_updated = result.get('updated', 0)
                 except Exception as e:
                     logger.error(f"Customer fetch failed: {e}", exc_info=True)
-                    ok1 = False
+                    ok_cust = False
 
-                if ok1 and ok2:
-                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA COMPLETED (products: new={prod_new}, updated={prod_updated} | customers: new={cust_new}, updated={cust_updated}) ===")
-                elif ok2:
-                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA PARTIAL (products OK: new={prod_new}, updated={prod_updated} | customers FAILED) ===")
-                elif ok1:
-                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA PARTIAL (products FAILED | customers OK: new={cust_new}, updated={cust_updated}) ===")
-                else:
-                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA FAILED ===")
+                self._log_to_dashboard(
+                    f"=== AUTO: FETCH MASTER DATA COMPLETED "
+                    f"(products: new={prod_new} upd={prod_updated} | "
+                    f"customers: new={cust_new} upd={cust_updated}) ==="
+                )
 
-                # Update last run time
                 with self.lock:
                     self.state['last_runs'][task] = datetime.now().isoformat()
                     self._save_state()
 
-                logger.info(f"{task} completed")
-                consecutive_errors = 0  # reset on success
+                consecutive_errors = 0
 
-                # Signal DC fetch that initial master data is ready
                 if _first_run:
                     _first_run = False
                     self._master_initial_done.set()
                     logger.info(f"{task}: Initial master fetch done — DC fetch unblocked")
 
-                # Wait for interval or stop signal
+                # --- Sync pending products + customers immediately after fetch ---
+                sync_args = SimpleNamespace(
+                    config=cfg.resolve_env_path(ROOT_DIR),
+                    db_path=None,
+                    api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
+                    api_key=cfg.get_env("CATALYTICS_API_KEY"),
+                    entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
+                    company=cfg.get_env("TALLY_COMPANY"),
+                    batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
+                    limit=cfg.get_env_int("SYNC_LIMIT", 200),
+                    max_attempts=cfg.get_env_int("SYNC_MAX_ATTEMPTS", 5),
+                    dry_run=cfg.get_env_bool("SYNC_DRY_RUN", False),
+                    log_level=cfg.get_env("LOG_LEVEL", "INFO"),
+                    log_json=cfg.get_env_bool("LOG_JSON", False),
+                    log_file=None,
+                )
+                try:
+                    sync_products_once(build_sync_products_config(sync_args))
+                except Exception as e:
+                    logger.error(f"Product sync failed: {e}")
+                try:
+                    sync_customers_once(build_sync_customers_config(sync_args))
+                except Exception as e:
+                    logger.error(f"Customer sync failed: {e}")
+
+                # Wait full day before next master fetch
                 self.stop_flags[task].wait(timeout=interval)
 
             except Exception as e:
                 consecutive_errors += 1
-                # Backoff: 30s, 60s, 120s, 120s, ... (cap at 120s)
                 backoff = min(30 * consecutive_errors, 120)
                 logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
                 self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA ERROR: {e} (retry in {backoff}s) ===")
-                # Also signal DC fetch even on error so it isn't blocked forever
                 if _first_run:
                     _first_run = False
                     self._master_initial_done.set()
@@ -331,119 +342,65 @@ class AutomationManager:
                 self.stop_flags[task].wait(timeout=backoff)
 
     def _fetch_invoices_loop(self):
-        """Continuous loop for fetching invoices/DCs"""
+        """
+        Every-20s loop: fetch DCs from Tally, then immediately sync
+        any pending DCs to the server (inline — no separate sync timer).
+        """
         from fetch_invoices import build_config as build_fetch_invoices_config, run_once as fetch_invoices_once
+        from sync_catalytics import build_config as build_sync_config, run_once as sync_once
         from types import SimpleNamespace
 
         task = 'fetch_invoices'
         consecutive_errors = 0
 
-        # Wait until initial master data (products + customers) fetch completes
         logger.info(f"{task}: Waiting for initial master data fetch to complete...")
         self._master_initial_done.wait()
         if self.stop_flags[task].is_set():
-            return  # Stopped while waiting
+            return
 
-        logger.info(f"{task}: Master data ready — starting DC fetch loop")
+        logger.info(f"{task}: Master data ready — starting DC fetch+sync loop (every 20s)")
 
         while not self.stop_flags[task].is_set():
             try:
-                # Update next run time
                 interval = self.state['intervals'][task]
                 next_run = datetime.now() + timedelta(seconds=interval)
                 with self.lock:
                     self.state['next_runs'][task] = next_run.isoformat()
                     self._save_state()
 
-                # Run fetch
-                logger.info(f"Running {task}...")
-                self._log_to_dashboard(f"=== AUTO: FETCH DCs STARTED ===")
-
-                # Build args namespace
-                args = SimpleNamespace(
+                # --- Fetch DCs from Tally ---
+                fetch_args = SimpleNamespace(
                     config=cfg.resolve_env_path(ROOT_DIR),
                     db_path=cfg.get_env("TALLY_DB_PATH"),
                     tally_url=cfg.get_env("TALLY_URL"),
                     company=cfg.get_env("TALLY_COMPANY"),
                     entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
-                    from_date=cfg.get_env("TALLY_FROM_DATE"),  # Read from .env
-                    to_date=cfg.get_env("TALLY_TO_DATE"),  # Read from .env
-                    days_back=cfg.get_env_int("TALLY_DAYS_BACK"),  # Read from .env (CRITICAL FIX)
-                    fetch_stock=False,  # Don't fetch stock details for DCs (too slow)
+                    from_date=cfg.get_env("TALLY_FROM_DATE"),
+                    to_date=cfg.get_env("TALLY_TO_DATE"),
+                    days_back=cfg.get_env_int("TALLY_DAYS_BACK"),
+                    fetch_stock=False,
                     dry_run=False,
                     log_level=cfg.get_env("LOG_LEVEL", "INFO"),
                     log_json=cfg.get_env_bool("LOG_JSON", False),
-                    log_file=None
+                    log_file=None,
                 )
-
-                # Fetch DCs
-                fetch_config = build_fetch_invoices_config(args)
-                ok = True
-                error_msg = None
+                fetch_ok = True
+                fetch_created = fetch_updated = 0
                 try:
-                    result = fetch_invoices_once(fetch_config)
-                    # Check if any DCs were created/updated
-                    created = result.get('created', 0)
-                    updated = result.get('updated', 0)
-                    if created > 0 or updated > 0:
-                        self._log_to_dashboard(f"=== AUTO: FETCH DCs COMPLETED (created={created}, updated={updated}) ===")
-                    else:
-                        self._log_to_dashboard(f"=== AUTO: FETCH DCs COMPLETED (no new DCs) ===")
+                    result = fetch_invoices_once(build_fetch_invoices_config(fetch_args))
+                    fetch_created = result.get('created', 0)
+                    fetch_updated = result.get('updated', 0)
+                    if fetch_created or fetch_updated:
+                        self._log_to_dashboard(
+                            f"=== AUTO: FETCH DCs COMPLETED (created={fetch_created}, updated={fetch_updated}) ==="
+                        )
                 except Exception as e:
                     logger.error(f"DC fetch failed: {e}", exc_info=True)
-                    error_msg = str(e)
-                    ok = False
-                    self._log_to_dashboard(f"=== AUTO: FETCH DCs FAILED: {error_msg} ===")
+                    fetch_ok = False
+                    self._log_to_dashboard(f"=== AUTO: FETCH DCs FAILED: {e} ===")
 
-                # Update last run time
-                with self.lock:
-                    self.state['last_runs'][task] = datetime.now().isoformat()
-                    self._save_state()
-
-                logger.info(f"{task} completed")
-                consecutive_errors = 0  # reset on success
-
-                # Wait for interval or stop signal
-                self.stop_flags[task].wait(timeout=interval)
-
-            except Exception as e:
-                consecutive_errors += 1
-                # Backoff: 30s, 60s, 120s cap — avoids hammering a crashed Tally
-                backoff = min(30 * consecutive_errors, 120)
-                logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
-                self._log_to_dashboard(f"=== AUTO: FETCH DCs ERROR: {e} (retry in {backoff}s) ===")
-                self.stop_flags[task].wait(timeout=backoff)
-
-    def _sync_loop(self):
-        """Continuous loop for syncing to Catalytics"""
-        from sync_catalytics import build_config as build_sync_config, run_once as sync_once
-        from sync_customers import build_config as build_sync_customers_config, run_once as sync_customers_once
-        from sync_products import build_config as build_sync_products_config, run_once as sync_products_once
-        from types import SimpleNamespace
-
-        task = 'sync'
-        consecutive_errors = 0
-
-        initial_delay = INITIAL_DELAYS[task]
-        logger.info(f"{task}: Waiting {initial_delay} seconds before first run...")
-        if self.stop_flags[task].wait(timeout=initial_delay):
-            return  # Stop flag was set during initial delay
-
-        while not self.stop_flags[task].is_set():
-            try:
-                # Update next run time
-                interval = self.state['intervals'][task]
-                next_run = datetime.now() + timedelta(seconds=interval)
-                with self.lock:
-                    self.state['next_runs'][task] = next_run.isoformat()
-                    self._save_state()
-
-                # Run sync
-                logger.info(f"Running {task}...")
-                self._log_to_dashboard(f"=== AUTO: SYNC TO CATALYTICS STARTED ===")
-
-                # Build args namespace
-                args = SimpleNamespace(
+                # --- Sync pending DCs immediately after fetch ---
+                sync_args = SimpleNamespace(
                     config=cfg.resolve_env_path(ROOT_DIR),
                     db_path=cfg.get_env("TALLY_DB_PATH"),
                     api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
@@ -457,58 +414,25 @@ class AutomationManager:
                     dry_run=cfg.get_env_bool("SYNC_DRY_RUN", False),
                     log_level=cfg.get_env("LOG_LEVEL", "INFO"),
                     log_json=cfg.get_env_bool("LOG_JSON", False),
-                    log_file=None
+                    log_file=None,
                 )
-
-                # Sync DCs
-                sync_config = build_sync_config(args)
-                ok1 = True
                 try:
-                    sync_once(sync_config)
+                    sync_once(build_sync_config(sync_args))
                 except Exception as e:
                     logger.error(f"DC sync failed: {e}")
-                    ok1 = False
 
-                # Sync customers
-                sync_config = build_sync_customers_config(args)
-                ok2 = True
-                try:
-                    sync_customers_once(sync_config)
-                except Exception as e:
-                    logger.error(f"Customer sync failed: {e}")
-                    ok2 = False
-
-                # Sync products
-                sync_config = build_sync_products_config(args)
-                ok3 = True
-                try:
-                    sync_products_once(sync_config)
-                except Exception as e:
-                    logger.error(f"Product sync failed: {e}")
-                    ok3 = False
-
-                if ok1 and ok2 and ok3:
-                    self._log_to_dashboard(f"=== AUTO: SYNC TO CATALYTICS COMPLETED ===")
-                else:
-                    self._log_to_dashboard(f"=== AUTO: SYNC TO CATALYTICS FAILED ===")
-
-                # Update last run time
                 with self.lock:
                     self.state['last_runs'][task] = datetime.now().isoformat()
                     self._save_state()
 
-                logger.info(f"{task} completed")
-                consecutive_errors = 0  # reset on success
-
-                # Wait for interval or stop signal
+                consecutive_errors = 0
                 self.stop_flags[task].wait(timeout=interval)
 
             except Exception as e:
                 consecutive_errors += 1
-                # Backoff: 30s, 60s, 120s cap
                 backoff = min(30 * consecutive_errors, 120)
                 logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
-                self._log_to_dashboard(f"=== AUTO: SYNC ERROR: {e} (retry in {backoff}s) ===")
+                self._log_to_dashboard(f"=== AUTO: FETCH DCs ERROR: {e} (retry in {backoff}s) ===")
                 self.stop_flags[task].wait(timeout=backoff)
 
 

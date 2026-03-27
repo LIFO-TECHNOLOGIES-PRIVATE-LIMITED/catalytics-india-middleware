@@ -177,6 +177,30 @@ def _parse_billedqty(qty_str: str):
     return qty, unit
 
 
+import re as _re
+
+_LIQUID_NAME_VARIANT_RE = _re.compile(
+    r'^(.*?)\s+(\d+(?:\.\d+)?)\s*([A-Za-z]+)\s*(?:\(TNK\))?\s*$',
+    _re.IGNORECASE,
+)
+
+
+def _parse_liquid_name_variant(stock_name: str):
+    """
+    Try to extract variant from a liquid product name like:
+      "LIQUID NITROGEN 130 LIT"       → base="LIQUID NITROGEN", qty="130", unit="LIT"
+      "LIQUID NITROGEN 130 LIT (TNK)" → base="LIQUID NITROGEN", qty="130", unit="LIT"
+    Returns (base_name, qty, unit) or (stock_name, None, None) if no variant found.
+    """
+    m = _LIQUID_NAME_VARIANT_RE.match(stock_name.strip())
+    if m:
+        base = m.group(1).strip().upper()
+        qty = m.group(2)
+        unit = m.group(3).strip().upper()
+        return base, qty, unit
+    return stock_name, None, None
+
+
 def _ensure_liquid_product(
     master_db_path: str,
     stock_name: str,
@@ -184,25 +208,37 @@ def _ensure_liquid_product(
     company_name: str,
     entity_id: Optional[int],
     api_base_url: str,
-    force_qty_one: bool = False,
 ) -> bool:
     """
     For a DC line item whose stock name starts with 'liquid':
-      1. Build canonical name: "LIQUID OXYGEN 3000 Ltr (TNK)"
-         - force_qty_one=False (Point 1): qty + unit both from BILLEDQTY
-         - force_qty_one=True  (Point 3): qty forced to 1, unit from BILLEDQTY
-           (delivery DCs — tank is their own asset, always qty=1)
-      2. Check local SQLite first — if already there, return True (no API call)
-      3. If not found: INSERT to SQLite (is_synced=0) then POST to /tally-product_name-payload/
-      4. On API success: mark is_synced=1
-      5. Return True on success (or if product in SQLite), False on hard failure
+      1. If stock_name already contains variant (e.g. "LIQUID NITROGEN 130 LIT (TNK)"),
+         extract base name + variant from the name itself.
+         Otherwise fall back to BILLEDQTY for variant.
+      2. Always force item BILLEDQTY/ACTUALQTY = 1 (tank is a physical asset).
+      3. Check local SQLite first — if already there, return True (no API call)
+      4. If not found: INSERT to SQLite (is_synced=0) then POST to /tally-product_name-payload/
+      5. On API success: mark is_synced=1
+      6. Return True on success (or if product in SQLite), False on hard failure
     """
-    qty_str = (item.get('BILLEDQTY') or item.get('ACTUALQTY') or '').strip()
-    qty, unit = _parse_billedqty(qty_str)
+    # Normalize stock_name to uppercase — Tally may send mixed/lower case
+    stock_name = stock_name.strip().upper()
 
-    if force_qty_one:
-        # Delivery DC: liquid container is their own asset — always qty=1
-        qty = "1"
+    # Save original qty before overwriting — needed for fallback variant lookup
+    _orig_billedqty = (item.get('BILLEDQTY') or item.get('ACTUALQTY') or '').strip()
+
+    # Always set DC item qty to 1 — tank product, mandatory
+    item['BILLEDQTY'] = '1'
+    item['ACTUALQTY'] = '1'
+
+    # Try to get variant from the product name itself
+    base_name, name_qty, name_unit = _parse_liquid_name_variant(stock_name)
+    if name_qty:
+        qty = name_qty
+        unit = name_unit
+        stock_name = base_name  # use base name (without variant) as product master name
+    else:
+        # Plain name (e.g. "LIQUID NITROGEN") — get variant from original BILLEDQTY
+        qty, unit = _parse_billedqty(_orig_billedqty)
 
     if not qty:
         logger.warning(
@@ -211,12 +247,18 @@ def _ensure_liquid_product(
         )
         return False
 
+    unit = unit.upper()
     variant_name = f"{qty} {unit}".strip()
 
     tank_type_code = 'TNK'
     tank_type_name = cfg.config.PRODUCT_TYPE_MAP.get(tank_type_code, 'TANK')
     # Canonical name includes (TNK) suffix
     canonical_name = f"{stock_name} {variant_name} (TNK)"
+
+    logger.info(
+        "[PARSED] '%s' -> product=%s, variant=%s, unit=%s, type=%s(%s), canonical='%s'",
+        stock_name, stock_name, variant_name, unit, tank_type_code, tank_type_name, canonical_name,
+    )
 
     master_db = None
     try:
@@ -255,20 +297,20 @@ def _ensure_liquid_product(
         }
         master_db.insert_product(product_data)
         logger.info(
-            "[LIQUID PRODUCT] '%s' saved to local SQLite (canonical='%s', is_synced=0)",
-            stock_name, canonical_name,
+            "[NEW PRODUCT] '%s' saved (company: %s, product=%s, variant=%s, type=%s, GUID=N/A, HSN=)",
+            canonical_name, company_name, stock_name, variant_name, tank_type_name,
         )
 
         # --- 3. Sync to Catalytics server ---
         endpoint = api_base_url.rstrip('/') + '/tally-product_name-payload/'
         payload = {
             'entity_id': entity_id,
-            'stock_item_name': canonical_name,        # "LIQUID OXYGEN 3000 Ltr (TNK)"
-            'product_master_name': stock_name,        # "LIQUID OXYGEN"
-            'unit_master_name': unit,                 # "Ltr"
-            'variant_name': variant_name,             # "3000 Ltr"
-            'product_type_code': tank_type_code,      # "TNK"
-            'product_type_name': tank_type_name,      # "TANK"
+            'stock_item_name': canonical_name,
+            'product_master_name': stock_name,
+            'unit_master_name': unit,
+            'variant_name': variant_name,
+            'product_type_code': tank_type_code,
+            'product_type_name': tank_type_name,
             'hsn_code': '',
             'guid': '',
             'rate': 0.0,
@@ -280,8 +322,8 @@ def _ensure_liquid_product(
             'tally_company': company_name,
         }
         logger.info(
-            "[LIQUID PRODUCT] Syncing '%s' to server — variant='%s', unit='%s', type=%s",
-            stock_name, variant_name, unit, tank_type_code,
+            "[LIQUID PRODUCT] Syncing '%s' to server (variant=%s, unit=%s, type=%s)",
+            canonical_name, variant_name, unit, tank_type_code,
         )
 
         resp = requests.post(
@@ -297,7 +339,7 @@ def _ensure_liquid_product(
             logger.error(
                 "[LIQUID PRODUCT] Server sync failed for '%s': HTTP %d — %s. "
                 "Product saved in SQLite (is_synced=0), sync_products will retry.",
-                stock_name, resp.status_code, resp.text[:300],
+                canonical_name, resp.status_code, resp.text[:300],
             )
             return True   # SQLite has it — DC can proceed, sync will retry
 
@@ -306,7 +348,7 @@ def _ensure_liquid_product(
             logger.error(
                 "[LIQUID PRODUCT] Server returned non-success for '%s': %s. "
                 "Product saved in SQLite (is_synced=0), sync_products will retry.",
-                stock_name, result.get('message'),
+                canonical_name, result.get('message'),
             )
             return True   # SQLite has it — DC can proceed, sync will retry
 
@@ -317,7 +359,7 @@ def _ensure_liquid_product(
             logger.error(
                 "[LIQUID PRODUCT] Server error for '%s': %s. "
                 "Product saved in SQLite (is_synced=0), sync_products will retry.",
-                stock_name, err_msg,
+                canonical_name, err_msg,
             )
             return True   # SQLite has it — DC can proceed, sync will retry
 
@@ -325,8 +367,8 @@ def _ensure_liquid_product(
         if prod_row:
             master_db.mark_product_synced(prod_row['id'], None, json.dumps(result))
         logger.info(
-            "[LIQUID PRODUCT] '%s' synced to server and marked is_synced=1 (canonical='%s')",
-            stock_name, canonical_name,
+            "[LIQUID PRODUCT] '%s' synced to server — marked is_synced=1",
+            canonical_name,
         )
         return True
 
@@ -792,8 +834,8 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 _qty_str = (item.get('BILLEDQTY') or item.get('ACTUALQTY') or '').strip()
 
                 logger.info(
-                    "[LIQUID] DC %s | Found liquid product '%s' | BILLEDQTY='%s' | delivery_dc=%s | master_db='%s'",
-                    dc_no, _sname, _qty_str, _is_delivery_dc, config.master_db_path,
+                    "[LIQUID] DC %s | Found liquid product '%s' | BILLEDQTY='%s' | master_db='%s'",
+                    dc_no, _sname, _qty_str, config.master_db_path,
                 )
 
                 if stock_cache.get(_nkey):
@@ -807,7 +849,6 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                     company_name=company_name,
                     entity_id=config.entity_id,
                     api_base_url=_api_url,
-                    force_qty_one=_is_delivery_dc,
                 )
                 stock_cache[_nkey] = _created
                 logger.info(
@@ -986,28 +1027,40 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 if row:
                     stock_items_map[stock_name] = db.json_loads(row["data_json"])
 
-        payload_hash = _build_payload_hash(voucher_for_hash, inventory_items, party_name, ledger_data, stock_items_map)
-        existing_hash = None
-        if dn_id:
-            hash_row = conn.execute(
-                "SELECT payload_hash FROM sync_status WHERE delivery_note_id = ?",
-                (dn_id,),
-            ).fetchone()
-            existing_hash = hash_row["payload_hash"] if hash_row else None
+        # Change detection: compare raw Tally data only.
+        # DO NOT compare against sync_status.payload_hash — that is the sync
+        # payload hash written by sync_catalytics and uses a different format.
+        # Comparing them always produces a mismatch, causing every DC to be
+        # re-synced on every fetch run even when nothing changed.
+        new_data_json = db.json_dumps(voucher)
+        data_changed = (existing_json is None) or (existing_json != new_data_json)
 
-        is_changed = (existing_json != db.json_dumps(voucher)) or (existing_hash != payload_hash)
         if existing_json is None:
             created += 1
-        elif is_changed:
+        elif data_changed:
             updated += 1
 
-        hash_changed = existing_hash != payload_hash
-        if hash_changed or existing_hash is None:
-            db.ensure_sync_status(
-                conn,
-                delivery_note_id=dn_id,
-                is_synced=0,
-                payload_hash=payload_hash,
+        if data_changed:
+            # Data changed in Tally — mark as pending sync (reset is_synced)
+            # Keep payload_hash=NULL so sync_catalytics recomputes it fresh.
+            conn.execute(
+                """INSERT INTO sync_status
+                       (delivery_note_id, is_synced, attempts, payload_hash, created_at, updated_at)
+                   VALUES (?, 0, 0, NULL, ?, ?)
+                   ON CONFLICT(delivery_note_id) DO UPDATE SET
+                       is_synced = 0, attempts = 0, payload_hash = NULL,
+                       last_error = NULL, synced_at = NULL,
+                       updated_at = excluded.updated_at""",
+                (dn_id, db.now_ts(), db.now_ts()),
+            )
+        else:
+            # Data unchanged — ensure sync_status row exists but do NOT reset is_synced
+            conn.execute(
+                """INSERT INTO sync_status
+                       (delivery_note_id, is_synced, attempts, payload_hash, created_at, updated_at)
+                   VALUES (?, 0, 0, NULL, ?, ?)
+                   ON CONFLICT(delivery_note_id) DO NOTHING""",
+                (dn_id, db.now_ts(), db.now_ts()),
             )
 
         if not config.dry_run:
