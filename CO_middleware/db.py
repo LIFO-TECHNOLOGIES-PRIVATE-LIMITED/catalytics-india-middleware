@@ -849,10 +849,17 @@ class Database:
         )
 
     def product_exists_normalized(self, canonical_name: str):
-        """Check if product exists by canonical name (case-insensitive, handles spacing variations)."""
+        """Check if product exists by canonical name.
+        Checks both name_canonical (COLLATE NOCASE) and name column with all spaces
+        removed (same as Step 6 product check), so NULL name_canonical or spacing
+        differences never cause a false miss.
+        """
+        normalized = canonical_name.strip().lower().replace(' ', '')
         return self.query(
-            "SELECT id, tally_company, name FROM products WHERE name_canonical = ? COLLATE NOCASE",
-            (canonical_name,)
+            """SELECT id, tally_company, name FROM products
+               WHERE name_canonical = ? COLLATE NOCASE
+                  OR lower(replace(name, ' ', '')) = ?""",
+            (canonical_name, normalized)
         )
 
     def insert_product(self, data: dict):

@@ -415,23 +415,33 @@ def _remap_liquid_inventory_items(
     liquid_name_map: Dict[str, str],
 ) -> None:
     """
-    For each inventory item whose STOCKITEMNAME starts with 'liquid',
-    replace STOCKITEMNAME with the canonical product name stored in
-    the master DB (e.g. "LIQUID OXYGEN" -> "LIQUID OXYGEN 3000 Ltr (TNK)").
+    For each inventory item whose STOCKITEMNAME starts with 'liquid':
+      - Replace STOCKITEMNAME with the canonical product name from master DB
+        (e.g. "LIQUID OXYGEN" -> "LIQUID OXYGEN 3000 Ltr (TNK)")
+      - Always force BILLEDQTY and ACTUALQTY to 1 (tank is a physical asset)
     Mutates items in-place.
     """
     for item in items:
         stock_name = (item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
         if not stock_name.lower().startswith("liquid"):
             continue
+
+        # Always force qty=1 for liquid/tank products — mandatory
+        item["BILLEDQTY"] = "1"
+        item["ACTUALQTY"] = "1"
+
         canonical = liquid_name_map.get(stock_name.lower())
         if canonical and canonical != stock_name:
             logger.info(
-                "[LIQUID REMAP] DC item '%s' -> '%s'", stock_name, canonical
+                "[LIQUID REMAP] DC item '%s' -> '%s' (qty forced to 1)", stock_name, canonical
             )
             item["STOCKITEMNAME"] = canonical
             if "ITEMNAME" in item:
                 item["ITEMNAME"] = canonical
+        else:
+            logger.info(
+                "[LIQUID REMAP] DC item '%s' — qty forced to 1", stock_name
+            )
 
 
 def _build_payload_for_note(

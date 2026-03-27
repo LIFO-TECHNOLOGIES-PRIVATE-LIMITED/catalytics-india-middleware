@@ -830,16 +830,24 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 if not _sname.lower().startswith('liquid'):
                     continue
 
-                _nkey = _normalize_name_key(_sname)
                 _qty_str = (item.get('BILLEDQTY') or item.get('ACTUALQTY') or '').strip()
 
+                # Always force qty=1 for liquid/tank products — mandatory regardless of cache
+                item['BILLEDQTY'] = '1'
+                item['ACTUALQTY'] = '1'
+
+                # Cache key includes original BILLEDQTY so two rows with the same
+                # product name but different variants (e.g. "163 CUM" vs "230 LTR")
+                # are treated as separate products and both get created.
+                _nkey = _normalize_name_key(_sname + _qty_str)
+
                 logger.info(
-                    "[LIQUID] DC %s | Found liquid product '%s' | BILLEDQTY='%s' | master_db='%s'",
+                    "[LIQUID] DC %s | Found liquid product '%s' | BILLEDQTY='%s' (forced→1) | master_db='%s'",
                     dc_no, _sname, _qty_str, config.master_db_path,
                 )
 
                 if stock_cache.get(_nkey):
-                    logger.info("[LIQUID] DC %s | '%s' already handled this run — skipping", dc_no, _sname)
+                    logger.info("[LIQUID] DC %s | '%s' qty='%s' already handled this run — skipping API", dc_no, _sname, _qty_str)
                     continue
 
                 _created = _ensure_liquid_product(
@@ -852,8 +860,8 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 )
                 stock_cache[_nkey] = _created
                 logger.info(
-                    "[LIQUID] DC %s | '%s' result: %s",
-                    dc_no, _sname, "OK" if _created else "FAILED",
+                    "[LIQUID] DC %s | '%s' qty='%s' result: %s",
+                    dc_no, _sname, _qty_str, "OK" if _created else "FAILED",
                 )
 
         # --- Reference keyword filter ---
