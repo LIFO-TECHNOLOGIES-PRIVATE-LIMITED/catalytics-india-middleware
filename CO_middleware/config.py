@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import shutil
 from typing import Optional
@@ -28,22 +28,23 @@ def load_env_file(path: Optional[str]) -> None:
 
 
 def resolve_env_path(default_dir: str) -> str:
-    # Priority: explicit env var -> EXE dir (frozen) -> default_dir -> cwd
-    env_override = os.environ.get("TALLY_ENV_PATH")
-    if env_override:
-        return env_override
+    default_env = os.path.join(default_dir, ".env")
 
-    # When running as a PyInstaller frozen EXE, always check the EXE's directory first
+    # For local source runs like `py dashboard.py`, prefer the repo/script .env.
+    if not getattr(sys, 'frozen', False) and os.path.exists(default_env):
+        return default_env
+
+    # For packaged EXEs, prefer the EXE-local .env next to the binary.
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
         exe_env = os.path.join(exe_dir, ".env")
         if os.path.exists(exe_env):
             return exe_env
 
-    # Then try the passed-in directory
-    default_env = os.path.join(default_dir, ".env")
-    if os.path.exists(default_env):
-        return default_env
+    # External override is still available when no local .env exists.
+    env_override = os.environ.get("TALLY_ENV_PATH")
+    if env_override:
+        return env_override
 
     # Then try current working directory
     cwd_env = os.path.join(os.getcwd(), ".env")
@@ -79,7 +80,7 @@ def _normalize_tally_db_path(raw: Optional[str]) -> str:
 
     p = Path(value)
     if not p.is_absolute():
-        p = BASE_DIR / value
+        p = get_path_base_dir() / value
 
     try:
         if ends_with_sep or (p.exists() and p.is_dir()):
@@ -98,6 +99,26 @@ def _normalize_tally_db_path(raw: Optional[str]) -> str:
     except Exception:
         pass
     return str(p)
+
+
+def _normalize_sqlite_db_path(raw: Optional[str]) -> str:
+    value = raw or "chennai.sqlite"
+    p = Path(value)
+    if not p.is_absolute():
+        p = get_path_base_dir() / value
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return str(p)
+
+
+def _get_master_db_env_value() -> str:
+    return (
+        os.getenv("SQLITE_DB_PATH")
+        or os.getenv("TALLY_DB_PATH")
+        or "chennai.sqlite"
+    )
 
 
 def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -134,21 +155,33 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = Path(__file__).parent
 
-_env_path = BASE_DIR / '.env'
+
+def get_env_path() -> Path:
+    return Path(resolve_env_path(str(BASE_DIR)))
+
+
+def get_path_base_dir() -> Path:
+    env_path = get_env_path()
+    return env_path.parent if env_path else BASE_DIR
+
+
 _env_example_path = BASE_DIR / '.env.example'
 
 # Create .env from template if missing
+_env_path = get_env_path()
 if not _env_path.exists() and _env_example_path.exists():
     try:
+        _env_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(_env_example_path, _env_path)
         print(f"[INFO] Created .env from template at: {_env_path}")
     except Exception as exc:
         print(f"[WARNING] Could not create .env from .env.example: {exc}")
 
-load_env_file(str(_env_path))
+load_env_file(str(get_env_path()))
 
 if os.environ.get("TALLY_DB_PATH"):
     os.environ["TALLY_DB_PATH"] = _normalize_tally_db_path(os.environ.get("TALLY_DB_PATH"))
+os.environ["SQLITE_DB_PATH"] = _normalize_sqlite_db_path(_get_master_db_env_value())
 
 # Aliases for compatibility
 if os.environ.get('ENTITY_ID') and not os.environ.get('CATALYTICS_ENTITY_ID'):
@@ -208,9 +241,10 @@ class Config:
 
     @classmethod
     def reload_from_env(cls):
-        load_env_file(str(_env_path))
+        load_env_file(str(get_env_path()))
         if os.environ.get("TALLY_DB_PATH"):
             os.environ["TALLY_DB_PATH"] = _normalize_tally_db_path(os.environ.get("TALLY_DB_PATH"))
+        os.environ["SQLITE_DB_PATH"] = _normalize_sqlite_db_path(_get_master_db_env_value())
         cls.INVOICE_FETCH_START_DATE = os.getenv('INVOICE_FETCH_START_DATE', '')
         cls.SYNC_INTERVAL_SECONDS = int(os.getenv('SYNC_INTERVAL_SECONDS', '60'))
         cls.FETCH_CUSTOMERS_INTERVAL_MINUTES = int(os.getenv('FETCH_CUSTOMERS_INTERVAL_MINUTES', '10'))
@@ -224,13 +258,13 @@ class Config:
         cls.CUSTOMER_SYNC_WORKERS = int(os.getenv('CUSTOMER_SYNC_WORKERS', '5'))
         cls.DEFAULT_FILLING_STATION = os.getenv('DEFAULT_FILLING_STATION', '')
         cls.DEFAULT_FILLING_STATION_ID = os.getenv('DEFAULT_FILLING_STATION_ID', '')
-        cls.SQLITE_DB_PATH = os.getenv('SQLITE_DB_PATH', 'chennai.sqlite')
+        cls.SQLITE_DB_PATH = _normalize_sqlite_db_path(_get_master_db_env_value())
         cls.TALLY_DB_PATH = _normalize_tally_db_path(os.getenv('TALLY_DB_PATH', ''))
         return cls.INVOICE_FETCH_START_DATE
 
     @classmethod
     def get_invoice_fetch_start_date(cls):
-        load_env_file(str(_env_path))
+        load_env_file(str(get_env_path()))
         return os.getenv('INVOICE_FETCH_START_DATE', '')
 
     # Verification Settings
@@ -242,7 +276,7 @@ class Config:
     AUDIT_TIME = os.getenv('AUDIT_TIME', '02:00')
 
     # Database
-    SQLITE_DB_PATH = os.getenv('SQLITE_DB_PATH', 'chennai.sqlite')
+    SQLITE_DB_PATH = _normalize_sqlite_db_path(_get_master_db_env_value())
     TALLY_DB_PATH = _normalize_tally_db_path(os.getenv('TALLY_DB_PATH', ''))
 
     # PostgreSQL (optional)

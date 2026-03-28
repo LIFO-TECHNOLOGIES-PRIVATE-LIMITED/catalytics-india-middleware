@@ -3,7 +3,16 @@ setlocal
 
 cd /d "%~dp0"
 
-echo [1/4] Checking PyInstaller...
+if not defined PYI_DIST_DIR set "PYI_DIST_DIR=%cd%\dist"
+if not defined PYI_BUILD_DIR set "PYI_BUILD_DIR=%cd%\build"
+
+echo [1/4] Checking Python and PyInstaller...
+py --version >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Python is not installed or not in PATH.
+    exit /b 1
+)
+
 py -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] PyInstaller is not installed. Run: py -m pip install pyinstaller
@@ -11,8 +20,8 @@ if errorlevel 1 (
 )
 
 echo [2/4] Cleaning previous build artifacts...
-if exist "build" rmdir /s /q "build"
-if exist "dist" rmdir /s /q "dist"
+if exist "%PYI_BUILD_DIR%" rmdir /s /q "%PYI_BUILD_DIR%"
+if exist "%PYI_DIST_DIR%" rmdir /s /q "%PYI_DIST_DIR%"
 if exist "co_middleware_dashboard.spec" del /q "co_middleware_dashboard.spec"
 
 echo [3/4] Building CO Middleware dashboard EXE...
@@ -22,12 +31,14 @@ py -m PyInstaller ^
     --onefile ^
     --noconsole ^
     --name co_middleware_dashboard ^
+    --distpath "%PYI_DIST_DIR%" ^
+    --workpath "%PYI_BUILD_DIR%" ^
     --add-data "templates;templates" ^
+    --collect-all psycopg2 ^
     --hidden-import config ^
     --hidden-import db ^
     --hidden-import tally_api ^
     --hidden-import tally_client ^
-    --hidden-import fetch_tally ^
     --hidden-import fetch_invoices ^
     --hidden-import fetch_customers ^
     --hidden-import fetch_products ^
@@ -45,11 +56,11 @@ if errorlevel 1 (
 )
 
 echo [4/4] Build complete.
-echo EXE generated at: "%cd%\dist\co_middleware_dashboard.exe"
+echo EXE generated at: "%PYI_DIST_DIR%\co_middleware_dashboard.exe"
 echo.
 echo Place these next to the EXE on client machine:
 echo   - .env
-echo   - tally_dc.sqlite (optional, auto-created if missing)
+echo   - SQLite DB file (optional, auto-created if missing)
 echo   - logs\ folder (optional, auto-created if missing)
 
 endlocal

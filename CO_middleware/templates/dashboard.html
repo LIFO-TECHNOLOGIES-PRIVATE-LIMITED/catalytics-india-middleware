@@ -2873,59 +2873,142 @@
             }
         }
 
-        // Product Row Actions
+        // Customer Row Actions
 
-        async function productRefetch(productId) {
-            if (!confirm('Refetch this product from Tally and sync to Catalytics?')) return;
+        async function customerRefetch(customerId, customerName = 'this customer') {
+            if (!confirm(`Refetch "${customerName}" from Tally and sync to Catalytics?`)) return;
             try {
-                // Step 1: Refetch from Tally
-                const refetchResp = await fetch(`/api/products/${productId}/refetch`, { method: 'POST' });
+                const refetchResp = await fetch(`/api/customers/${customerId}/refetch`, { method: 'POST' });
                 const refetchData = await refetchResp.json();
                 if (!refetchData.success) {
-                    alert(`Refetch failed: ${refetchData.error}`);
+                    alert(`Refetch failed: ${refetchData.error || 'Unknown error'}`);
                     return;
                 }
 
-                // Step 2: Trigger sync to push updated data to Catalytics
-                const syncResp = await fetch('/api/trigger/sync', { method: 'POST' });
+                const syncResp = await fetch(`/api/customers/${customerId}/resync`, { method: 'POST' });
                 const syncData = await syncResp.json();
-
-                if (syncData.success) {
-                    alert('Product refetched from Tally and synced to Catalytics!');
-                } else {
-                    alert('Product refetched but sync failed: ' + (syncData.error || 'Unknown error'));
+                if (!syncData.success) {
+                    alert('Customer refetched but sync failed: ' + (syncData.error || 'Unknown error'));
+                    return;
                 }
 
                 await fetchStatus();
-                await applyFilters('products', false);
+                await fetchActivity();
+                await fetchDataTables();
+                alert(syncData.message || `Customer "${customerName}" refetched and synced successfully`);
             } catch (error) {
                 alert(`Error: ${error.message}`);
             }
         }
 
-        async function productResync(productId) {
-            if (!confirm('Resync this product to Catalytics?')) return;
+        async function customerResync(customerId, customerName = 'this customer') {
+            if (!confirm(`Resync "${customerName}" to Catalytics?`)) return;
             try {
-                // Step 1: Mark product as unsynced
-                const markResp = await fetch(`/api/products/${productId}/resync`, { method: 'POST' });
-                const markData = await markResp.json();
-                if (!markData.success) {
-                    alert(`Reset failed: ${markData.error}`);
+                const syncResp = await fetch(`/api/customers/${customerId}/resync`, { method: 'POST' });
+                const syncData = await syncResp.json();
+                if (!syncData.success) {
+                    alert(`Resync failed: ${syncData.error || 'Unknown error'}`);
                     return;
                 }
 
-                // Step 2: Immediately trigger sync to Catalytics
-                const syncResp = await fetch('/api/trigger/sync', { method: 'POST' });
-                const syncData = await syncResp.json();
+                await fetchStatus();
+                await fetchActivity();
+                await fetchDataTables();
+                alert(syncData.message || `Customer "${customerName}" resynced successfully`);
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+            }
+        }
 
-                if (syncData.success) {
-                    alert('Product resynced to Catalytics successfully!');
-                } else {
-                    alert('Resync failed: ' + (syncData.error || 'Unknown error'));
+        // Product Row Actions
+
+        async function productRefetch(productId, productName = 'this product') {
+            if (!confirm(`Refetch "${productName}" from Tally and sync to Catalytics?`)) return;
+            try {
+                const refetchResp = await fetch(`/api/products/${productId}/refetch`, { method: 'POST' });
+                const refetchData = await refetchResp.json();
+                if (!refetchData.success) {
+                    alert(`Refetch failed: ${refetchData.error || 'Unknown error'}`);
+                    return;
+                }
+
+                const syncResp = await fetch(`/api/products/${productId}/resync`, { method: 'POST' });
+                const syncData = await syncResp.json();
+                if (!syncData.success) {
+                    alert('Product refetched but sync failed: ' + (syncData.error || 'Unknown error'));
+                    return;
                 }
 
                 await fetchStatus();
-                await applyFilters('products', false);
+                await fetchActivity();
+                await fetchDataTables();
+                alert(syncData.message || `Product "${productName}" refetched and synced successfully`);
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+            }
+        }
+
+        async function productResync(productId, productName = 'this product') {
+            if (!confirm(`Resync "${productName}" to Catalytics?`)) return;
+            try {
+                const markResp = await fetch(`/api/products/${productId}/resync`, { method: 'POST' });
+                const markData = await markResp.json();
+                if (!markData.success) {
+                    alert(`Resync failed: ${markData.error || 'Unknown error'}`);
+                    return;
+                }
+
+                await fetchStatus();
+                await fetchActivity();
+                await fetchDataTables();
+                alert(markData.message || `Product "${productName}" resynced successfully`);
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+            }
+        }
+
+        // Invoice Row Actions
+
+        async function invoiceRefetch(invoiceId, voucherNo = 'this DC') {
+            if (!confirm(`Refetch "${voucherNo}" from Tally and sync to Catalytics?`)) return;
+            try {
+                const refetchResp = await fetch(`/api/invoices/${invoiceId}/refetch`, { method: 'POST' });
+                const refetchData = await refetchResp.json();
+                if (!refetchData.success) {
+                    alert(`Refetch failed: ${refetchData.error || 'Unknown error'}`);
+                    return;
+                }
+
+                const syncResp = await fetch(`/api/invoices/${invoiceId}/resync`, { method: 'POST' });
+                const syncData = await syncResp.json();
+                if (!syncData.success) {
+                    alert('DC refetched but sync failed: ' + (syncData.error || 'Unknown error'));
+                    return;
+                }
+
+                await fetchStatus();
+                await fetchActivity();
+                await fetchDataTables();
+                alert(syncData.message || `DC "${voucherNo}" refetched and synced successfully`);
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+            }
+        }
+
+        async function invoiceResync(invoiceId, voucherNo = 'this DC') {
+            if (!confirm(`Resync "${voucherNo}" to Catalytics?`)) return;
+            try {
+                const syncResp = await fetch(`/api/invoices/${invoiceId}/resync`, { method: 'POST' });
+                const syncData = await syncResp.json();
+                if (!syncData.success) {
+                    alert(`Resync failed: ${syncData.error || 'Unknown error'}`);
+                    return;
+                }
+
+                await fetchStatus();
+                await fetchActivity();
+                await fetchDataTables();
+                alert(syncData.message || `DC "${voucherNo}" resynced successfully`);
             } catch (error) {
                 alert(`Error: ${error.message}`);
             }
@@ -3897,6 +3980,18 @@
 
         // Individual row actions
         async function resyncRecord(type, id, name) {
+            if (type === 'customers') {
+                await customerResync(id, name);
+                return;
+            }
+            if (type === 'products') {
+                await productResync(id, name);
+                return;
+            }
+            if (type === 'invoices') {
+                await invoiceResync(id, name);
+                return;
+            }
             if (!confirm(`Resync "${name}" to Catalytics?`)) return;
 
             const endpoint = type === 'customers' ? 'customers' :
@@ -3933,6 +4028,18 @@
         }
 
         async function refetchRecord(type, id, name) {
+            if (type === 'customers') {
+                await customerRefetch(id, name);
+                return;
+            }
+            if (type === 'products') {
+                await productRefetch(id, name);
+                return;
+            }
+            if (type === 'invoices') {
+                await invoiceRefetch(id, name);
+                return;
+            }
             if (!confirm(`Refetch "${name}" from Tally and sync to Catalytics?`)) return;
 
             const endpoint = type === 'customers' ? 'customers' :
@@ -3996,8 +4103,8 @@
                     <td>${c.last_sync_at ? new Date(c.last_sync_at).toLocaleString() : '-'}</td>
                     <td class="actions-cell" onclick="event.stopPropagation()">
                         <button class="row-action-btn view" onclick="showCustomerDetail(${c.id})" title="View Details">View</button>
-                        <button class="row-action-btn refetch" onclick="refetchRecord('customers', ${c.id}, '${c.name.replace(/'/g, "\\'")}')" title="Refetch from Tally">Refetch</button>
-                        <button class="row-action-btn resync" onclick="resyncRecord('customers', ${c.id}, '${c.name.replace(/'/g, "\\'")}')" title="Mark for Resync">Resync</button>
+                        <button class="row-action-btn refetch" onclick="customerRefetch(${c.id}, '${c.name.replace(/'/g, "\\'")}')" title="Refetch from Tally">Refetch</button>
+                        <button class="row-action-btn resync" onclick="customerResync(${c.id}, '${c.name.replace(/'/g, "\\'")}')" title="Resync to Catalytics">Resync</button>
                     </td>
                 </tr>
             `).join('');
@@ -4032,8 +4139,8 @@
                     <td onclick="showProductDetail(${p.id})" style="cursor: pointer;">${p.last_sync_at ? new Date(p.last_sync_at).toLocaleString() : '-'}</td>
                     <td class="actions-cell" onclick="event.stopPropagation()">
                         <button class="row-action-btn view" onclick="showProductDetail(${p.id})">View</button>
-                        <button class="row-action-btn refetch" onclick="refetchRecord('products', ${p.id}, '${p.name.replace(/'/g, "\\'")}')">Refetch</button>
-                        <button class="row-action-btn resync" onclick="resyncRecord('products', ${p.id}, '${p.name.replace(/'/g, "\\'")}')">Resync</button>
+                        <button class="row-action-btn refetch" onclick="productRefetch(${p.id}, '${p.name.replace(/'/g, "\\'")}')">Refetch</button>
+                        <button class="row-action-btn resync" onclick="productResync(${p.id}, '${p.name.replace(/'/g, "\\'")}')">Resync</button>
                     </td>
                 </tr>
             `).join('');
@@ -4069,8 +4176,8 @@
                     <td onclick="showInvoiceDetail(${inv.id})" style="cursor: pointer;">${inv.last_sync_at ? new Date(inv.last_sync_at).toLocaleString() : '-'}</td>
                     <td class="actions-cell" onclick="event.stopPropagation()">
                         <button class="row-action-btn view" onclick="showInvoiceDetail(${inv.id})">View</button>
-                          <button class="row-action-btn refetch" onclick="refetchRecord('invoices', ${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Refetch</button>
-                          <button class="row-action-btn resync" onclick="resyncRecord('invoices', ${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Resync</button>
+                          <button class="row-action-btn refetch" onclick="invoiceRefetch(${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Refetch</button>
+                          <button class="row-action-btn resync" onclick="invoiceResync(${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Resync</button>
                     </td>
                 </tr>
             `).join('');

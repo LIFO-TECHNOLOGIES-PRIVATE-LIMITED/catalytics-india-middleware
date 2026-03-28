@@ -71,6 +71,48 @@ def check_catalytics_connection():
 
 
 
+
+def _same_db_path(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    try:
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+    except Exception:
+        return left == right
+
+
+def initialize_database_file(db_path: str, *, include_master_tables: bool = False) -> None:
+    """Create required tables for a configured SQLite database file."""
+    if not db_path:
+        return
+
+    conn = db.connect(db_path)
+    try:
+        db.init_db(conn)
+    finally:
+        conn.close()
+
+    if include_master_tables:
+        master_db = db.Database(db_path)
+        master_db.close()
+
+
+def initialize_configured_databases() -> None:
+    """Initialize the configured DC/master databases for the current env."""
+    tally_db_path = cfg.get_env("TALLY_DB_PATH")
+    master_db_path = config.SQLITE_DB_PATH
+
+    if tally_db_path:
+        initialize_database_file(
+            tally_db_path,
+            include_master_tables=_same_db_path(tally_db_path, master_db_path),
+        )
+
+    if master_db_path and not _same_db_path(master_db_path, tally_db_path):
+        master_db = db.Database(master_db_path)
+        master_db.close()
+
+
 def get_recent_file_logs(log_file, lines=20):
     """Get recent lines from a log file"""
     try:
@@ -1224,6 +1266,56 @@ def bulk_mark_unsynced_invoices():
 
 
 # Individual record resync endpoints
+def _refetch_one_customer(customer_id: int) -> dict:
+    """Refresh a single customer from Tally and mark it pending sync."""
+    import json as _json
+    from fetch_customers import _map_ledger_to_customer
+    import tally_api
+
+    db_path = config.SQLITE_DB_PATH
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM customers WHERE id = ?", (customer_id,)).fetchone()
+        if not row:
+            return {'success': False, 'error': 'Customer not found'}
+
+        customer_name = (row['name'] or '').strip()
+        company_name = (row['tally_company'] or cfg.get_env('TALLY_COMPANY', '')).strip()
+        if not customer_name:
+            return {'success': False, 'error': 'Customer name is empty'}
+        if not company_name:
+            return {'success': False, 'error': f'No Tally company configured for "{customer_name}"'}
+
+        lookup_name = customer_name
+        data_json = row['data_json'] or ''
+        if data_json:
+            try:
+                saved_ledger = _json.loads(data_json)
+                lookup_name = (saved_ledger.get('NAME') or saved_ledger.get('LEDGERNAME') or customer_name).strip() or customer_name
+            except Exception:
+                pass
+
+        ledger = tally_api.get_ledger_by_name(company_name, lookup_name, config.TALLY_URL)
+        if not ledger and lookup_name != customer_name:
+            ledger = tally_api.get_ledger_by_name(company_name, customer_name, config.TALLY_URL)
+        if not ledger:
+            return {'success': False, 'error': f'"{customer_name}" not found in Tally for {company_name}'}
+
+        customer_data = _map_ledger_to_customer(ledger, company_name)
+        updated_name = customer_data.get('name') or customer_name
+
+        db_obj = db.Database(db_path)
+        try:
+            db_obj.update_customer(customer_id, customer_data)
+        finally:
+            db_obj.close()
+
+        return {'success': True, 'message': f'"{updated_name}" refetched from Tally'}
+    finally:
+        conn.close()
+
+
 def _sync_one_customer(customer_id: int) -> dict:
     """Immediately sync a single customer to Catalytics. Returns result dict."""
     import json as _json
@@ -1257,7 +1349,7 @@ def _sync_one_customer(customer_id: int) -> dict:
         headers = {'Content-Type': 'application/json'}
 
         payload = {'entity_id': entity_id, 'ledger': ledger}
-        company = cfg.get_env('TALLY_COMPANY')
+        company = (row['tally_company'] or cfg.get_env('TALLY_COMPANY', '')).strip()
         if company:
             payload['company_name'] = company
 
@@ -1303,6 +1395,62 @@ def _sync_one_customer(customer_id: int) -> dict:
         except Exception:
             pass
         raise
+    finally:
+        conn.close()
+
+
+def _refetch_one_product(product_id: int) -> dict:
+    """Refresh a single product from Tally and mark it pending sync."""
+    from fetch_products import _map_stock_item_to_product, parse_stock_item_name
+    import tally_api
+
+    db_path = config.SQLITE_DB_PATH
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        if not row:
+            return {'success': False, 'error': 'Product not found'}
+
+        product_name = (row['name'] or '').strip()
+        company_name = (row['tally_company'] or cfg.get_env('TALLY_COMPANY', '')).strip()
+        if not product_name:
+            return {'success': False, 'error': 'Product name is empty'}
+        if not company_name:
+            return {'success': False, 'error': f'No Tally company configured for "{product_name}"'}
+
+        item = tally_api.get_stock_item_by_name(company_name, product_name, config.TALLY_URL)
+        if not item:
+            return {'success': False, 'error': f'"{product_name}" not found in Tally for {company_name}'}
+
+        parsed = parse_stock_item_name(product_name)
+        if not parsed:
+            name_lower = product_name.lower()
+            matched_keyword = next(
+                (kw for kw in config.PRODUCT_EXACT_KEYWORDS if kw in name_lower),
+                None
+            )
+            if not matched_keyword:
+                return {'success': False, 'error': f'Unable to parse "{product_name}" with current product rules'}
+            parsed = {
+                'product_master_name': product_name,
+                'variant_name': '',
+                'unit_name': '',
+                'product_type_code': '',
+                'product_type_name': '',
+                'canonical_name': product_name,
+            }
+
+        product_data = _map_stock_item_to_product(item, company_name, parsed)
+        product_data['name_canonical'] = parsed['canonical_name']
+
+        db_obj = db.Database(db_path)
+        try:
+            db_obj.update_product(product_id, product_data)
+        finally:
+            db_obj.close()
+
+        return {'success': True, 'message': f'"{product_name}" refetched from Tally'}
     finally:
         conn.close()
 
@@ -1410,6 +1558,157 @@ def _sync_one_product(product_id: int) -> dict:
         conn.close()
 
 
+def _refetch_one_invoice(invoice_id: int) -> dict:
+    """Refresh a single invoice/DC from Tally and mark it pending sync."""
+    from fetch_tally import _default_date_range, _extract_tally_guid, _normalize_dc_no
+    import tally_api
+
+    tally_db_path = cfg.get_env('TALLY_DB_PATH')
+    if not tally_db_path:
+        return {'success': False, 'error': 'TALLY_DB_PATH not configured'}
+
+    tally_url = cfg.get_env('TALLY_URL', 'http://localhost:9000/')
+    conn = db.connect(tally_db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM delivery_notes WHERE id = ?", (invoice_id,)
+        ).fetchone()
+        if not row:
+            return {'success': False, 'error': 'DC not found'}
+
+        note = dict(row)
+        dc_no = (note.get('dc_no') or '').strip()
+        stored_guid = (note.get('tally_guid') or '').strip()
+        voucher_date = ''.join(ch for ch in (note.get('voucher_date') or '') if ch.isdigit())[:8]
+
+        company_row = conn.execute(
+            "SELECT name, tally_name FROM companies WHERE id = ?",
+            (note.get('company_id'),)
+        ).fetchone()
+        company = ''
+        if company_row:
+            company = (company_row['tally_name'] or company_row['name'] or '').strip()
+        if not company:
+            company = cfg.get_env('TALLY_COMPANY', '').strip()
+        if not company:
+            return {'success': False, 'error': f'No Tally company configured for DC "{dc_no or invoice_id}"'}
+
+        search_ranges = []
+        seen_ranges = set()
+
+        def add_range(start_date, end_date):
+            if not start_date or not end_date:
+                return
+            key = (start_date, end_date)
+            if key in seen_ranges:
+                return
+            seen_ranges.add(key)
+            search_ranges.append(key)
+
+        if len(voucher_date) == 8:
+            add_range(voucher_date, voucher_date)
+
+        default_from, default_to = _default_date_range(cfg.get_env_int('TALLY_DAYS_BACK'))
+        add_range(cfg.get_env('TALLY_FROM_DATE') or default_from, cfg.get_env('TALLY_TO_DATE') or default_to)
+
+        fy_from, fy_to = _default_date_range(None)
+        add_range(fy_from, fy_to)
+
+        matched_voucher = None
+        for from_date, to_date in search_ranges:
+            vouchers = tally_api.get_delivery_notes(company, tally_url, from_date, to_date)
+            for voucher in vouchers:
+                voucher_guid = _extract_tally_guid(voucher).strip()
+                voucher_dc_no = _normalize_dc_no(voucher).strip()
+                if stored_guid and voucher_guid and voucher_guid == stored_guid:
+                    matched_voucher = dict(voucher)
+                    break
+                if dc_no and voucher_dc_no and voucher_dc_no == dc_no:
+                    matched_voucher = dict(voucher)
+                    break
+            if matched_voucher:
+                break
+
+        if not matched_voucher:
+            return {'success': False, 'error': f'DC "{dc_no or invoice_id}" not found in Tally for {company}'}
+
+        matched_guid = _extract_tally_guid(matched_voucher).strip()
+        matched_dc_no = _normalize_dc_no(matched_voucher).strip() or dc_no or str(invoice_id)
+        if stored_guid and matched_guid and stored_guid == matched_guid and dc_no:
+            matched_dc_no = dc_no
+        matched_voucher['VOUCHERNUMBER'] = matched_dc_no
+
+        updated_voucher_date = (matched_voucher.get('DATE') or note.get('voucher_date') or '').strip()
+        party_name = (matched_voucher.get('PARTYLEDGERNAME') or matched_voucher.get('PARTYNAME') or '').strip()
+        reference = (matched_voucher.get('REFERENCE') or matched_voucher.get('PONUMBER') or '').strip()
+
+        dn_id = db.upsert_delivery_note(
+            conn,
+            company_id=note['company_id'],
+            dc_no=matched_dc_no,
+            voucher_date=updated_voucher_date,
+            party_ledger_name=party_name,
+            tally_guid=matched_guid,
+            reference=reference,
+            data=matched_voucher,
+        )
+
+        inventory_items = matched_voucher.get('INVENTORY') or []
+        db.replace_delivery_note_items(conn, delivery_note_id=dn_id, items=inventory_items)
+
+        if party_name:
+            ledger_data = tally_api.get_ledger_by_name(company, party_name, tally_url)
+            if ledger_data:
+                db.upsert_json_row(
+                    conn,
+                    table='ledgers',
+                    company_id=note['company_id'],
+                    name=party_name,
+                    data=ledger_data,
+                )
+
+        seen_stock_names = set()
+        for item in inventory_items:
+            stock_name = (item.get('STOCKITEMNAME') or item.get('ITEMNAME') or '').strip()
+            if not stock_name or stock_name in seen_stock_names:
+                continue
+            seen_stock_names.add(stock_name)
+            stock_data = tally_api.get_stock_item_by_name(company, stock_name, tally_url)
+            if stock_data:
+                db.upsert_json_row(
+                    conn,
+                    table='stock_items',
+                    company_id=note['company_id'],
+                    name=stock_name,
+                    data=stock_data,
+                )
+
+        ts = db.now_ts()
+        conn.execute(
+            """
+            INSERT INTO sync_status
+                (delivery_note_id, is_synced, attempts, last_attempt_at, synced_at,
+                 last_error, last_response_json, payload_hash, created_at, updated_at)
+            VALUES (?, 0, 0, NULL, NULL, NULL, NULL, NULL, ?, ?)
+            ON CONFLICT(delivery_note_id) DO UPDATE SET
+                is_synced = 0,
+                attempts = 0,
+                last_attempt_at = NULL,
+                synced_at = NULL,
+                last_error = NULL,
+                last_response_json = NULL,
+                payload_hash = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (dn_id, ts, ts),
+        )
+        conn.commit()
+
+        return {'success': True, 'message': f'DC "{matched_dc_no}" refetched from Tally', 'invoice_id': dn_id}
+    finally:
+        conn.close()
+
+
 def _sync_one_invoice(invoice_id: int) -> dict:
     """Immediately sync a single invoice/DC to Catalytics. Returns result dict."""
     import json as _json
@@ -1432,13 +1731,22 @@ def _sync_one_invoice(invoice_id: int) -> dict:
 
         api_base = cfg.get_env('CATALYTICS_API_BASE_URL', '')
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
-        company = cfg.get_env('TALLY_COMPANY')
+        company_row = conn.execute(
+            "SELECT name, tally_name FROM companies WHERE id = ?",
+            (note.get('company_id'),)
+        ).fetchone()
+        company = ''
+        if company_row:
+            company = (company_row['tally_name'] or company_row['name'] or '').strip()
+        if not company:
+            company = cfg.get_env('TALLY_COMPANY', '').strip()
         endpoint = api_base.rstrip('/') + '/tally-delivery-challan-payload/'
         # Payload endpoints use AllowAny permission â€” no auth header needed
         headers = {'Content-Type': 'application/json'}
 
         payload, payload_hash = _build_payload_for_note(
             conn, note,
+            api_base_url=api_base,
             entity_id=entity_id,
             company_name=company,
             allow_tally_fetch=False,
@@ -1496,6 +1804,25 @@ def resync_customer(customer_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/customers/<int:customer_id>/refetch', methods=['POST'])
+def refetch_customer(customer_id):
+    """Refetch a single customer from Tally and mark it pending sync."""
+    try:
+        result = _refetch_one_customer(customer_id)
+        if result['success']:
+            with activity_lock:
+                activity_log.appendleft({
+                    'time': datetime.now().isoformat(),
+                    'action': 'Refetch Customer',
+                    'status': 'success',
+                    'detail': result['message']
+                })
+        return jsonify(result)
+    except Exception as e:
+        logger.exception(f"Failed to refetch customer {customer_id}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/products/<int:product_id>/resync', methods=['POST'])
 def resync_product(product_id):
     """Immediately sync a single product to Catalytics."""
@@ -1512,6 +1839,44 @@ def resync_product(product_id):
         return jsonify(result)
     except Exception as e:
         logger.exception(f"Failed to resync product {product_id}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/products/<int:product_id>/refetch', methods=['POST'])
+def refetch_product(product_id):
+    """Refetch a single product from Tally and mark it pending sync."""
+    try:
+        result = _refetch_one_product(product_id)
+        if result['success']:
+            with activity_lock:
+                activity_log.appendleft({
+                    'time': datetime.now().isoformat(),
+                    'action': 'Refetch Product',
+                    'status': 'success',
+                    'detail': result['message']
+                })
+        return jsonify(result)
+    except Exception as e:
+        logger.exception(f"Failed to refetch product {product_id}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/invoices/<int:invoice_id>/refetch', methods=['POST'])
+def refetch_invoice(invoice_id):
+    """Refetch a single invoice/DC from Tally and mark it pending sync."""
+    try:
+        result = _refetch_one_invoice(invoice_id)
+        if result['success']:
+            with activity_lock:
+                activity_log.appendleft({
+                    'time': datetime.now().isoformat(),
+                    'action': 'Refetch Invoice',
+                    'status': 'success',
+                    'detail': result['message']
+                })
+        return jsonify(result)
+    except Exception as e:
+        logger.exception(f"Failed to refetch invoice {invoice_id}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -2215,9 +2580,10 @@ def clear_database():
             })
 
         # Recreate fresh empty DB immediately
-        conn = db.connect(db_path)
-        db.init_db(conn)
-        conn.close()
+        initialize_database_file(
+            db_path,
+            include_master_tables=_same_db_path(db_path, config.SQLITE_DB_PATH),
+        )
         dashboard_logger.write_log("=== NEW EMPTY DATABASE INITIALIZED ===")
 
         # Restart automation if it was running before clear
@@ -2299,6 +2665,7 @@ def maybe_register_windows_startup():
 
         app_name = os.getenv('WINDOWS_STARTUP_APP_NAME', 'ChennaiOxygenMiddlewareDashboard').strip() or 'ChennaiOxygenMiddlewareDashboard'
         exe_path = f'"{sys.executable}"'
+        env_path = str(Path(sys.executable).with_name('.env'))
 
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -2308,7 +2675,14 @@ def maybe_register_windows_startup():
         ) as run_key:
             winreg.SetValueEx(run_key, app_name, 0, winreg.REG_SZ, exe_path)
 
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER,
+            r'Environment'
+        ) as env_key:
+            winreg.SetValueEx(env_key, 'TALLY_ENV_PATH', 0, winreg.REG_SZ, env_path)
+
         logger.info(f"Windows startup registration ensured for: {app_name}")
+        logger.info(f"Windows env path ensured for startup: {env_path}")
     except Exception as exc:
         logger.warning(f"Could not register Windows startup: {exc}")
 
@@ -2336,23 +2710,10 @@ if __name__ == '__main__':
     _dh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logging.getLogger().addHandler(_dh)
 
-    # Initialize DC database (TALLY_DB_PATH)
-    db_path = cfg.get_env("TALLY_DB_PATH")
-    if db_path:
-        try:
-            conn = db.connect(db_path)
-            db.init_db(conn)
-            conn.close()
-        except Exception as e:
-            logger.error(f"Failed to initialize DC database: {e}")
-
-    # Initialize master data database (SQLITE_DB_PATH: customers/products tables)
     try:
-        from db import Database as _Database
-        _master_db = _Database(config.SQLITE_DB_PATH)
-        _master_db.close()
+        initialize_configured_databases()
     except Exception as e:
-        logger.error(f"Failed to initialize master database: {e}")
+        logger.error(f"Failed to initialize configured databases: {e}")
 
     default_debug = 'false' if getattr(sys, 'frozen', False) else 'true'
     dashboard_debug = _env_flag('DASHBOARD_DEBUG', default_debug)

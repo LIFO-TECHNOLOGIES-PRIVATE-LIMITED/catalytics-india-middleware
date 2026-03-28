@@ -151,6 +151,213 @@ def _load_stock_items(conn, company_id: int, inventory_items: List[Dict[str, Any
     return stock_map
 
 
+_FILL_STATION_LIST_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _normalize_station_key(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").casefold() if ch.isalnum())
+
+
+def _get_default_fill_station_value() -> str:
+    return (
+        os.getenv("DEFAULT_FILLING_STATION_ID", "").strip()
+        or os.getenv("DEFAULT_FILLING_STATION", "").strip()
+    )
+
+
+def _get_default_fill_station_id() -> str:
+    explicit = os.getenv("DEFAULT_FILLING_STATION_ID", "").strip()
+    if explicit:
+        return explicit
+    fallback = os.getenv("DEFAULT_FILLING_STATION", "").strip()
+    return fallback if fallback.isdigit() else ""
+
+
+def _extract_payload_fill_station_name(
+    voucher: Dict[str, Any],
+    items: List[Dict[str, Any]],
+) -> str:
+    for key in ("FILLINGSTATION", "FILLINGSTATIONNAME", "GODOWNNAME", "LOCATIONNAME", "LOCATION", "GODOWN"):
+        value = str(voucher.get(key) or "").strip()
+        if value:
+            return value
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("GODOWNNAME", "LOCATIONNAME", "LOCATION", "GODOWN"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+
+    return ""
+
+
+def _get_entity_fill_stations(api_base_url: str, entity_id: Optional[int]) -> List[Dict[str, Any]]:
+    if not api_base_url or not entity_id:
+        return []
+
+    cache_key = str(entity_id)
+    if cache_key in _FILL_STATION_LIST_CACHE:
+        return _FILL_STATION_LIST_CACHE[cache_key]
+
+    url = _server_base_url(api_base_url) + "/master/gas_filling_station"
+    try:
+        resp = requests.get(
+            url,
+            params={"entity_id": entity_id, "limit_end": 500},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                "Could not fetch filling stations for entity %s: HTTP %s",
+                entity_id,
+                resp.status_code,
+            )
+            _FILL_STATION_LIST_CACHE[cache_key] = []
+            return []
+
+        payload = resp.json()
+        stations = payload if isinstance(payload, list) else payload.get("data") or []
+        if not isinstance(stations, list):
+            stations = []
+        _FILL_STATION_LIST_CACHE[cache_key] = stations
+        return stations
+    except Exception as exc:
+        logger.warning("Could not fetch filling stations for entity %s: %s", entity_id, exc)
+        _FILL_STATION_LIST_CACHE[cache_key] = []
+        return []
+
+
+def _match_backend_fill_station(
+    api_base_url: str,
+    entity_id: Optional[int],
+    station_name: str,
+) -> Optional[Dict[str, Any]]:
+    normalized = _normalize_station_key(station_name)
+    if not normalized:
+        return None
+
+    stations = _get_entity_fill_stations(api_base_url, entity_id)
+    if not stations:
+        return None
+
+    for station in stations:
+        name_key = _normalize_station_key(station.get("name"))
+        code_key = _normalize_station_key(station.get("code"))
+        if normalized == name_key or normalized == code_key:
+            return station
+
+    for station in stations:
+        name_key = _normalize_station_key(station.get("name"))
+        code_key = _normalize_station_key(station.get("code"))
+        if name_key and (normalized in name_key or name_key in normalized):
+            return station
+        if code_key and (normalized in code_key or code_key in normalized):
+            return station
+
+    return None
+
+
+def _apply_default_fill_station(
+    voucher: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    *,
+    default_value: str,
+    default_id: str,
+) -> None:
+    if default_value:
+        voucher["FILLINGSTATION"] = default_value
+    else:
+        voucher.pop("FILLINGSTATION", None)
+
+    if default_id:
+        voucher["FILLINGSTATIONID"] = default_id
+    else:
+        voucher.pop("FILLINGSTATIONID", None)
+
+    for key in ("GODOWNNAME", "LOCATIONNAME", "FILLINGSTATIONNAME", "LOCATION", "GODOWN"):
+        voucher.pop(key, None)
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("GODOWNNAME", "LOCATIONNAME", "LOCATION", "GODOWN"):
+            item.pop(key, None)
+
+
+def _apply_matched_fill_station(
+    voucher: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    station: Dict[str, Any],
+) -> None:
+    canonical_name = str(station.get("name") or station.get("code") or "").strip()
+    station_id = str(station.get("id") or "").strip()
+    if not canonical_name:
+        return
+
+    voucher["FILLINGSTATION"] = canonical_name
+    voucher["GODOWNNAME"] = canonical_name
+    if station_id:
+        voucher["FILLINGSTATIONID"] = station_id
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        has_station_key = any(str(item.get(key) or "").strip() for key in ("GODOWNNAME", "LOCATIONNAME", "LOCATION", "GODOWN"))
+        if has_station_key:
+            item["GODOWNNAME"] = canonical_name
+        for key in ("LOCATIONNAME", "LOCATION", "GODOWN"):
+            item.pop(key, None)
+
+
+def _resolve_fill_station_payload(
+    voucher: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    *,
+    api_base_url: str,
+    entity_id: Optional[int],
+) -> None:
+    station_name = _extract_payload_fill_station_name(voucher, items)
+    default_value = _get_default_fill_station_value()
+    default_id = _get_default_fill_station_id()
+
+    if not station_name or station_name.lower() in _TALLY_DEFAULT_GODOWNS_SET:
+        if default_value or default_id:
+            _apply_default_fill_station(
+                voucher,
+                items,
+                default_value=default_value,
+                default_id=default_id,
+            )
+        return
+
+    station = _match_backend_fill_station(api_base_url, entity_id, station_name)
+    if station:
+        _apply_matched_fill_station(voucher, items, station)
+        logger.info(
+            "Matched filling station '%s' to backend station '%s' (id=%s)",
+            station_name,
+            station.get("name"),
+            station.get("id"),
+        )
+        return
+
+    if default_value or default_id:
+        logger.warning(
+            "Filling station '%s' not matched for entity %s; using default station %s",
+            station_name,
+            entity_id,
+            default_id or default_value,
+        )
+        _apply_default_fill_station(
+            voucher,
+            items,
+            default_value=default_value,
+            default_id=default_id,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Delivery-term resolution — identical to the one in fetch_invoices.py.
 # Maps abbreviations / typos in OTHERREFERENCE to a standard term.
@@ -290,7 +497,8 @@ def _enrich_voucher(
     # Tally fills GODOWNNAME with "Main Location" / "Main Godown" when no
     # specific location is selected — treat those as "not set" and fall
     # through to DEFAULT_FILLING_STATION so the server uses the correct ID.
-    default_fs = os.getenv("DEFAULT_FILLING_STATION", "").strip()
+    default_fs = _get_default_fill_station_value()
+    default_fs_id = _get_default_fill_station_id()
 
     if not voucher.get("FILLINGSTATION"):
         for key in ("GODOWNNAME", "LOCATIONNAME"):
@@ -307,9 +515,8 @@ def _enrich_voucher(
     if not voucher.get("FILLINGSTATION"):
         if default_fs:
             voucher["FILLINGSTATION"] = default_fs
-            # Send numeric ID so backend can look up the station directly
-            if default_fs.isdigit():
-                voucher["FILLINGSTATIONID"] = default_fs
+            if default_fs_id:
+                voucher["FILLINGSTATIONID"] = default_fs_id
 
     # PO number
     po_number = _extract_po_number(voucher)
@@ -468,6 +675,7 @@ def _build_payload_for_note(
     conn,
     note: Dict[str, Any],
     *,
+    api_base_url: str,
     entity_id: Optional[int],
     company_name: Optional[str],
     allow_tally_fetch: bool,
@@ -485,6 +693,12 @@ def _build_payload_for_note(
 
     # Enrich voucher with all fields the backend expects
     _enrich_voucher(voucher, note, items)
+    _resolve_fill_station_payload(
+        voucher,
+        items,
+        api_base_url=api_base_url,
+        entity_id=entity_id,
+    )
 
     party_name = note.get("party_ledger_name") or voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME")
     ledger_data = _load_ledger(conn, note["company_id"], party_name)
@@ -810,6 +1024,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             payload, payload_hash = _build_payload_for_note(
                 conn,
                 note,
+                api_base_url=config.api_base_url,
                 entity_id=config.entity_id,
                 company_name=company_name,
                 allow_tally_fetch=config.allow_tally_fetch,
@@ -926,16 +1141,22 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 total_ok += 1
 
                 # Step 2: Update fill_station (same as arasan) when Tally godown is default/main
-                default_fs = os.getenv("DEFAULT_FILLING_STATION", "").strip()
+                default_fs = _get_default_fill_station_value()
+                default_fs_id = _get_default_fill_station_id()
                 voucher_fs = str(voucher.get("FILLINGSTATION") or "").strip()
                 _needs_fs_update = (
-                    default_fs
-                    and (not voucher_fs or voucher_fs.lower() in _TALLY_DEFAULT_GODOWNS_SET or voucher_fs == default_fs)
+                    default_fs_id
+                    and (
+                        not voucher_fs
+                        or voucher_fs.lower() in _TALLY_DEFAULT_GODOWNS_SET
+                        or voucher_fs == default_fs
+                        or voucher_fs == default_fs_id
+                    )
                 )
                 if _needs_fs_update:
                     _dc_server_id = _lookup_dc_id_by_no(config.api_base_url, config.entity_id, resolved_dc_no or dc_no)
                     if _dc_server_id:
-                        _update_dc_fill_station(config.api_base_url, _dc_server_id, default_fs)
+                        _update_dc_fill_station(config.api_base_url, _dc_server_id, default_fs_id)
                     else:
                         logger.debug("Could not look up server DC id for fill_station update (dc_no=%s)", resolved_dc_no or dc_no)
         else:
