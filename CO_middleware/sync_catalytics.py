@@ -368,6 +368,9 @@ _REF_TERM_EXACT: Dict[str, str] = {
     'c': 'customer pickup',
     's': 'supplier',
     't': 'traders',
+    # dealer shorthand used by Tally users; map to traders
+    'de': 'traders',
+    'ds': 'traders',
     'del': 'delivery',
     'deliv': 'delivery',
     'cust': 'customer pickup',
@@ -422,6 +425,8 @@ _NON_PO_VALUES = {
     'customer pik up', 'customerpikup', 'supplier', 'traders', 'trader',
     # Single-letter abbreviations used in OTHERREFERENCE
     'd', 'c', 's', 't',
+    # Dealer shorthand abbreviations mapped to traders
+    'de', 'ds',
     # Short-form abbreviations
     'del', 'deliv', 'cust', 'sup', 'supp', 'tr', 'trd',
 }
@@ -1222,7 +1227,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
 
 

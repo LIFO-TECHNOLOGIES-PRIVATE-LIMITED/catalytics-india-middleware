@@ -555,6 +555,9 @@ _REF_TERM_EXACT: Dict[str, str] = {
     'c': 'customer pickup',
     's': 'supplier',
     't': 'traders',
+    # dealer shorthand used by Tally users; map to traders as requested
+    'de': 'traders',
+    'ds': 'traders',
     # common short forms
     'del': 'delivery',
     'deliv': 'delivery',
@@ -1190,7 +1193,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
 
 
