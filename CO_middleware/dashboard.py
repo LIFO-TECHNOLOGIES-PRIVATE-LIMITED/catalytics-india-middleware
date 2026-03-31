@@ -82,7 +82,7 @@ def _same_db_path(left: str, right: str) -> bool:
 
 
 def initialize_database_file(db_path: str, *, include_master_tables: bool = False) -> None:
-    """Create required tables for a configured SQLite database file."""
+    """Create the full required schema for a configured SQLite database file."""
     if not db_path:
         return
 
@@ -92,9 +92,9 @@ def initialize_database_file(db_path: str, *, include_master_tables: bool = Fals
     finally:
         conn.close()
 
-    if include_master_tables:
-        master_db = db.Database(db_path)
-        master_db.close()
+    # Keep the Database bootstrap for backward-compatible migrations/index creation.
+    master_db = db.Database(db_path)
+    master_db.close()
 
 
 def initialize_configured_databases() -> None:
@@ -105,12 +105,49 @@ def initialize_configured_databases() -> None:
     if tally_db_path:
         initialize_database_file(
             tally_db_path,
-            include_master_tables=_same_db_path(tally_db_path, master_db_path),
+            include_master_tables=True,
         )
 
     if master_db_path and not _same_db_path(master_db_path, tally_db_path):
-        master_db = db.Database(master_db_path)
-        master_db.close()
+        initialize_database_file(master_db_path, include_master_tables=True)
+
+
+RUNTIME_LOG_FILES = (
+    'app.log',
+    'dashboard_operations.log',
+    'customer_fetch.log',
+    'product_fetch.log',
+    'customer_sync.log',
+    'product_sync.log',
+    'dc_fetch.log',
+    'dc_fetch_errors.log',
+    'dc_sync.log',
+    'dc_sync_errors.log',
+)
+
+
+def ensure_runtime_support_files() -> None:
+    """Create log files/directories used by the EXE on first launch."""
+    log_dir = BASE_DIR / 'logs'
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    configured_log = cfg.get_env('LOG_FILE', 'logs/app.log') or 'logs/app.log'
+    configured_path = Path(configured_log)
+    if not configured_path.is_absolute():
+        configured_path = BASE_DIR / configured_log
+
+    log_paths = {configured_path}
+    log_paths.update(log_dir / name for name in RUNTIME_LOG_FILES)
+
+    for log_path in log_paths:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.touch(exist_ok=True)
+        except Exception:
+            pass
 
 
 def get_recent_file_logs(log_file, lines=20):
@@ -204,6 +241,59 @@ def stop_dashboard_process_async(exit_delay_seconds: float = 0.5) -> None:
         os._exit(0)
 
     threading.Thread(target=_exit_self, daemon=True).start()
+
+
+def _dashboard_control_hosts() -> list[str]:
+    host = (config.WEB_UI_HOST or '').strip()
+    hosts: list[str] = []
+
+    def _add(value: str) -> None:
+        value = (value or '').strip()
+        if value and value not in hosts:
+            hosts.append(value)
+
+    if host in ('', '0.0.0.0', '::'):
+        _add('127.0.0.1')
+        _add('localhost')
+    else:
+        _add(host)
+        if host.lower() == 'localhost':
+            _add('127.0.0.1')
+
+    return hosts
+
+
+def maybe_toggle_existing_instance_on_launch() -> None:
+    """If another dashboard instance is already running, request it to close and exit."""
+    default_toggle = 'true' if getattr(sys, 'frozen', False) else 'false'
+    if not _env_flag('TOGGLE_EXISTING_INSTANCE_ON_LAUNCH', default_toggle):
+        return
+
+    for host in _dashboard_control_hosts():
+        base_url = f'http://{host}:{config.WEB_UI_PORT}'
+        try:
+            response = requests.post(
+                f'{base_url}/api/internal/shutdown',
+                json={'source': 'launcher'},
+                timeout=1.2,
+            )
+        except requests.RequestException:
+            continue
+        except Exception:
+            continue
+
+        if response.status_code != 200:
+            continue
+
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+
+        if payload.get('success'):
+            logger.info('Existing dashboard instance found at %s; shutdown requested', base_url)
+            time.sleep(0.2)
+            os._exit(0)
 
 
 @app.route('/')
@@ -343,7 +433,7 @@ def api_status():
             },
             'sync_batch_size': cfg.get_env_int("SYNC_BATCH_SIZE", 10),
             'invoice_fetch_start_date': cfg.get_env("TALLY_FROM_DATE", "Today"),
-            'product_type_map': config.PRODUCT_TYPE_MAP
+            'product_type_map': config.get_product_type_map()
         },
         'automation': automation_status
     })
@@ -538,6 +628,24 @@ def api_automation_intervals():
     except Exception as e:
         logger.exception("Failed to update intervals")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/internal/shutdown', methods=['POST'])
+def api_internal_shutdown():
+    """Allow a new local launcher instance to close the currently running dashboard."""
+    remote_addr = (request.remote_addr or '').strip()
+    if remote_addr and remote_addr not in ('127.0.0.1', '::1', '::ffff:127.0.0.1'):
+        return jsonify({'success': False, 'error': 'Local requests only'}), 403
+
+    try:
+        manager = get_manager()
+        manager.stop()
+    except Exception as exc:
+        logger.warning(f'Could not stop automation during internal shutdown: {exc}')
+
+    dashboard_logger.write_log('=== LAUNCHER: EXISTING DASHBOARD INSTANCE SHUTDOWN REQUESTED ===')
+    stop_dashboard_process_async(exit_delay_seconds=0.35)
+    return jsonify({'success': True, 'message': 'Dashboard shutdown requested'})
 
 
 @app.route('/api/logs')
@@ -2665,7 +2773,8 @@ def maybe_register_windows_startup():
 
         app_name = os.getenv('WINDOWS_STARTUP_APP_NAME', 'ChennaiOxygenMiddlewareDashboard').strip() or 'ChennaiOxygenMiddlewareDashboard'
         exe_path = f'"{sys.executable}"'
-        env_path = str(Path(sys.executable).with_name('.env'))
+        exe_env_path = Path(sys.executable).with_name('.env')
+        env_path = str(exe_env_path if exe_env_path.exists() else cfg.get_env_path())
 
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -2688,8 +2797,7 @@ def maybe_register_windows_startup():
 
 
 if __name__ == '__main__':
-    # Ensure logs directory exists (next to the exe, not in CWD)
-    os.makedirs(str(BASE_DIR / 'logs'), exist_ok=True)
+    ensure_runtime_support_files()
 
     # Setup logging
     log_level = cfg.get_env("LOG_LEVEL", "INFO")
@@ -2709,6 +2817,8 @@ if __name__ == '__main__':
     _dh = _DashboardLogHandler()
     _dh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logging.getLogger().addHandler(_dh)
+
+    maybe_toggle_existing_instance_on_launch()
 
     try:
         initialize_configured_databases()

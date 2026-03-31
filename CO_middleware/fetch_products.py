@@ -7,9 +7,15 @@ Tally stock item name format:
     └─ product ─────┘ │ └┘  └─┘
                       qty unit  type_code
 
-Only stock items with a recognized type code in parentheses are saved.
+Stock items are normally classified by a recognized type code in parentheses.
 Type codes configured via PRODUCT_TYPE_MAP in .env:
     CYL:CYLINDER, PLT:PALLET, TNK:TANK, CON:CONTAINER
+
+Special rules:
+- products whose names start with LPG are always fetched with product type LPG,
+  even if they do not use a configured suffix.
+- products whose names mention Vaparizer are always fetched with product type
+  VAPARIZER and default to variant/unit 1 Nos when no size is present.
 """
 import re
 import json
@@ -60,6 +66,72 @@ STOCK_NAME_PATTERN_NO_VARIANT = re.compile(r'^(.+?)\s+\((\w+)\)$')
 # Default variant when product name has type code but no quantity/unit
 DEFAULT_VARIANT = '7 Cum'
 DEFAULT_UNIT = 'Cum'
+LPG_TYPE_CODE = 'LPG'
+VAPARIZER_TYPE_CODE = 'VAPARIZER'
+VAPARIZER_DEFAULT_VARIANT = '1 Nos'
+VAPARIZER_DEFAULT_UNIT = 'Nos'
+LPG_NAME_PATTERN = re.compile(
+    r'^(?P<base>LPG.*?)(?:\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+))?(?:\s+\((?P<legacy_type>\w+)\))?$',
+    re.IGNORECASE,
+)
+VAPARIZER_NAME_PATTERN = re.compile(
+    r'^(?P<base>.*?\bVAPARIZER\b.*?)(?:\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+))?$',
+    re.IGNORECASE,
+)
+
+
+def _parse_vaparizer_stock_item_name(normalized_name: str):
+    if 'VAPARIZER' not in normalized_name.upper():
+        return None
+
+    match = VAPARIZER_NAME_PATTERN.match(normalized_name)
+    if not match:
+        return None
+
+    product_master_name = match.group('base').strip()
+    quantity = (match.group('qty') or '1').strip()
+    unit_name = (match.group('unit') or VAPARIZER_DEFAULT_UNIT).strip()
+    variant_name = f"{quantity} {unit_name}".strip()
+    product_type_name = config.get_product_type_name(VAPARIZER_TYPE_CODE) or 'Vaparizer'
+
+    return {
+        'product_master_name': product_master_name,
+        'unit_name': unit_name,
+        'variant_name': variant_name,
+        'product_type_code': VAPARIZER_TYPE_CODE,
+        'product_type_name': product_type_name,
+        'canonical_name': f"{product_master_name} {variant_name} ({VAPARIZER_TYPE_CODE})",
+        'variant_defaulted': match.group('qty') is None,
+    }
+
+
+def _parse_lpg_stock_item_name(normalized_name: str):
+    if not normalized_name.upper().startswith(LPG_TYPE_CODE):
+        return None
+
+    match = LPG_NAME_PATTERN.match(normalized_name)
+    if not match:
+        return None
+
+    product_master_name = match.group('base').strip()
+    quantity = (match.group('qty') or '').strip()
+    unit_name = (match.group('unit') or '').strip()
+    variant_name = f"{quantity} {unit_name}".strip()
+    product_type_name = config.get_product_type_name(LPG_TYPE_CODE) or LPG_TYPE_CODE
+
+    if variant_name:
+        canonical_name = f"{product_master_name} {variant_name} ({LPG_TYPE_CODE})"
+    else:
+        canonical_name = f"{product_master_name} ({LPG_TYPE_CODE})"
+
+    return {
+        'product_master_name': product_master_name,
+        'unit_name': unit_name,
+        'variant_name': variant_name,
+        'product_type_code': LPG_TYPE_CODE,
+        'product_type_name': product_type_name,
+        'canonical_name': canonical_name,
+    }
 
 
 def parse_stock_item_name(name: str):
@@ -68,11 +140,15 @@ def parse_stock_item_name(name: str):
 
     Primary pattern:   <NAME> <QTY> <UNIT> (<TYPE_CODE>)  e.g. "Oxygen Gas 7 Cum (CYL)"
     Fallback pattern:  <NAME> (<TYPE_CODE>)                e.g. "Oxygen Gas (CYL)"
-      → fallback uses default variant '7 Cum'
+      -> fallback uses default variant '7 Cum'
+    LPG override:        Any name starting with LPG is accepted and forced to
+                         product type LPG, with qty/unit parsed from the tail when present.
+    Vaparizer override: Any name mentioning Vaparizer is accepted and forced to
+                         product type VAPARIZER, defaulting to variant/unit 1 Nos.
 
     Returns dict with product_master_name, variant_name, unit_name,
     product_type_code, product_type_name, canonical_name
-    — or None if unrecognized.
+    - or None if unrecognized.
     """
     if not name:
         return None
@@ -80,6 +156,15 @@ def parse_stock_item_name(name: str):
     # Normalize: collapse multiple spaces into single space
     normalized_name = ' '.join(name.strip().split())
     type_map = config.PRODUCT_TYPE_MAP
+
+    # Special product rules use dedicated overrides instead of PRODUCT_TYPE_MAP suffixes.
+    parsed_vaparizer = _parse_vaparizer_stock_item_name(normalized_name)
+    if parsed_vaparizer:
+        return parsed_vaparizer
+
+    parsed_lpg = _parse_lpg_stock_item_name(normalized_name)
+    if parsed_lpg:
+        return parsed_lpg
 
     # --- Primary pattern: name includes quantity and unit ---
     match = STOCK_NAME_PATTERN.match(normalized_name)
@@ -179,7 +264,7 @@ def fetch_products_from_all_companies():
 
     logger.info(f"Starting product fetch from {len(active_companies)} companies")
     logger.info(f"Active companies: {', '.join(active_companies)}")
-    logger.info(f"Product type map: {config.PRODUCT_TYPE_MAP}")
+    logger.info(f"Product type rules: {config.get_product_type_map()}")
 
     overall_stats = {
         'total_fetched': 0, 'matched': 0, 'new_saved': 0, 'updated': 0,
@@ -233,7 +318,7 @@ def fetch_products_from_all_companies():
                     else:
                         logger.debug(
                             f"[SKIPPED] '{product_name}' — no matching type code "
-                            f"(expected one of: {list(config.PRODUCT_TYPE_MAP.keys())})"
+                            f"(expected one of: {list(config.get_product_type_codes())})"
                         )
                         overall_stats['skipped_no_type'] += 1
                         continue

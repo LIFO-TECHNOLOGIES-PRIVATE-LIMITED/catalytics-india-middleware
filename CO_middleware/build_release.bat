@@ -28,12 +28,20 @@ if errorlevel 1 (
     exit /b 1
 )
 copy /y ".env.example" "%RELEASE_DIR%\.env.example" >nul
-copy /y ".env.example" "%RELEASE_DIR%\.env" >nul
+if exist ".env" (
+    copy /y ".env" "%RELEASE_DIR%\.env" >nul
+    echo [INFO] Packaged current .env into release.
+) else (
+    copy /y ".env.example" "%RELEASE_DIR%\.env" >nul
+    echo [INFO] .env not found, packaged .env.example as release .env.
+)
 copy /y "README_CLIENT_SETUP.txt" "%RELEASE_DIR%\" >nul
 if exist "RELEASE_NOTES.md" copy /y "RELEASE_NOTES.md" "%RELEASE_DIR%\" >nul
 copy /y "Start_Dashboard.bat" "%RELEASE_DIR%\" >nul
 copy /y "Install_AutoStart.bat" "%RELEASE_DIR%\" >nul
 copy /y "Remove_AutoStart.bat" "%RELEASE_DIR%\" >nul
+copy /y "allow_firewall.bat" "%RELEASE_DIR%\" >nul
+copy /y "check_network_access.py" "%RELEASE_DIR%\" >nul
 
 echo [4/5] Creating zip archive...
 if exist "%ZIP_PATH%" del /q "%ZIP_PATH%"
@@ -53,7 +61,7 @@ echo   1. Unzip on client system
 echo   2. Edit .env with Tally and Catalytics settings
 echo   3. Double-click Start_Dashboard.bat or co_middleware_dashboard.exe
 echo   4. Dashboard opens in browser at http://localhost:8787
-echo   5. Use Install_AutoStart.bat if Windows auto-start is required
+echo   5. For network access, run allow_firewall.bat as Administrator
+echo   6. Use Install_AutoStart.bat if Windows auto-start is required
 
 endlocal
-

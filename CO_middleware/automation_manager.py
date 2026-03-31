@@ -1,18 +1,24 @@
 """
-Automation Manager for CO Middleware
-Manages automated fetch and sync operations with configurable intervals
-Single company version (adapted from arasan_gas)
+Automation manager for CO middleware.
+
+The dashboard uses three automation timers:
+- fetch_master: fetch products + customers from Tally
+- fetch_invoices: fetch delivery challans from Tally
+- sync: sync pending products, customers, and delivery challans to Catalytics
+
+Intervals default from .env when automation starts. Dashboard interval changes
+are runtime-only and are reset the next time automation is started.
 """
 
 import json
-import time
-import threading
-import io
-from datetime import datetime, timedelta
-from pathlib import Path
 import logging
 import os
 import sys
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 if ROOT_DIR not in sys.path:
@@ -21,155 +27,188 @@ if ROOT_DIR not in sys.path:
 import config as cfg
 from config import config
 
-# Setup logging
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
 
-# Dashboard logger for terminal output
 try:
     from log_capture import dashboard_logger
 except ImportError:
     dashboard_logger = None
 
-# State file path
-STATE_FILE = Path(ROOT_DIR) / 'automation_state.json'
 
-# Default intervals (in seconds) — read from .env via config
-# Master (products + customers): once per day (1440 min default)
-# DC fetch: every 20 seconds (FETCH_INVOICES_INTERVAL_SECONDS default)
-# DC sync runs inline after each DC fetch — no separate sync timer needed
-DEFAULT_INTERVALS = {
-    'fetch_master': config.FETCH_MASTER_INTERVAL_MINUTES * 60,   # default 1440 min = 1 day
-    'fetch_invoices': config.FETCH_INVOICES_INTERVAL_SECONDS,    # default 20s
-}
-
-INITIAL_DELAYS = {
-    'fetch_master': 0,    # Products + Customers run immediately on startup
-    'fetch_invoices': 0,  # DCs run immediately after master data is ready
-}
+STATE_FILE = Path(cfg.BASE_DIR) / 'automation_state.json'
+TASKS = ('fetch_master', 'fetch_invoices', 'sync')
+INITIAL_DELAYS = {task: 0 for task in TASKS}
 
 
-class DashboardLogHandler(logging.Handler):
-    """Routes logging output to the dashboard terminal and a StringIO buffer."""
+def _reload_env_config():
+    """Reload .env so automation uses the latest file-backed config."""
+    cfg.load_env_file(cfg.resolve_env_path(ROOT_DIR))
+    config.reload_from_env()
 
-    def __init__(self, string_buffer=None):
-        super().__init__()
-        self.buffer = string_buffer
 
-    def emit(self, record):
-        msg = self.format(record)
-        if dashboard_logger:
-            dashboard_logger.write_raw(msg)
-        if self.buffer:
-            self.buffer.write(msg + '\n')
+def _default_intervals():
+    """Return default task intervals from the current environment."""
+    _reload_env_config()
+    return {
+        'fetch_master': max(1, config.FETCH_MASTER_INTERVAL_MINUTES * 60),
+        'fetch_invoices': max(1, config.FETCH_INVOICES_INTERVAL_SECONDS),
+        'sync': max(1, config.SYNC_INVOICES_INTERVAL_SECONDS),
+    }
+
+
+def _empty_task_map():
+    return {task: None for task in TASKS}
+
+
+def _coerce_positive_int(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 class AutomationManager:
-    """Manages automated fetch and sync operations for single company"""
+    """Manages automated fetch and sync operations for the dashboard."""
 
     def __init__(self):
-        self.state = self._load_state()
         self.threads = {}
         self.stop_flags = {}
         self.lock = threading.Lock()
-        # Signalled after the very first product+customer fetch completes.
-        # DC fetch waits on this so it only starts once master data is ready.
         self._master_initial_done = threading.Event()
+        self.state = self._load_state()
 
-        # Reset status on startup — threads don't survive process restart
         if self.state['status'] == 'running':
             logger.info("Resetting stale 'running' state to 'stopped' (process restarted)")
             self.state['status'] = 'stopped'
+            self.state['next_runs'] = _empty_task_map()
             self._save_state()
 
-    def _load_state(self):
-        """Load automation state from file"""
-        if STATE_FILE.exists():
-            try:
-                with open(STATE_FILE, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Error loading state: {e}")
-
-        # Default state
+    def _new_state(self):
         return {
-            'status': 'stopped',  # stopped, running
-            'intervals': DEFAULT_INTERVALS.copy(),
-            'last_runs': {
-                'fetch_master': None,
-                'fetch_invoices': None,
-            },
-            'next_runs': {
-                'fetch_master': None,
-                'fetch_invoices': None,
-            },
+            'status': 'stopped',
+            'intervals': _default_intervals(),
+            'last_runs': _empty_task_map(),
+            'next_runs': _empty_task_map(),
             'started_at': None,
-            'stopped_at': None
+            'stopped_at': None,
         }
 
-    def _save_state(self):
-        """Save automation state to file"""
+    def _load_state(self):
+        """Load automation state from disk, but keep env as the interval source."""
+        state = self._new_state()
+        if not STATE_FILE.exists():
+            return state
+
         try:
-            with open(STATE_FILE, 'w') as f:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading state: {e}")
+            return state
+
+        if not isinstance(loaded, dict):
+            return state
+
+        state['status'] = loaded.get('status', state['status'])
+        state['started_at'] = loaded.get('started_at')
+        state['stopped_at'] = loaded.get('stopped_at')
+
+        for section in ('last_runs', 'next_runs'):
+            values = loaded.get(section)
+            if isinstance(values, dict):
+                for task in TASKS:
+                    state[section][task] = values.get(task)
+
+        return state
+
+    def _save_state(self):
+        """Save automation state to disk."""
+        try:
+            with open(STATE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.state, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving state: {e}")
 
     def get_status(self):
-        """Get current automation status"""
+        """Get current automation status."""
         with self.lock:
-            status = self.state.copy()
+            status = {
+                'status': self.state['status'],
+                'intervals': dict(self.state['intervals']),
+                'last_runs': dict(self.state['last_runs']),
+                'next_runs': dict(self.state['next_runs']),
+                'started_at': self.state['started_at'],
+                'stopped_at': self.state['stopped_at'],
+            }
 
-            # Calculate time until next runs
             if self.state['status'] == 'running':
                 now = datetime.now()
-                for task in ['fetch_master', 'fetch_invoices']:
-                    if self.state['next_runs'][task]:
-                        next_run = datetime.fromisoformat(self.state['next_runs'][task])
-                        seconds_until = max(0, (next_run - now).total_seconds())
-                        status[f'{task}_countdown'] = int(seconds_until)
+                for task in TASKS:
+                    next_run = self.state['next_runs'].get(task)
+                    if next_run:
+                        dt = datetime.fromisoformat(next_run)
+                        status[f'{task}_countdown'] = int(max(0, (dt - now).total_seconds()))
                     else:
                         status[f'{task}_countdown'] = 0
 
             return status
 
     def set_intervals(self, intervals):
-        """Update automation intervals"""
+        """Update live automation intervals."""
+        now = datetime.now()
         with self.lock:
-            for task, interval in intervals.items():
-                if task in self.state['intervals'] and interval > 0:
-                    self.state['intervals'][task] = interval
+            for task, interval in (intervals or {}).items():
+                interval = _coerce_positive_int(interval)
+                if task not in self.state['intervals'] or interval is None:
+                    continue
+                self.state['intervals'][task] = interval
+                if self.state['status'] == 'running':
+                    self.state['next_runs'][task] = (now + timedelta(seconds=interval)).isoformat()
             self._save_state()
 
         logger.info(f"Intervals updated: {intervals}")
         return True
 
     def start(self):
-        """Start automation loops - threads have built-in delays to avoid overwhelming Tally"""
+        """Start automation loops."""
+        _reload_env_config()
         with self.lock:
             if self.state['status'] == 'running':
                 logger.warning("Automation already running")
                 return False
 
+            env_defaults = _default_intervals()
+            self.state['intervals'] = dict(env_defaults)
+
+
             self.state['status'] = 'running'
-            now = datetime.now()
-            self.state['started_at'] = now.isoformat()
+            self.state['started_at'] = datetime.now().isoformat()
+            self.state['stopped_at'] = None
             for task, delay in INITIAL_DELAYS.items():
-                self.state['next_runs'][task] = (now + timedelta(seconds=delay)).isoformat()
+                self.state['next_runs'][task] = (datetime.now() + timedelta(seconds=delay)).isoformat()
             self._save_state()
 
+        self._master_initial_done.clear()
         logger.info("Starting automation threads...")
         self._start_thread('fetch_master', self._fetch_master_loop)
         self._start_thread('fetch_invoices', self._fetch_invoices_loop)
-
-        logger.info("Automation started — master fetch once/day, DC fetch+sync every 20s")
+        self._start_thread('sync', self._sync_loop)
+        logger.info(
+            "Automation started - master fetch every %ss, DC fetch every %ss, sync every %ss",
+            self.state['intervals']['fetch_master'],
+            self.state['intervals']['fetch_invoices'],
+            self.state['intervals']['sync'],
+        )
         return True
 
     def stop(self):
-        """Stop automation loops"""
+        """Stop automation loops."""
         with self.lock:
             if self.state['status'] != 'running':
                 logger.warning("Automation not running")
@@ -177,113 +216,146 @@ class AutomationManager:
 
             self.state['status'] = 'stopped'
             self.state['stopped_at'] = datetime.now().isoformat()
-            self.state['next_runs'] = {
-                'fetch_master': None,
-                'fetch_invoices': None,
-            }
+            self.state['next_runs'] = _empty_task_map()
             self._save_state()
 
-        # Stop all threads
-        for task in list(self.stop_flags.keys()):
-            self.stop_flags[task].set()
+        for flag in list(self.stop_flags.values()):
+            flag.set()
 
-        # Wait for threads to finish
         for task, thread in list(self.threads.items()):
             thread.join(timeout=5)
 
         self.threads.clear()
         self.stop_flags.clear()
+        self._master_initial_done.clear()
 
         logger.info("Automation stopped")
         return True
 
     def restart(self):
-        """Restart automation loops"""
+        """Restart automation loops."""
         logger.info("Restarting automation...")
         self.stop()
         time.sleep(2)
         return self.start()
 
     def _start_thread(self, task_name, target_func):
-        """Start a background thread for a task"""
         self.stop_flags[task_name] = threading.Event()
-        thread = threading.Thread(target=target_func, daemon=True)
+        thread = threading.Thread(target=target_func, daemon=True, name=f'automation-{task_name}')
         thread.start()
         self.threads[task_name] = thread
 
     def _log_to_dashboard(self, message):
-        """Write a message to the dashboard terminal output"""
         if dashboard_logger:
             dashboard_logger.write_log(message)
 
-    def _run_with_log_capture(self, func, *args, **kwargs):
-        """Run a function while capturing its log output to the dashboard.
-        Returns (success: bool, output: str)."""
-        buf = io.StringIO()
-        handler = DashboardLogHandler(string_buffer=buf)
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    def _prepare_task_run(self, task):
+        _reload_env_config()
+        with self.lock:
+            interval = int(self.state['intervals'][task])
+            self.state['next_runs'][task] = (datetime.now() + timedelta(seconds=interval)).isoformat()
+            self._save_state()
+        return interval
 
-        root = logging.getLogger()
-        root.addHandler(handler)
-        try:
-            func(*args, **kwargs)
-            return True, buf.getvalue()
-        except Exception as exc:
-            logger.error(f"Error running {func.__name__}: {exc}")
-            return False, buf.getvalue()
-        finally:
-            root.removeHandler(handler)
+    def _mark_task_complete(self, task):
+        with self.lock:
+            self.state['last_runs'][task] = datetime.now().isoformat()
+            self._save_state()
+
+    def _wait_for_initial_master(self, task):
+        logger.info("%s: Waiting for initial master data fetch to complete...", task)
+        while not self._master_initial_done.is_set():
+            if self.stop_flags[task].wait(timeout=1.0):
+                return False
+        return True
+
+    def _wait_for_next_run(self, task):
+        while not self.stop_flags[task].is_set():
+            with self.lock:
+                next_run_iso = self.state['next_runs'].get(task)
+
+            if not next_run_iso:
+                return False
+
+            try:
+                next_run = datetime.fromisoformat(next_run_iso)
+            except ValueError:
+                return True
+
+            remaining = (next_run - datetime.now()).total_seconds()
+            if remaining <= 0:
+                return True
+
+            self.stop_flags[task].wait(timeout=min(1.0, remaining))
+
+        return False
+
+    def _build_master_sync_args(self):
+        return SimpleNamespace(
+            config=cfg.resolve_env_path(ROOT_DIR),
+            db_path=None,
+            api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
+            api_key=cfg.get_env("CATALYTICS_API_KEY"),
+            entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
+            company=cfg.get_env("TALLY_COMPANY"),
+            batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
+            limit=cfg.get_env_int("SYNC_LIMIT", 200),
+            max_attempts=cfg.get_env_int("SYNC_MAX_ATTEMPTS", 5),
+            dry_run=cfg.get_env_bool("SYNC_DRY_RUN", False),
+            log_level=cfg.get_env("LOG_LEVEL", "INFO"),
+            log_json=cfg.get_env_bool("LOG_JSON", False),
+            log_file=None,
+        )
+
+    def _build_dc_sync_args(self):
+        return SimpleNamespace(
+            config=cfg.resolve_env_path(ROOT_DIR),
+            db_path=cfg.get_env("TALLY_DB_PATH"),
+            api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
+            api_key=cfg.get_env("CATALYTICS_API_KEY"),
+            entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
+            company=cfg.get_env("TALLY_COMPANY"),
+            batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
+            limit=cfg.get_env_int("SYNC_LIMIT", 200),
+            max_attempts=cfg.get_env_int("SYNC_MAX_ATTEMPTS", 5),
+            allow_tally_fetch=cfg.get_env_bool("SYNC_ALLOW_TALLY_FETCH", False),
+            dry_run=cfg.get_env_bool("SYNC_DRY_RUN", False),
+            log_level=cfg.get_env("LOG_LEVEL", "INFO"),
+            log_json=cfg.get_env_bool("LOG_JSON", False),
+            log_file=None,
+        )
 
     def _fetch_master_loop(self):
-        """
-        Once-per-day loop: fetch products + customers from Tally,
-        then immediately sync any pending ones to the server.
-        """
-        from fetch_products import fetch_products_from_all_companies
+        """Fetch products + customers from Tally on the master schedule."""
         from fetch_customers import fetch_customers_from_all_companies
-        from sync_customers import build_config as build_sync_customers_config, run_once as sync_customers_once
-        from sync_products import build_config as build_sync_products_config, run_once as sync_products_once
-        from types import SimpleNamespace
+        from fetch_products import fetch_products_from_all_companies
 
         task = 'fetch_master'
         consecutive_errors = 0
-        _first_run = True
+        first_run = True
 
         while not self.stop_flags[task].is_set():
             try:
-                interval = self.state['intervals'][task]
-                next_run = datetime.now() + timedelta(seconds=interval)
-                with self.lock:
-                    self.state['next_runs'][task] = next_run.isoformat()
-                    self._save_state()
+                self._prepare_task_run(task)
+                logger.info("Running %s...", task)
+                self._log_to_dashboard("=== AUTO: FETCH MASTER DATA STARTED ===")
 
-                logger.info(f"Running {task}...")
-                self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA STARTED ===")
-
-                # --- Fetch products ---
-                ok_prod = True
                 prod_new = prod_updated = 0
+                cust_new = cust_updated = 0
+
                 try:
                     result = fetch_products_from_all_companies()
                     prod_new = result.get('new_saved', 0)
                     prod_updated = result.get('updated', 0)
                 except Exception as e:
                     logger.error(f"Product fetch failed: {e}", exc_info=True)
-                    ok_prod = False
 
-                if self.stop_flags[task].wait(timeout=10):
-                    return
-
-                # --- Fetch customers ---
-                ok_cust = True
-                cust_new = cust_updated = 0
                 try:
                     result = fetch_customers_from_all_companies()
                     cust_new = result.get('new_saved', 0)
                     cust_updated = result.get('updated', 0)
                 except Exception as e:
                     logger.error(f"Customer fetch failed: {e}", exc_info=True)
-                    ok_cust = False
 
                 self._log_to_dashboard(
                     f"=== AUTO: FETCH MASTER DATA COMPLETED "
@@ -291,84 +363,45 @@ class AutomationManager:
                     f"customers: new={cust_new} upd={cust_updated}) ==="
                 )
 
-                with self.lock:
-                    self.state['last_runs'][task] = datetime.now().isoformat()
-                    self._save_state()
-
+                self._mark_task_complete(task)
                 consecutive_errors = 0
 
-                if _first_run:
-                    _first_run = False
+                if first_run:
+                    first_run = False
                     self._master_initial_done.set()
-                    logger.info(f"{task}: Initial master fetch done — DC fetch unblocked")
+                    logger.info("%s: Initial master fetch done - DC fetch and sync unblocked", task)
 
-                # --- Sync pending products + customers immediately after fetch ---
-                sync_args = SimpleNamespace(
-                    config=cfg.resolve_env_path(ROOT_DIR),
-                    db_path=None,
-                    api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
-                    api_key=cfg.get_env("CATALYTICS_API_KEY"),
-                    entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
-                    company=cfg.get_env("TALLY_COMPANY"),
-                    batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
-                    limit=cfg.get_env_int("SYNC_LIMIT", 200),
-                    max_attempts=cfg.get_env_int("SYNC_MAX_ATTEMPTS", 5),
-                    dry_run=cfg.get_env_bool("SYNC_DRY_RUN", False),
-                    log_level=cfg.get_env("LOG_LEVEL", "INFO"),
-                    log_json=cfg.get_env_bool("LOG_JSON", False),
-                    log_file=None,
-                )
-                try:
-                    sync_products_once(build_sync_products_config(sync_args))
-                except Exception as e:
-                    logger.error(f"Product sync failed: {e}")
-                try:
-                    sync_customers_once(build_sync_customers_config(sync_args))
-                except Exception as e:
-                    logger.error(f"Customer sync failed: {e}")
-
-                # Wait full day before next master fetch
-                self.stop_flags[task].wait(timeout=interval)
+                if not self._wait_for_next_run(task):
+                    return
 
             except Exception as e:
                 consecutive_errors += 1
                 backoff = min(30 * consecutive_errors, 120)
                 logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
                 self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA ERROR: {e} (retry in {backoff}s) ===")
-                if _first_run:
-                    _first_run = False
+                if first_run:
+                    first_run = False
                     self._master_initial_done.set()
-                    logger.warning(f"{task}: Master fetch failed on first run — DC fetch unblocked anyway")
-                self.stop_flags[task].wait(timeout=backoff)
+                    logger.warning("%s: Master fetch failed on first run - DC fetch and sync unblocked anyway", task)
+                if self.stop_flags[task].wait(timeout=backoff):
+                    return
 
     def _fetch_invoices_loop(self):
-        """
-        Every-20s loop: fetch DCs from Tally, then immediately sync
-        any pending DCs to the server (inline — no separate sync timer).
-        """
+        """Fetch delivery challans from Tally on the invoice schedule."""
         from fetch_invoices import build_config as build_fetch_invoices_config, run_once as fetch_invoices_once
-        from sync_catalytics import build_config as build_sync_config, run_once as sync_once
-        from types import SimpleNamespace
 
         task = 'fetch_invoices'
         consecutive_errors = 0
 
-        logger.info(f"{task}: Waiting for initial master data fetch to complete...")
-        self._master_initial_done.wait()
-        if self.stop_flags[task].is_set():
+        if not self._wait_for_initial_master(task):
             return
 
-        logger.info(f"{task}: Master data ready — starting DC fetch+sync loop (every 20s)")
+        logger.info("%s: Master data ready - starting DC fetch loop", task)
 
         while not self.stop_flags[task].is_set():
             try:
-                interval = self.state['intervals'][task]
-                next_run = datetime.now() + timedelta(seconds=interval)
-                with self.lock:
-                    self.state['next_runs'][task] = next_run.isoformat()
-                    self._save_state()
+                self._prepare_task_run(task)
 
-                # --- Fetch DCs from Tally ---
                 fetch_args = SimpleNamespace(
                     config=cfg.resolve_env_path(ROOT_DIR),
                     db_path=cfg.get_env("TALLY_DB_PATH"),
@@ -384,7 +417,7 @@ class AutomationManager:
                     log_json=cfg.get_env_bool("LOG_JSON", False),
                     log_file=None,
                 )
-                fetch_ok = True
+
                 fetch_created = fetch_updated = 0
                 try:
                     result = fetch_invoices_once(build_fetch_invoices_config(fetch_args))
@@ -396,52 +429,92 @@ class AutomationManager:
                         )
                 except Exception as e:
                     logger.error(f"DC fetch failed: {e}", exc_info=True)
-                    fetch_ok = False
                     self._log_to_dashboard(f"=== AUTO: FETCH DCs FAILED: {e} ===")
 
-                # --- Sync pending DCs immediately after fetch ---
-                sync_args = SimpleNamespace(
-                    config=cfg.resolve_env_path(ROOT_DIR),
-                    db_path=cfg.get_env("TALLY_DB_PATH"),
-                    api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
-                    api_key=cfg.get_env("CATALYTICS_API_KEY"),
-                    entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
-                    company=cfg.get_env("TALLY_COMPANY"),
-                    batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
-                    limit=cfg.get_env_int("SYNC_LIMIT", 200),
-                    max_attempts=cfg.get_env_int("SYNC_MAX_ATTEMPTS", 5),
-                    allow_tally_fetch=cfg.get_env_bool("SYNC_ALLOW_TALLY_FETCH", False),
-                    dry_run=cfg.get_env_bool("SYNC_DRY_RUN", False),
-                    log_level=cfg.get_env("LOG_LEVEL", "INFO"),
-                    log_json=cfg.get_env_bool("LOG_JSON", False),
-                    log_file=None,
-                )
-                try:
-                    sync_once(build_sync_config(sync_args))
-                except Exception as e:
-                    logger.error(f"DC sync failed: {e}")
-
-                with self.lock:
-                    self.state['last_runs'][task] = datetime.now().isoformat()
-                    self._save_state()
-
+                self._mark_task_complete(task)
                 consecutive_errors = 0
-                self.stop_flags[task].wait(timeout=interval)
+
+                if not self._wait_for_next_run(task):
+                    return
 
             except Exception as e:
                 consecutive_errors += 1
                 backoff = min(30 * consecutive_errors, 120)
                 logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
                 self._log_to_dashboard(f"=== AUTO: FETCH DCs ERROR: {e} (retry in {backoff}s) ===")
-                self.stop_flags[task].wait(timeout=backoff)
+                if self.stop_flags[task].wait(timeout=backoff):
+                    return
+
+    def _sync_loop(self):
+        """Sync products, customers, and delivery challans on the sync schedule."""
+        from sync_catalytics import build_config as build_dc_sync_config, run_once as sync_dc_once
+        from sync_customers import build_config as build_customer_sync_config, run_once as sync_customers_once
+        from sync_products import build_config as build_product_sync_config, run_once as sync_products_once
+
+        task = 'sync'
+        consecutive_errors = 0
+
+        if not self._wait_for_initial_master(task):
+            return
+
+        logger.info("%s: Master data ready - starting sync loop", task)
+
+        while not self.stop_flags[task].is_set():
+            try:
+                self._prepare_task_run(task)
+                logger.info("Running %s...", task)
+                self._log_to_dashboard("=== AUTO: SYNC STARTED ===")
+
+                product_stats = {'sent': 0, 'ok': 0, 'failed': 0}
+                customer_stats = {'sent': 0, 'ok': 0, 'failed': 0}
+                dc_stats = {'sent': 0, 'ok': 0, 'failed': 0}
+
+                master_sync_args = self._build_master_sync_args()
+                try:
+                    product_stats = sync_products_once(build_product_sync_config(master_sync_args))
+                except Exception as e:
+                    logger.error(f"Product sync failed: {e}", exc_info=True)
+
+                try:
+                    customer_stats = sync_customers_once(build_customer_sync_config(master_sync_args))
+                except Exception as e:
+                    logger.error(f"Customer sync failed: {e}", exc_info=True)
+
+                dc_sync_args = self._build_dc_sync_args()
+                try:
+                    dc_stats = sync_dc_once(build_dc_sync_config(dc_sync_args))
+                except Exception as e:
+                    logger.error(f"DC sync failed: {e}", exc_info=True)
+
+                self._log_to_dashboard(
+                    "=== AUTO: SYNC COMPLETED "
+                    f"(products ok={product_stats.get('ok', 0)} failed={product_stats.get('failed', 0)} | "
+                    f"customers ok={customer_stats.get('ok', 0)} failed={customer_stats.get('failed', 0)} | "
+                    f"dcs ok={dc_stats.get('ok', 0)} failed={dc_stats.get('failed', 0)}) ==="
+                )
+
+                self._mark_task_complete(task)
+                consecutive_errors = 0
+
+                if not self._wait_for_next_run(task):
+                    return
+
+            except Exception as e:
+                consecutive_errors += 1
+                backoff = min(30 * consecutive_errors, 120)
+                logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
+                self._log_to_dashboard(f"=== AUTO: SYNC ERROR: {e} (retry in {backoff}s) ===")
+                if self.stop_flags[task].wait(timeout=backoff):
+                    return
 
 
-# Global automation manager instance
 _manager = None
 
+
 def get_manager():
-    """Get or create the global automation manager instance"""
+    """Get or create the global automation manager instance."""
     global _manager
     if _manager is None:
         _manager = AutomationManager()
     return _manager
+

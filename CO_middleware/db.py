@@ -1,5 +1,6 @@
-﻿import hashlib
+import hashlib
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
@@ -233,9 +234,105 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_master_tables_conn(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    prod_cols = {row[1] for row in cur.execute("PRAGMA table_info(products)").fetchall()}
+    if 'name_canonical' not in prod_cols:
+        cur.execute("ALTER TABLE products ADD COLUMN name_canonical TEXT")
+    cust_cols = {row[1] for row in cur.execute("PRAGMA table_info(customers)").fetchall()}
+    if 'delivery_addresses_json' not in cust_cols:
+        cur.execute("ALTER TABLE customers ADD COLUMN delivery_addresses_json TEXT")
+    conn.commit()
+
+
+def ensure_master_data_tables(conn: sqlite3.Connection) -> None:
+    """Create the customers/products schema in the target SQLite DB."""
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tally_guid TEXT,
+            name TEXT UNIQUE NOT NULL,
+            tally_company TEXT NOT NULL,
+            gstin TEXT,
+            pan TEXT,
+            address TEXT,
+            state TEXT,
+            city TEXT,
+            pincode TEXT,
+            phone TEXT,
+            email TEXT,
+            delivery_addresses_json TEXT,
+            data_json TEXT,
+            sync_request_json TEXT,
+            last_response_json TEXT,
+            first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_synced INTEGER DEFAULT 0,
+            catalytics_id INTEGER,
+            sync_attempts INTEGER DEFAULT 0,
+            last_sync_error TEXT,
+            last_sync_at TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tally_guid TEXT,
+            name TEXT NOT NULL,
+            name_canonical TEXT UNIQUE NOT NULL,
+            tally_company TEXT NOT NULL,
+            hsn_code TEXT,
+            unit TEXT,
+            rate REAL,
+            description TEXT,
+            data_json TEXT,
+            product_master_name TEXT,
+            variant_name TEXT,
+            unit_name TEXT,
+            product_type_code TEXT,
+            product_type_name TEXT,
+            gst_applicable TEXT,
+            gst_rate REAL,
+            igst_rate REAL,
+            cgst_rate REAL,
+            sgst_rate REAL,
+            sync_request_json TEXT,
+            last_response_json TEXT,
+            first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_synced INTEGER DEFAULT 0,
+            catalytics_id INTEGER,
+            sync_attempts INTEGER DEFAULT 0,
+            last_sync_error TEXT,
+            last_sync_at TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS duplicate_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_name TEXT NOT NULL,
+            tally_company TEXT NOT NULL,
+            owned_by_company TEXT NOT NULL,
+            logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            details TEXT
+        )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_products_name ON products(name_canonical)")
+    conn.commit()
+    _migrate_master_tables_conn(conn)
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     migrate_db(conn)
+    ensure_master_data_tables(conn)
 
 
 def ensure_company(
@@ -397,7 +494,16 @@ def _safe_float(value: Any) -> Optional[float]:
     try:
         return float(value)
     except (TypeError, ValueError):
-        return None
+        text_value = str(value or '').replace(',', '').strip()
+        if not text_value:
+            return None
+        match = re.search(r'-?\d+(?:\.\d+)?', text_value)
+        if not match:
+            return None
+        try:
+            return float(match.group(0))
+        except (TypeError, ValueError):
+            return None
 
 
 def mark_records_deleted(
@@ -672,98 +778,11 @@ class Database:
         return cursor.fetchall()
 
     def _create_tables(self):
-        cur = self.conn.cursor()
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS customers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tally_guid TEXT,
-                name TEXT UNIQUE NOT NULL,
-                tally_company TEXT NOT NULL,
-                gstin TEXT,
-                pan TEXT,
-                address TEXT,
-                state TEXT,
-                city TEXT,
-                pincode TEXT,
-                phone TEXT,
-                email TEXT,
-                data_json TEXT,
-                sync_request_json TEXT,
-                last_response_json TEXT,
-                first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_synced INTEGER DEFAULT 0,
-                catalytics_id INTEGER,
-                sync_attempts INTEGER DEFAULT 0,
-                last_sync_error TEXT,
-                last_sync_at TIMESTAMP
-            )
-        """)
-
-        # name_canonical is the UNIQUE key â€” handles spacing variations like "1.5CUM" vs "1.5 CUM"
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tally_guid TEXT,
-                name TEXT NOT NULL,
-                name_canonical TEXT UNIQUE NOT NULL,
-                tally_company TEXT NOT NULL,
-                hsn_code TEXT,
-                unit TEXT,
-                rate REAL,
-                description TEXT,
-                data_json TEXT,
-                product_master_name TEXT,
-                variant_name TEXT,
-                unit_name TEXT,
-                product_type_code TEXT,
-                product_type_name TEXT,
-                gst_applicable TEXT,
-                gst_rate REAL,
-                igst_rate REAL,
-                cgst_rate REAL,
-                sgst_rate REAL,
-                sync_request_json TEXT,
-                last_response_json TEXT,
-                first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_synced INTEGER DEFAULT 0,
-                catalytics_id INTEGER,
-                sync_attempts INTEGER DEFAULT 0,
-                last_sync_error TEXT,
-                last_sync_at TIMESTAMP
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS duplicate_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entity_type TEXT NOT NULL,
-                entity_name TEXT NOT NULL,
-                tally_company TEXT NOT NULL,
-                owned_by_company TEXT NOT NULL,
-                logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                details TEXT
-            )
-        """)
-
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_products_name ON products(name_canonical)")
-
-        self.conn.commit()
-        self._migrate_master_tables()
+        ensure_master_data_tables(self.conn)
 
     def _migrate_master_tables(self):
-        """Add missing columns to existing tables when upgrading schema."""
-        cur = self.conn.cursor()
-        prod_cols = {row[1] for row in cur.execute("PRAGMA table_info(products)").fetchall()}
-        if 'name_canonical' not in prod_cols:
-            cur.execute("ALTER TABLE products ADD COLUMN name_canonical TEXT")
-        cust_cols = {row[1] for row in cur.execute("PRAGMA table_info(customers)").fetchall()}
-        if 'delivery_addresses_json' not in cust_cols:
-            cur.execute("ALTER TABLE customers ADD COLUMN delivery_addresses_json TEXT")
-        self.conn.commit()
+        """Backward-compatible wrapper for master table migrations."""
+        _migrate_master_tables_conn(self.conn)
 
     # ========================================================================
     # CUSTOMER OPERATIONS

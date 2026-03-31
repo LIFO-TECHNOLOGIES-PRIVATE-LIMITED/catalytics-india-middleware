@@ -27,6 +27,63 @@ def load_env_file(path: Optional[str]) -> None:
             os.environ[key] = value
 
 
+def _default_local_data_root() -> Path:
+    for key in ('LOCALAPPDATA', 'APPDATA'):
+        value = os.environ.get(key)
+        if value:
+            return Path(value)
+    return Path.home() / 'AppData' / 'Local'
+
+
+def _can_write_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f'.write_test_{os.getpid()}'
+        with open(probe, 'w', encoding='utf-8') as handle:
+            handle.write('ok')
+        try:
+            probe.unlink()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def get_runtime_data_dir() -> Path:
+    override = os.environ.get('TALLY_RUNTIME_DIR')
+    if override:
+        path = Path(override).expanduser()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return path
+
+    if not getattr(sys, 'frozen', False):
+        return Path(__file__).parent
+
+    exe_dir = Path(sys.executable).parent
+    if _can_write_dir(exe_dir):
+        return exe_dir
+
+    app_name = Path(sys.executable).stem or 'co_middleware_dashboard'
+    fallback = _default_local_data_root() / app_name
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return fallback
+
+
+def get_runtime_asset_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            return Path(meipass)
+    return Path(__file__).parent
+
+
 def resolve_env_path(default_dir: str) -> str:
     default_env = os.path.join(default_dir, ".env")
 
@@ -34,29 +91,28 @@ def resolve_env_path(default_dir: str) -> str:
     if not getattr(sys, 'frozen', False) and os.path.exists(default_env):
         return default_env
 
-    # For packaged EXEs, prefer the EXE-local .env next to the binary.
+    # Packaged EXEs must prefer the .env beside the EXE so each released build
+    # remains self-contained even if an older global TALLY_ENV_PATH still exists.
     if getattr(sys, 'frozen', False):
-        exe_dir = os.path.dirname(sys.executable)
-        exe_env = os.path.join(exe_dir, ".env")
-        if os.path.exists(exe_env):
-            return exe_env
+        exe_env = Path(sys.executable).with_name('.env')
+        if exe_env.exists():
+            return str(exe_env)
 
-    # External override is still available when no local .env exists.
+    # External override is still supported when no EXE-local .env exists.
     env_override = os.environ.get("TALLY_ENV_PATH")
     if env_override:
         return env_override
 
-    # Then try current working directory
+    # Packaged EXEs fall back to the writable runtime data directory for first launch.
+    if getattr(sys, 'frozen', False):
+        return str(get_runtime_data_dir() / '.env')
+
+    # Then try current working directory for non-frozen runs.
     cwd_env = os.path.join(os.getcwd(), ".env")
     if os.path.exists(cwd_env):
         return cwd_env
 
-    # Final fallback: EXE dir (frozen) or default_dir
-    if getattr(sys, 'frozen', False):
-        return os.path.join(os.path.dirname(sys.executable), ".env")
     return default_env
-
-
 def _safe_db_name(value: Optional[str]) -> str:
     name = (value or "tally_dc").strip()
     if not name:
@@ -103,14 +159,46 @@ def _normalize_tally_db_path(raw: Optional[str]) -> str:
 
 def _normalize_sqlite_db_path(raw: Optional[str]) -> str:
     value = raw or "chennai.sqlite"
+
+    company_name = os.getenv("TALLY_COMPANY") or os.getenv("ENTITY_NAME") or "chennai"
+    safe_name = _safe_db_name(company_name) + ".sqlite"
+
+    raw_str = str(value)
+    ends_with_sep = raw_str.endswith("/") or raw_str.endswith("\\")
+
     p = Path(value)
     if not p.is_absolute():
         p = get_path_base_dir() / value
+
+    try:
+        if ends_with_sep or (p.exists() and p.is_dir()):
+            p = p / safe_name
+    except Exception:
+        if ends_with_sep:
+            p = p / safe_name
+
+    if p.suffix == "":
+        p = p / safe_name
+
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.touch()
     except Exception:
         pass
     return str(p)
+
+
+def _normalize_log_path(raw: Optional[str]) -> str:
+    value = raw or 'logs/app.log'
+    path = Path(value)
+    if not path.is_absolute():
+        path = BASE_DIR / value
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return str(path)
 
 
 def _get_master_db_env_value() -> str:
@@ -127,6 +215,11 @@ def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
         return default
     if name == "TALLY_DB_PATH":
         normalized = _normalize_tally_db_path(value)
+        if normalized:
+            os.environ[name] = normalized
+        return normalized
+    if name == "LOG_FILE":
+        normalized = _normalize_log_path(value)
         if normalized:
             os.environ[name] = normalized
         return normalized
@@ -150,10 +243,7 @@ def get_env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-if getattr(sys, 'frozen', False):
-    BASE_DIR = Path(sys.executable).parent
-else:
-    BASE_DIR = Path(__file__).parent
+BASE_DIR = get_runtime_data_dir()
 
 
 def get_env_path() -> Path:
@@ -161,23 +251,85 @@ def get_env_path() -> Path:
 
 
 def get_path_base_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        return BASE_DIR
     env_path = get_env_path()
     return env_path.parent if env_path else BASE_DIR
 
 
-_env_example_path = BASE_DIR / '.env.example'
+_FALLBACK_ENV_TEMPLATE = """# Auto-generated default middleware configuration
+ENTITY_NAME=Chennai Oxygen
+ENTITY_ID=1
+DEFAULT_FILLING_STATION=
+DEFAULT_FILLING_STATION_ID=
+CATALYTICS_API_BASE_URL=http://localhost:8000/
+CATALYTICS_API_KEY=
+TALLY_URL=http://localhost:9000/
+TALLY_COMPANY=COMPANY NAME 1
+TALLY_DB_PATH=tally_dc.sqlite
+TALLY_REQUEST_COOLDOWN=10.0
+TALLY_COMPANY_1=COMPANY NAME 1
+TALLY_COMPANY_2=
+TALLY_COMPANY_3=
+TALLY_COMPANY_4=
+TALLY_COMPANY_ACTIVE=COMPANY_1
+PRODUCT_TYPE_MAP=CYL:CYLINDER,PLT:PALLET,TNK:TANK,CON:CONTAINER
+PRODUCT_EXACT_KEYWORDS=
+TALLY_FETCH_STOCK=false
+TALLY_DAYS_BACK=0
+DC_REFERENCE_KEYWORDS=delivery,customer pickup,supplier,traders
+SYNC_INVOICES_INTERVAL_SECONDS=120
+FETCH_MASTER_INTERVAL_MINUTES=30
+FETCH_INVOICES_INTERVAL_SECONDS=120
+SYNC_BATCH_SIZE=50
+SYNC_LIMIT=200
+SYNC_MAX_ATTEMPTS=5
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=catalytics
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=
+LOG_LEVEL=INFO
+LOG_FILE=logs/app.log
+LOG_JSON=false
+WEB_UI_HOST=0.0.0.0
+WEB_UI_PORT=8787
+AUTO_OPEN_DASHBOARD=true
+AUTO_START_AUTOMATION=false
+DASHBOARD_DEBUG=false
+AUTO_REGISTER_WINDOWS_STARTUP=true
+WINDOWS_STARTUP_APP_NAME=ChennaiOxygenMiddlewareDashboard
+"""
 
-# Create .env from template if missing
-_env_path = get_env_path()
-if not _env_path.exists() and _env_example_path.exists():
+
+def ensure_env_file_exists() -> Path:
+    env_path = get_env_path()
+    if env_path.exists():
+        return env_path
+
+    template_candidates = (
+        get_runtime_asset_dir() / '.env.example',
+        BASE_DIR / '.env.example',
+    )
+
     try:
-        _env_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(_env_example_path, _env_path)
-        print(f"[INFO] Created .env from template at: {_env_path}")
-    except Exception as exc:
-        print(f"[WARNING] Could not create .env from .env.example: {exc}")
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        for candidate in template_candidates:
+            if candidate.exists():
+                shutil.copyfile(candidate, env_path)
+                print(f"[INFO] Created .env from template at: {env_path}")
+                return env_path
 
-load_env_file(str(get_env_path()))
+        env_path.write_text(_FALLBACK_ENV_TEMPLATE, encoding='utf-8')
+        print(f"[INFO] Created .env from built-in defaults at: {env_path}")
+    except Exception as exc:
+        print(f"[WARNING] Could not create .env automatically: {exc}")
+
+    return env_path
+
+
+_env_path = ensure_env_file_exists()
+load_env_file(str(_env_path))
 
 if os.environ.get("TALLY_DB_PATH"):
     os.environ["TALLY_DB_PATH"] = _normalize_tally_db_path(os.environ.get("TALLY_DB_PATH"))
@@ -258,6 +410,7 @@ class Config:
         cls.CUSTOMER_SYNC_WORKERS = int(os.getenv('CUSTOMER_SYNC_WORKERS', '5'))
         cls.DEFAULT_FILLING_STATION = os.getenv('DEFAULT_FILLING_STATION', '')
         cls.DEFAULT_FILLING_STATION_ID = os.getenv('DEFAULT_FILLING_STATION_ID', '')
+        cls.LOG_FILE = _normalize_log_path(os.getenv('LOG_FILE', 'logs/app.log'))
         cls.SQLITE_DB_PATH = _normalize_sqlite_db_path(_get_master_db_env_value())
         cls.TALLY_DB_PATH = _normalize_tally_db_path(os.getenv('TALLY_DB_PATH', ''))
         return cls.INVOICE_FETCH_START_DATE
@@ -288,7 +441,7 @@ class Config:
 
     # Logging
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-    LOG_FILE = str(BASE_DIR / os.getenv('LOG_FILE', 'logs/app.log'))
+    LOG_FILE = _normalize_log_path(os.getenv('LOG_FILE', 'logs/app.log'))
     LOG_MAX_BYTES = int(os.getenv('LOG_MAX_BYTES', '10485760'))
     LOG_BACKUP_COUNT = int(os.getenv('LOG_BACKUP_COUNT', '5'))
 
@@ -300,6 +453,10 @@ class Config:
         if ':' in _pair:
             _code, _full = _pair.split(':', 1)
             PRODUCT_TYPE_MAP[_code.strip().upper()] = _full.strip()
+    SPECIAL_PRODUCT_TYPE_MAP = {
+        'LPG': 'LPG',
+        'VAPARIZER': 'Vaparizer',
+    }
 
     # Exact-keyword product fetch: stock items whose names contain any of these
     # words (case-insensitive) are saved as-is, without requiring a type code.
@@ -310,7 +467,8 @@ class Config:
     ]
 
     # Web UI
-    WEB_UI_HOST = os.getenv('WEB_UI_HOST', 'localhost')
+    _default_web_ui_host = '0.0.0.0' if getattr(sys, 'frozen', False) else 'localhost'
+    WEB_UI_HOST = os.getenv('WEB_UI_HOST', _default_web_ui_host)
     WEB_UI_PORT = int(os.getenv('WEB_UI_PORT', '8787'))
 
     @classmethod
@@ -333,12 +491,18 @@ class Config:
         return None
 
     @classmethod
+    def get_product_type_map(cls):
+        product_type_map = dict(cls.PRODUCT_TYPE_MAP)
+        product_type_map.update(cls.SPECIAL_PRODUCT_TYPE_MAP)
+        return product_type_map
+
+    @classmethod
     def get_product_type_codes(cls):
-        return list(cls.PRODUCT_TYPE_MAP.keys())
+        return list(cls.get_product_type_map().keys())
 
     @classmethod
     def get_product_type_name(cls, code):
-        return cls.PRODUCT_TYPE_MAP.get(code.strip().upper(), None)
+        return cls.get_product_type_map().get(code.strip().upper(), None)
 
 
 config = Config()

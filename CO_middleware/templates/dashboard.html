@@ -2831,7 +2831,7 @@
                         } else if (cr.count_matched === 0 && cr.count_no_type > 0) {
                             html += `<div style="background:#fef3c7;border-radius:8px;padding:12px;color:#92400e;font-size:13px;">
                                  Tally returned ${cr.total_from_tally} items but <strong>NONE matched the product type map</strong>.<br>
-                                Check that your <code>PRODUCT_TYPE_MAP</code> codes match the suffixes in the product names below.
+                                Check that your <code>PRODUCT_TYPE_MAP</code> codes match the suffixes below; LPG-prefixed products and Vaparizer-mentioned products are handled separately as special types.
                             </div>`;
                         }
 

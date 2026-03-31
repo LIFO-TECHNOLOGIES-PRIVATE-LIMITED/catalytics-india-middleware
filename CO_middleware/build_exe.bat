@@ -34,6 +34,7 @@ py -m PyInstaller ^
     --distpath "%PYI_DIST_DIR%" ^
     --workpath "%PYI_BUILD_DIR%" ^
     --add-data "templates;templates" ^
+    --add-data ".env.example;." ^
     --collect-all psycopg2 ^
     --hidden-import config ^
     --hidden-import db ^
@@ -58,9 +59,10 @@ if errorlevel 1 (
 echo [4/4] Build complete.
 echo EXE generated at: "%PYI_DIST_DIR%\co_middleware_dashboard.exe"
 echo.
-echo Place these next to the EXE on client machine:
-echo   - .env
-echo   - SQLite DB file (optional, auto-created if missing)
-echo   - logs\ folder (optional, auto-created if missing)
+echo First launch behavior:
+echo   - .env is auto-created from bundled defaults if missing
+echo   - SQLite DB file(s) and tables are auto-created if missing
+echo   - logs\ folder and standard log files are auto-created if missing
+echo You can still place a custom .env next to the EXE before launch.
 
 endlocal
