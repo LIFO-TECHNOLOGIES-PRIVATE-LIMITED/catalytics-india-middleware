@@ -432,7 +432,10 @@ def api_status():
                 if config.TALLY_COMPANIES.get(key)
             },
             'sync_batch_size': cfg.get_env_int("SYNC_BATCH_SIZE", 10),
-            'invoice_fetch_start_date': cfg.get_env("TALLY_FROM_DATE", "Today"),
+            'invoice_fetch_start_date': (
+                cfg.get_env("TALLY_FROM_DATE")
+                or 'Dynamic: yesterday to tomorrow'
+            ),
             'product_type_map': config.get_product_type_map()
         },
         'automation': automation_status
@@ -811,8 +814,18 @@ def trigger_fetch_master():
 
         dashboard_logger.write_log("=== MANUAL: FETCH MASTER DATA STARTED ===")
 
-        cust_stats = fetch_customers_from_all_companies()
-        prod_stats = fetch_products_from_all_companies()
+        prod_stats = {'new_saved': 0, 'updated': 0}
+        cust_stats = {'new_saved': 0, 'updated': 0}
+
+        if cfg.get_env_bool("AUTO_FETCH_PRODUCTS", False):
+            prod_stats = fetch_products_from_all_companies()
+        else:
+            dashboard_logger.write_log("Product fetch skipped (AUTO_FETCH_PRODUCTS=false)")
+
+        if cfg.get_env_bool("AUTO_FETCH_CUSTOMERS", False):
+            cust_stats = fetch_customers_from_all_companies()
+        else:
+            dashboard_logger.write_log("Customer fetch skipped (AUTO_FETCH_CUSTOMERS=false)")
 
         dashboard_logger.write_log("=== MANUAL: FETCH MASTER DATA COMPLETED ===")
 
@@ -832,6 +845,8 @@ def trigger_fetch_master():
 @app.route('/api/trigger/fetch_customers', methods=['POST'])
 def trigger_fetch_customers():
     """Manually trigger customer fetch from Tally"""
+    if not cfg.get_env_bool("AUTO_FETCH_CUSTOMERS", False):
+        return jsonify({'success': False, 'error': 'Customer fetch is disabled (AUTO_FETCH_CUSTOMERS=false)'}), 400
     try:
         from fetch_customers import fetch_customers_from_all_companies
 
@@ -870,6 +885,8 @@ def trigger_fetch_customers():
 @app.route('/api/trigger/fetch_products', methods=['POST'])
 def trigger_fetch_products():
     """Manually trigger product fetch from Tally"""
+    if not cfg.get_env_bool("AUTO_FETCH_PRODUCTS", False):
+        return jsonify({'success': False, 'error': 'Product fetch is disabled (AUTO_FETCH_PRODUCTS=false)'}), 400
     try:
         from fetch_products import fetch_products_from_all_companies
 
@@ -944,17 +961,31 @@ def trigger_sync():
             log_file=None
         )
         
-        # Sync DCs
+        # Sync products first, then customers, then DCs
+        master_args = SimpleNamespace(
+            config=cfg.resolve_env_path(ROOT_DIR),
+            db_path=None,
+            api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
+            api_key=cfg.get_env("CATALYTICS_API_KEY"),
+            entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
+            company=cfg.get_env("TALLY_COMPANY"),
+            batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
+            limit=cfg.get_env_int("SYNC_LIMIT", 200),
+            max_attempts=cfg.get_env_int("SYNC_MAX_ATTEMPTS", 5),
+            dry_run=cfg.get_env_bool("SYNC_DRY_RUN", False),
+            log_level=cfg.get_env("LOG_LEVEL", "INFO"),
+            log_json=False,
+            log_file=None
+        )
+
+        prod_config = build_prod_config(master_args)
+        prod_stats = sync_prod(prod_config)
+
+        cust_config = build_cust_config(master_args)
+        cust_stats = sync_cust(cust_config)
+
         dc_config = build_dc_config(args)
         dc_stats = sync_dc(dc_config)
-        
-        # Sync customers
-        cust_config = build_cust_config(args)
-        cust_stats = sync_cust(cust_config)
-        
-        # Sync products
-        prod_config = build_prod_config(args)
-        prod_stats = sync_prod(prod_config)
         
         dashboard_logger.write_log(f"=== MANUAL: SYNC TO CATALYTICS COMPLETED ===")
         
@@ -979,12 +1010,12 @@ def trigger_sync_customers():
     try:
         from sync_customers import build_config, run_once
         from types import SimpleNamespace
-        
+
         dashboard_logger.write_log("=== MANUAL: SYNC CUSTOMERS STARTED ===")
-        
+
         args = SimpleNamespace(
             config=cfg.resolve_env_path(ROOT_DIR),
-            db_path=cfg.get_env("TALLY_DB_PATH"),
+            db_path=None,
             api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
             api_key=cfg.get_env("CATALYTICS_API_KEY"),
             entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
@@ -1033,12 +1064,12 @@ def trigger_sync_products():
     try:
         from sync_products import build_config, run_once
         from types import SimpleNamespace
-        
+
         dashboard_logger.write_log("=== MANUAL: SYNC PRODUCTS STARTED ===")
-        
+
         args = SimpleNamespace(
             config=cfg.resolve_env_path(ROOT_DIR),
-            db_path=cfg.get_env("TALLY_DB_PATH"),
+            db_path=None,
             api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
             api_key=cfg.get_env("CATALYTICS_API_KEY"),
             entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),

@@ -103,7 +103,6 @@ def _fetch_unsynced(
         LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
         WHERE COALESCE(ss.is_synced, 0) = 0
           AND COALESCE(ss.attempts, 0) < ?
-          AND COALESCE(dn.is_deleted, 0) = 0
           {where_company}
         ORDER BY dn.updated_at ASC
         LIMIT ?
@@ -171,6 +170,38 @@ def _get_default_fill_station_id() -> str:
         return explicit
     fallback = os.getenv("DEFAULT_FILLING_STATION", "").strip()
     return fallback if fallback.isdigit() else ""
+
+
+# Cache: fill station ID -> station name from backend
+_FILL_STATION_NAME_CACHE: Dict[str, str] = {}
+
+
+def _resolve_fill_station_name_by_id(
+    api_base_url: str,
+    entity_id: Optional[int],
+    station_id: str,
+) -> str:
+    """Look up a fill station's name from the backend by its ID.
+
+    The backend's DC payload handler reads GODOWNNAME and passes it to
+    _get_or_create_filling_station(godown_name) which matches by *name*.
+    So we must send the station name, not its numeric ID.
+    """
+    if not station_id:
+        return ""
+    if station_id in _FILL_STATION_NAME_CACHE:
+        return _FILL_STATION_NAME_CACHE[station_id]
+
+    stations = _get_entity_fill_stations(api_base_url, entity_id)
+    for station in stations:
+        sid = str(station.get("id") or "").strip()
+        if sid == station_id:
+            name = str(station.get("name") or "").strip()
+            _FILL_STATION_NAME_CACHE[station_id] = name
+            return name
+
+    _FILL_STATION_NAME_CACHE[station_id] = ""
+    return ""
 
 
 def _extract_payload_fill_station_name(
@@ -276,14 +307,25 @@ def _apply_default_fill_station(
     else:
         voucher.pop("FILLINGSTATIONID", None)
 
-    for key in ("GODOWNNAME", "LOCATIONNAME", "FILLINGSTATIONNAME", "LOCATION", "GODOWN"):
-        voucher.pop(key, None)
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key in ("GODOWNNAME", "LOCATIONNAME", "LOCATION", "GODOWN"):
-            item.pop(key, None)
+    # The backend reads GODOWNNAME from inventory items to resolve fill station.
+    # Set it on both voucher and items so the backend can find the station.
+    godown_value = default_value or default_id
+    if godown_value:
+        voucher["GODOWNNAME"] = godown_value
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item["GODOWNNAME"] = godown_value
+            for key in ("LOCATIONNAME", "LOCATION", "GODOWN"):
+                item.pop(key, None)
+    else:
+        for key in ("GODOWNNAME", "LOCATIONNAME", "FILLINGSTATIONNAME", "LOCATION", "GODOWN"):
+            voucher.pop(key, None)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for key in ("GODOWNNAME", "LOCATIONNAME", "LOCATION", "GODOWN"):
+                item.pop(key, None)
 
 
 def _apply_matched_fill_station(
@@ -321,6 +363,14 @@ def _resolve_fill_station_payload(
     station_name = _extract_payload_fill_station_name(voucher, items)
     default_value = _get_default_fill_station_value()
     default_id = _get_default_fill_station_id()
+
+    # When default_value is a numeric ID (e.g. "23"), resolve it to the
+    # actual station name from the backend.  The backend's payload handler
+    # reads GODOWNNAME and matches by *name*, not by ID.
+    if default_id and (not default_value or default_value == default_id):
+        resolved_name = _resolve_fill_station_name_by_id(api_base_url, entity_id, default_id)
+        if resolved_name:
+            default_value = resolved_name
 
     if not station_name or station_name.lower() in _TALLY_DEFAULT_GODOWNS_SET:
         if default_value or default_id:
@@ -773,36 +823,6 @@ def _update_sync_status(
     )
 
 
-def _fetch_deleted_unsynced(
-    conn,
-    *,
-    company_id: Optional[int],
-    limit: int,
-    max_attempts: int,
-) -> List[Dict[str, Any]]:
-    """Fetch delivery notes that are deleted but not yet synced to Catalytics."""
-    params: List[Any] = [max_attempts]
-    where_company = ""
-    if company_id:
-        where_company = "AND dn.company_id = ?"
-        params.append(company_id)
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT dn.*, ss.is_synced, ss.attempts, ss.payload_hash
-        FROM delivery_notes dn
-        LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
-        WHERE COALESCE(dn.is_deleted, 0) = 1
-          AND COALESCE(ss.is_synced, 0) = 0
-          AND COALESCE(ss.attempts, 0) < ?
-          {where_company}
-        ORDER BY dn.updated_at ASC
-        LIMIT ?
-        """,
-        tuple(params),
-    ).fetchall()
-    return [dict(row) for row in rows]
-
 
 _TALLY_DEFAULT_GODOWNS_SET = {'main location', 'main godown', 'main', 'not applicable', 'n/a'}
 
@@ -836,7 +856,7 @@ def _lookup_dc_id_by_no(api_base_url: str, entity_id: Optional[int], dc_no: str)
 
 
 def _update_dc_fill_station(api_base_url: str, dc_id: int, fill_station_id: str) -> bool:
-    """POST /transaction/delivery_challan/<id> with fill_station to update."""
+    """Update fill_station on a DC via PATCH, PUT, or POST (tries in order)."""
     if not dc_id or not fill_station_id:
         return False
     try:
@@ -845,116 +865,27 @@ def _update_dc_fill_station(api_base_url: str, dc_id: int, fill_station_id: str)
         return False
     try:
         url = _server_base_url(api_base_url) + f"/transaction/delivery_challan/{dc_id}"
-        resp = requests.post(url, json={"id": dc_id, "fill_station": fs_int},
-                             headers={"Content-Type": "application/json"}, timeout=15)
-        if resp.status_code in (200, 201):
-            logger.info("Fill station updated: DC server_id=%s fill_station=%s", dc_id, fs_int)
-            return True
-        logger.warning("Fill station update HTTP %s for DC server_id=%s: %s",
-                       resp.status_code, dc_id, resp.text[:200])
+        payload = {"id": dc_id, "fill_station": fs_int}
+        headers = {"Content-Type": "application/json"}
+
+        # Try PATCH first (partial update), then PUT, then POST
+        for method in (requests.patch, requests.put, requests.post):
+            resp = method(url, json=payload, headers=headers, timeout=15)
+            if resp.status_code in (200, 201):
+                logger.info("Fill station updated: DC server_id=%s fill_station=%s (via %s)", dc_id, fs_int, method.__name__.upper())
+                return True
+            if resp.status_code == 405:
+                # Method not allowed — try next
+                continue
+            logger.warning("Fill station update %s HTTP %s for DC server_id=%s: %s",
+                           method.__name__.upper(), resp.status_code, dc_id, resp.text[:300])
+            return False
+
+        logger.warning("Fill station update: all HTTP methods failed for DC server_id=%s", dc_id)
     except Exception as exc:
         logger.warning("Fill station update failed for DC server_id=%s: %s", dc_id, exc)
     return False
 
-
-def _sync_deleted_dcs(
-    conn,
-    *,
-    config: "SyncConfig",
-    company_id: Optional[int],
-    company_name: Optional[str],
-) -> Dict[str, int]:
-    """Sync deleted DC records to Catalytics delete endpoint."""
-    deleted_notes = _fetch_deleted_unsynced(
-        conn,
-        company_id=company_id,
-        limit=config.limit,
-        max_attempts=config.max_attempts,
-    )
-    if not deleted_notes:
-        return {"sent": 0, "ok": 0, "failed": 0}
-
-    endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-delete/"
-    # Payload endpoints use AllowAny permission â€" no auth header needed
-    headers = {"Content-Type": "application/json"}
-
-    total_sent = 0
-    total_ok = 0
-    total_fail = 0
-
-    for i in range(0, len(deleted_notes), config.batch_size):
-        batch = deleted_notes[i : i + config.batch_size]
-        delete_items = []
-        for note in batch:
-            dc_no = note.get("dc_no") or ""
-            delete_items.append({"dc_no": dc_no})
-
-        batch_payload: Dict[str, Any] = {"delete_dcs": delete_items}
-        if config.entity_id:
-            batch_payload["entity_id"] = config.entity_id
-        if company_name:
-            batch_payload["company_name"] = company_name
-
-        if config.dry_run:
-            logger.info("Dry-run: would delete %d DCs", len(delete_items))
-            continue
-
-        try:
-            resp = requests.post(endpoint, json=batch_payload, headers=headers, timeout=60)
-            total_sent += len(delete_items)
-        except Exception as exc:
-            logger.exception("Delete API request failed")
-            for note in batch:
-                _update_sync_status(
-                    conn,
-                    delivery_note_id=note["id"],
-                    success=False,
-                    payload_hash="DELETED",
-                    response_json=None,
-                    error_text=str(exc),
-                )
-            conn.commit()
-            total_fail += len(batch)
-            continue
-
-        response_json = None
-        try:
-            response_json = resp.json()
-        except Exception:
-            response_json = {"status": "error", "message": f"HTTP {resp.status_code} non-JSON"}
-
-        results = (response_json.get("data") or {}).get("results") or []
-        results_map = {
-            _norm_dc_no(r.get("dc_no")): r
-            for r in results
-            if isinstance(r, dict) and r.get("dc_no")
-        }
-
-        for note in batch:
-            dc_no = _norm_dc_no(note.get("dc_no"))
-            res = results_map.get(dc_no) if dc_no else None
-            status_val = (res or {}).get("status")
-            success = status_val in ("deleted", "skipped")
-            error_text = None
-            if not success:
-                error_text = (res or {}).get("message") or response_json.get("message") or "delete_sync_failed"
-            _update_sync_status(
-                conn,
-                delivery_note_id=note["id"],
-                success=success,
-                payload_hash="DELETED",
-                response_json=response_json,
-                error_text=error_text,
-            )
-            if success:
-                total_ok += 1
-            else:
-                total_fail += 1
-
-        conn.commit()
-
-    logger.info("DC delete sync complete. sent=%d ok=%d failed=%d", total_sent, total_ok, total_fail)
-    return {"sent": total_sent, "ok": total_ok, "failed": total_fail}
 
 
 def build_config(args: argparse.Namespace) -> SyncConfig:
@@ -1132,11 +1063,19 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 status_word = "created" if created else "updated"
 
                 resolved_dc_no = dc_no
+                _dc_server_id = None
                 results_list = (response_json.get("data") or {}).get("results") or []
                 if isinstance(results_list, list):
                     for entry in results_list:
-                        if isinstance(entry, dict) and entry.get("dc_no"):
-                            resolved_dc_no = str(entry.get("dc_no")).strip()
+                        if isinstance(entry, dict):
+                            if entry.get("dc_no"):
+                                resolved_dc_no = str(entry.get("dc_no")).strip()
+                            # Extract server-side DC id from response to avoid extra lookup
+                            if entry.get("id"):
+                                try:
+                                    _dc_server_id = int(entry["id"])
+                                except (ValueError, TypeError):
+                                    pass
                             break
                 if not resolved_dc_no:
                     resolved_dc_no = str(voucher.get("VOUCHERNUMBER") or "").strip() or dc_no
@@ -1145,25 +1084,18 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                                     payload_hash=payload_hash, response_json=response_json, error_text=None)
                 total_ok += 1
 
-                # Step 2: Update fill_station (same as arasan) when Tally godown is default/main
-                default_fs = _get_default_fill_station_value()
+                # Step 2: Always update fill_station after successful DC sync
                 default_fs_id = _get_default_fill_station_id()
-                voucher_fs = str(voucher.get("FILLINGSTATION") or "").strip()
-                _needs_fs_update = (
-                    default_fs_id
-                    and (
-                        not voucher_fs
-                        or voucher_fs.lower() in _TALLY_DEFAULT_GODOWNS_SET
-                        or voucher_fs == default_fs
-                        or voucher_fs == default_fs_id
-                    )
-                )
-                if _needs_fs_update:
-                    _dc_server_id = _lookup_dc_id_by_no(config.api_base_url, config.entity_id, resolved_dc_no or dc_no)
+                if default_fs_id:
+                    # Use server ID from response if available, otherwise look it up
+                    if not _dc_server_id:
+                        _dc_server_id = _lookup_dc_id_by_no(config.api_base_url, config.entity_id, resolved_dc_no or dc_no)
                     if _dc_server_id:
-                        _update_dc_fill_station(config.api_base_url, _dc_server_id, default_fs_id)
+                        fs_ok = _update_dc_fill_station(config.api_base_url, _dc_server_id, default_fs_id)
+                        if not fs_ok:
+                            logger.warning("Fill station update failed for DC #%s (server_id=%s, fill_station=%s)", resolved_dc_no or dc_no, _dc_server_id, default_fs_id)
                     else:
-                        logger.debug("Could not look up server DC id for fill_station update (dc_no=%s)", resolved_dc_no or dc_no)
+                        logger.warning("Could not determine server DC id for fill_station update (dc_no=%s)", resolved_dc_no or dc_no)
         else:
             error_msg = response_json.get("message") or f"HTTP {resp.status_code}"
             logger.error("Sync failed DC #%s: %s", dc_no, error_msg)
@@ -1180,21 +1112,10 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         total_fail,
     )
 
-    # --- Delete sync phase ---
-    delete_stats = _sync_deleted_dcs(
-        conn,
-        config=config,
-        company_id=company_id,
-        company_name=company_name,
-    )
-
     return {
         "sent": total_sent,
         "ok": total_ok,
         "failed": total_fail,
-        "delete_sent": delete_stats.get("sent", 0),
-        "delete_ok": delete_stats.get("ok", 0),
-        "delete_failed": delete_stats.get("failed", 0),
     }
 
 

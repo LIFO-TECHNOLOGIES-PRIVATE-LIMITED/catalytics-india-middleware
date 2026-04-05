@@ -145,58 +145,22 @@ def fetch_customers_from_all_companies():
 
                 guid = (ledger.get('GUID') or ledger.get('MASTERID') or ledger.get('REMOTEID') or '').strip()
 
-                # --- GUID-based lookup (takes priority over name) ---
-                existing_by_guid = db.customer_exists_by_guid(guid) if guid else None
-                if existing_by_guid:
-                    owner_company = existing_by_guid['tally_company']
-                    if owner_company == company_name:
-                        try:
-                            customer_data = _map_ledger_to_customer(ledger, company_name)
-                            db.update_customer(existing_by_guid['id'], customer_data)
-                            da_count = len(customer_data.get('delivery_addresses_json') and __import__('json').loads(customer_data['delivery_addresses_json']) or [])
-                            logger.info(
-                                f"[UPDATED by GUID] '{customer_name}' "
-                                f"(company: {company_name}, GUID: {guid}, "
-                                f"GSTIN: {customer_data.get('gstin') or 'N/A'}, "
-                                f"phone: {customer_data.get('phone') or 'N/A'}, "
-                                f"email: {customer_data.get('email') or 'N/A'}, "
-                                f"state: {customer_data.get('state') or 'N/A'}, "
-                                f"pincode: {customer_data.get('pincode') or 'N/A'}, "
-                                f"delivery_addresses: {da_count})"
-                            )
-                            overall_stats['updated'] += 1
-                        except Exception as e:
-                            logger.error(f"[ERROR] Failed to update customer '{customer_name}' by GUID: {e}", exc_info=True)
-                            overall_stats['errors'] += 1
-                    else:
-                        logger.warning(
-                            f"[DUPLICATE SKIPPED by GUID] '{customer_name}' "
-                            f"(GUID: {guid}, owned by {owner_company}, attempted by {company_name})"
-                        )
-                        db.log_duplicate(
-                            entity_type='customer',
-                            entity_name=customer_name,
-                            tally_company=company_name,
-                            owned_by_company=owner_company,
-                            details=f"GUID: {guid}, GSTIN: {ledger.get('GSTREGISTRATIONNUMBER', 'N/A')}",
-                        )
-                        overall_stats['duplicates_skipped'] += 1
-                    continue
-
-                # --- Name-based lookup (fallback) ---
+                # --- Name-based lookup (primary unique key) ---
                 existing = db.customer_exists(customer_name)
+                # GUID lookup only if name didn't match
+                if not existing and guid:
+                    existing = db.customer_exists_by_guid(guid)
 
                 if existing:
                     owner_company = existing['tally_company']
                     if owner_company == company_name:
-                        # Same company — update with fresh Tally data
                         try:
                             customer_data = _map_ledger_to_customer(ledger, company_name)
                             db.update_customer(existing['id'], customer_data)
                             da_count = len(customer_data.get('delivery_addresses_json') and __import__('json').loads(customer_data['delivery_addresses_json']) or [])
                             logger.info(
-                                f"[UPDATED by name] '{customer_name}' "
-                                f"(company: {company_name}, GUID: {customer_data.get('tally_guid') or 'N/A'}, "
+                                f"[UPDATED] '{customer_name}' "
+                                f"(company: {company_name}, GUID: {guid or 'N/A'}, "
                                 f"GSTIN: {customer_data.get('gstin') or 'N/A'}, "
                                 f"phone: {customer_data.get('phone') or 'N/A'}, "
                                 f"email: {customer_data.get('email') or 'N/A'}, "
@@ -209,7 +173,6 @@ def fetch_customers_from_all_companies():
                             logger.error(f"[ERROR] Failed to update customer '{customer_name}': {e}", exc_info=True)
                             overall_stats['errors'] += 1
                     else:
-                        # Different company — cross-company duplicate, skip
                         logger.warning(
                             f"[DUPLICATE SKIPPED] '{customer_name}' "
                             f"(owned by {owner_company}, attempted by {company_name})"
@@ -219,7 +182,7 @@ def fetch_customers_from_all_companies():
                             entity_name=customer_name,
                             tally_company=company_name,
                             owned_by_company=owner_company,
-                            details=f"GSTIN: {ledger.get('GSTREGISTRATIONNUMBER', 'N/A')}",
+                            details=f"GUID: {guid or 'N/A'}, GSTIN: {ledger.get('GSTREGISTRATIONNUMBER', 'N/A')}",
                         )
                         overall_stats['duplicates_skipped'] += 1
                     continue

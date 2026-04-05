@@ -243,6 +243,78 @@ def get_sales_voucher_types(company_name: str, url: Optional[str] = None) -> Lis
     return deduped
 
 
+def get_delivery_voucher_types(company_name: str, url: Optional[str] = None) -> List[str]:
+    """
+    Return active voucher type names that likely represent Delivery Notes / Challans.
+    Supports custom delivery voucher types whose name or parent mentions delivery/challan/DC.
+    """
+    xml = f"""
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>VoucherTypeList</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVCURRENTCOMPANY>{company_name}</SVCURRENTCOMPANY>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION ISMODIFY="No" NAME="VoucherTypeList">
+            <TYPE>VoucherType</TYPE>
+            <NATIVEMETHOD>Name</NATIVEMETHOD>
+            <NATIVEMETHOD>Parent</NATIVEMETHOD>
+            <NATIVEMETHOD>ReservedName</NATIVEMETHOD>
+            <NATIVEMETHOD>IsActive</NATIVEMETHOD>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>
+"""
+    resp = send_request(xml, url)
+    root = ET.fromstring(_clean_invalid_char_refs(resp))
+
+    voucher_types: List[str] = []
+    for vt in root.findall(".//VOUCHERTYPE"):
+        name = (vt.get("NAME") or "").strip()
+        parent = (vt.findtext("PARENT") or "").strip()
+        reserved_name = (vt.findtext("RESERVEDNAME") or "").strip()
+        is_active = (vt.findtext("ISACTIVE") or "Yes").strip()
+
+        if not name:
+            continue
+        if is_active.lower() == "no":
+            continue
+
+        haystack = " ".join(part for part in (name, parent, reserved_name) if part).lower()
+        if not haystack:
+            continue
+
+        if (
+            parent.lower() == "delivery note"
+            or "delivery" in haystack
+            or "delivary" in haystack
+            or "challan" in haystack
+            or re.search(r"\bdc\b", haystack)
+        ):
+            voucher_types.append(name)
+
+    deduped: List[str] = []
+    seen = set()
+    for name in voucher_types:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(name)
+    return deduped
+
+
 def parse_ledgers(response_xml: str):
     ledgers = []
     root = ET.fromstring(_clean_invalid_char_refs(response_xml))
@@ -1291,98 +1363,124 @@ def get_stock_item_by_name(company_name: str, item_name: str, url: Optional[str]
 
 def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: str = "20240101", to_date: str = "20991231"):
     """
-    Fetch Delivery Notes from TallyPrime using the Day Book report export.
+    Fetch Delivery Notes from Tally using Day Book report.
 
-    TallyPrime's custom TDL Collection filters (SVFROMDATE/SVTODATE, $$IsInRange)
-    are NOT executed via the HTTP API â€” Tally ignores them and dumps all vouchers,
-    causing memory crashes on large datasets.
-
-    The Day Book report is a built-in TallyPrime report that natively respects
-    SVFROMDATE/SVTODATE, so Tally filters at the source before sending data.
-    We then filter the result by voucher type to keep only delivery notes.
+    Uses Tally's Day Book XML export which returns all vouchers for a date range.
+    Filters delivery-type vouchers on the Python side (excludes vouchers, only gets daybook entries).
+    
+    Args:
+        company_name: Tally company name
+        url: Tally server URL
+        from_date: Start date (YYYYMMDD format)
+        to_date: End date (YYYYMMDD format)
+    
+    Returns:
+        List of delivery note vouchers from daybook only
     """
-    from xml.sax.saxutils import escape as xml_escape
-    from datetime import datetime as _dt
+    logger.info("=" * 80)
+    logger.info("DAY BOOK FETCH STARTED")
+    logger.info("=" * 80)
+    logger.info("Company: %s", company_name)
+    logger.info("Date Range: %s to %s", from_date, to_date)
+    logger.info("=" * 80)
 
-    safe_company = xml_escape(company_name)
-    def _to_tally_date(d: str) -> str:
-        dt = _dt.strptime(d, "%Y%m%d")
-        return f"{dt.day}-{dt.strftime('%b-%Y')}"
-    _from_tally = _to_tally_date(from_date)
-    _to_tally   = _to_tally_date(to_date)
-
-    logger.info("get_delivery_notes called with from_date=%s (%s), to_date=%s (%s)",
-                from_date, _from_tally, to_date, _to_tally)
-
-    # Use Day Book report â€” TallyPrime's built-in date-aware report.
-    # Unlike custom TDL collections, this DOES filter by SVFROMDATE/SVTODATE at source.
-    xml = f"""<ENVELOPE>
+    daybook_xml = f"""
+<ENVELOPE>
   <HEADER>
-    <TALLYREQUEST>Export Data</TALLYREQUEST>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Data</TYPE>
+    <ID>Day Book</ID>
   </HEADER>
   <BODY>
-    <EXPORTDATA>
-      <REQUESTDESC>
-        <REPORTNAME>Day Book</REPORTNAME>
-        <STATICVARIABLES>
-          <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-          <SVFROMDATE>{_from_tally}</SVFROMDATE>
-          <SVTODATE>{_to_tally}</SVTODATE>
-          <SVCURRENTCOMPANY>{safe_company}</SVCURRENTCOMPANY>
-        </STATICVARIABLES>
-      </REQUESTDESC>
-    </EXPORTDATA>
+    <DESC>
+      <STATICVARIABLES>
+        <SVCURRENTCOMPANY>{company_name}</SVCURRENTCOMPANY>
+        <SVFROMDATE>{from_date}</SVFROMDATE>
+        <SVTODATE>{to_date}</SVTODATE>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+      </STATICVARIABLES>
+    </DESC>
   </BODY>
-</ENVELOPE>"""
-
-    # Voucher type keywords that identify delivery notes/challans
-    _DC_KEYWORDS = ("delivery", "delivary", "challan", " dc", "dc ")
-
-    def _is_delivery_note(voucher: dict) -> bool:
-        vtype = (
-            voucher.get("VCHTYPE") or
-            voucher.get("VOUCHERTYPENAME") or ""
-        ).lower()
-        return any(kw in vtype for kw in _DC_KEYWORDS)
+</ENVELOPE>
+"""
 
     try:
-        logger.info("Sending Day Book request to Tally (date range: %s to %s)...", from_date, to_date)
-        resp = send_request(xml, url, timeout=180)
-        logger.info("Received Day Book response from Tally, parsing...")
+        # Filter delivery vouchers by keyword matching on VOUCHERTYPENAME.
+        # No separate Tally API call needed — the Day Book response already
+        # contains the voucher type for each voucher.
+        delivery_keywords = ("delivery", "challan")
+
+        def _is_delivery(v):
+            vtype = (v.get("VOUCHERTYPENAME") or v.get("VOUCHERTYPE") or "").strip().lower()
+            return any(kw in vtype for kw in delivery_keywords)
+
+        logger.info("[FUNCTION] Sending Day Book request to Tally...")
+        print("[FUNCTION] Sending Day Book request to Tally...")
+        resp = send_request(daybook_xml, url, timeout=180)
+
+        # Log raw XML size for debugging
+        logger.info("[FUNCTION] Received %d bytes XML response from Tally", len(resp))
+        print(f"[FUNCTION] Received {len(resp)} bytes XML response from Tally")
+
+        # Log first 2000 chars of raw XML to debug what Tally returns
+        logger.debug("Day Book raw XML (first 2000 chars): %s", resp[:2000])
+
+        logger.info("[FUNCTION] Parsing Day Book XML response...")
+        print("[FUNCTION] Parsing Day Book XML response...")
         all_vouchers = parse_delivery_notes(resp)
-        logger.info("Parsed %d total vouchers from Day Book", len(all_vouchers))
+        logger.info("[FUNCTION] Parsed %d total vouchers from Day Book response", len(all_vouchers))
+        print(f"[FUNCTION] Parsed {len(all_vouchers)} total vouchers from Day Book response")
 
-        # Filter to delivery notes only
-        dc_vouchers = [v for v in all_vouchers if _is_delivery_note(v)]
-        logger.info("Filtered to %d delivery notes (DC/Challan) from %d total vouchers",
-                    len(dc_vouchers), len(all_vouchers))
+        # Log all voucher types found for debugging
+        vtypes_found = set()
+        for v in all_vouchers:
+            vt = (v.get("VOUCHERTYPENAME") or v.get("VOUCHERTYPE") or "UNKNOWN").strip()
+            vtypes_found.add(vt)
+        if vtypes_found:
+            logger.info("[FUNCTION] Voucher types found in Day Book: %s", ", ".join(sorted(vtypes_found)))
+            print(f"[FUNCTION] Voucher types found in Day Book: {', '.join(sorted(vtypes_found))}")
 
-        # Python safety filter
-        date_filtered = [v for v in dc_vouchers if from_date <= (v.get("DATE") or "") <= to_date]
-        extra = len(dc_vouchers) - len(date_filtered)
+        logger.info("[FUNCTION] Filtering for delivery vouchers only (excluding vouchers)...")
+        print("[FUNCTION] Filtering for delivery vouchers only (excluding vouchers)...")
+        delivery_vouchers = [v for v in all_vouchers if _is_delivery(v)]
 
-        if extra > 0:
-            # Day Book did NOT filter by date on this Tally instance â€” it returned all DCs.
-            # If total DCs returned is large (>50), this is crash-prone. Switch to chunked fetch.
-            logger.warning(
-                "Day Book ignored SVFROMDATE/SVTODATE â€” returned %d DCs, only %d are in %sâ€“%s. "
-                "Tally is not filtering by date at source.",
-                len(dc_vouchers), len(date_filtered), from_date, to_date,
-            )
-            if len(dc_vouchers) > 50:
-                logger.warning(
-                    "Large dataset (%d DCs) with no Tally-side date filtering â€” "
-                    "crash risk on low-RAM systems. Consider upgrading TallyPrime.",
-                    len(dc_vouchers),
-                )
+        logger.info(
+            "[FUNCTION] Day Book Summary: Date Range %s to %s — %d total vouchers, %d delivery notes (daybook only) for company '%s'",
+            from_date, to_date, len(all_vouchers), len(delivery_vouchers), company_name,
+        )
+        print(f"[FUNCTION] Day Book Summary: {len(all_vouchers)} total vouchers, {len(delivery_vouchers)} delivery notes (daybook only)")
 
-        logger.info("After date filter (%s to %s): %d delivery notes", from_date, to_date, len(date_filtered))
-        return date_filtered
+        # Log each DC found with detailed info
+        logger.info("[FUNCTION] Delivery Notes Found:")
+        print("[FUNCTION] Delivery Notes Found:")
+        for i, v in enumerate(delivery_vouchers, 1):
+            dc_no = v.get("VOUCHERNUMBER", "?")
+            dc_date = v.get("DATE", "?")
+            party = v.get("PARTYLEDGERNAME", "?")
+            items_count = len(v.get("INVENTORY", []))
+            vtype = v.get("VOUCHERTYPENAME", v.get("VOUCHERTYPE", "?"))
+            
+            log_msg = f"  DC #{i}: No={dc_no} | Date={dc_date} | Party={party} | Type={vtype} | Items={items_count}"
+            logger.info("[FUNCTION] %s", log_msg)
+            print(f"[FUNCTION] {log_msg}")
+
+        logger.info("=" * 80)
+        logger.info("DAY BOOK FETCH COMPLETED SUCCESSFULLY")
+        logger.info("=" * 80)
+        print("=" * 80)
+        print("DAY BOOK FETCH COMPLETED SUCCESSFULLY")
+        print("=" * 80)
+
+        return delivery_vouchers
 
     except Exception as e:
-        logger.error("Failed to fetch delivery notes: %s", e, exc_info=True)
+        logger.error("[FUNCTION] Day Book fetch failed for company '%s': %s", company_name, e, exc_info=True)
+        print(f"[FUNCTION] ERROR: Day Book fetch failed: {e}")
+        logger.info("=" * 80)
+        logger.info("DAY BOOK FETCH FAILED")
+        logger.info("=" * 80)
         return []
-
 
 
 def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: str = "20240101", to_date: str = "20991231"):

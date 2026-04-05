@@ -194,7 +194,10 @@ class AutomationManager:
                 self.state['next_runs'][task] = (datetime.now() + timedelta(seconds=delay)).isoformat()
             self._save_state()
 
-        self._master_initial_done.clear()
+        # DC fetch and sync start immediately — no need to wait for master fetch.
+        # DC-driven creation handles missing customers/products in real-time.
+        # Master fetch runs daily as a background full refresh.
+        self._master_initial_done.set()
         logger.info("Starting automation threads...")
         self._start_thread('fetch_master', self._fetch_master_loop)
         self._start_thread('fetch_invoices', self._fetch_invoices_loop)
@@ -245,6 +248,18 @@ class AutomationManager:
         thread.start()
         self.threads[task_name] = thread
 
+    def _is_stopped(self, task):
+        """Check if a task has been stopped (flag missing or set)."""
+        flag = self.stop_flags.get(task)
+        return flag is None or flag.is_set()
+
+    def _wait_stop(self, task, timeout):
+        """Wait on a task's stop flag. Returns True if stopped."""
+        flag = self.stop_flags.get(task)
+        if flag is None:
+            return True
+        return flag.wait(timeout=timeout)
+
     def _log_to_dashboard(self, message):
         if dashboard_logger:
             dashboard_logger.write_log(message)
@@ -265,12 +280,12 @@ class AutomationManager:
     def _wait_for_initial_master(self, task):
         logger.info("%s: Waiting for initial master data fetch to complete...", task)
         while not self._master_initial_done.is_set():
-            if self.stop_flags[task].wait(timeout=1.0):
+            if self._wait_stop(task, timeout=1.0):
                 return False
         return True
 
     def _wait_for_next_run(self, task):
-        while not self.stop_flags[task].is_set():
+        while not self._is_stopped(task):
             with self.lock:
                 next_run_iso = self.state['next_runs'].get(task)
 
@@ -286,7 +301,7 @@ class AutomationManager:
             if remaining <= 0:
                 return True
 
-            self.stop_flags[task].wait(timeout=min(1.0, remaining))
+            self._wait_stop(task, timeout=min(1.0, remaining))
 
         return False
 
@@ -325,8 +340,19 @@ class AutomationManager:
             log_file=None,
         )
 
+    def _check_tally_connected(self) -> bool:
+        """Check if Tally is reachable."""
+        try:
+            import requests as _req
+            tally_url = cfg.get_env("TALLY_URL", "http://localhost:9000/")
+            resp = _req.get(tally_url, timeout=3)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     def _fetch_master_loop(self):
-        """Fetch products + customers from Tally on the master schedule."""
+        """Fetch products + customers from Tally daily.
+        On first run, waits for Tally connection before starting."""
         from fetch_customers import fetch_customers_from_all_companies
         from fetch_products import fetch_products_from_all_companies
 
@@ -334,7 +360,20 @@ class AutomationManager:
         consecutive_errors = 0
         first_run = True
 
-        while not self.stop_flags[task].is_set():
+        # Wait for Tally to be connected before first master fetch
+        if first_run:
+            logger.info("%s: Waiting for Tally connection...", task)
+            self._log_to_dashboard("=== AUTO: MASTER FETCH WAITING FOR TALLY CONNECTION ===")
+            while not self._is_stopped(task):
+                if self._check_tally_connected():
+                    logger.info("%s: Tally connected - starting master fetch", task)
+                    self._log_to_dashboard("=== AUTO: TALLY CONNECTED - STARTING MASTER FETCH ===")
+                    break
+                self._wait_stop(task, timeout=5)
+            if self._is_stopped(task):
+                return
+
+        while not self._is_stopped(task):
             try:
                 self._prepare_task_run(task)
                 logger.info("Running %s...", task)
@@ -343,19 +382,25 @@ class AutomationManager:
                 prod_new = prod_updated = 0
                 cust_new = cust_updated = 0
 
-                try:
-                    result = fetch_products_from_all_companies()
-                    prod_new = result.get('new_saved', 0)
-                    prod_updated = result.get('updated', 0)
-                except Exception as e:
-                    logger.error(f"Product fetch failed: {e}", exc_info=True)
+                if cfg.get_env_bool("AUTO_FETCH_PRODUCTS", False):
+                    try:
+                        result = fetch_products_from_all_companies()
+                        prod_new = result.get('new_saved', 0)
+                        prod_updated = result.get('updated', 0)
+                    except Exception as e:
+                        logger.error(f"Product fetch failed: {e}", exc_info=True)
+                else:
+                    logger.info("Product auto-fetch disabled (AUTO_FETCH_PRODUCTS=false)")
 
-                try:
-                    result = fetch_customers_from_all_companies()
-                    cust_new = result.get('new_saved', 0)
-                    cust_updated = result.get('updated', 0)
-                except Exception as e:
-                    logger.error(f"Customer fetch failed: {e}", exc_info=True)
+                if cfg.get_env_bool("AUTO_FETCH_CUSTOMERS", False):
+                    try:
+                        result = fetch_customers_from_all_companies()
+                        cust_new = result.get('new_saved', 0)
+                        cust_updated = result.get('updated', 0)
+                    except Exception as e:
+                        logger.error(f"Customer fetch failed: {e}", exc_info=True)
+                else:
+                    logger.info("Customer auto-fetch disabled (AUTO_FETCH_CUSTOMERS=false)")
 
                 self._log_to_dashboard(
                     f"=== AUTO: FETCH MASTER DATA COMPLETED "
@@ -383,7 +428,7 @@ class AutomationManager:
                     first_run = False
                     self._master_initial_done.set()
                     logger.warning("%s: Master fetch failed on first run - DC fetch and sync unblocked anyway", task)
-                if self.stop_flags[task].wait(timeout=backoff):
+                if self._wait_stop(task, timeout=backoff):
                     return
 
     def _fetch_invoices_loop(self):
@@ -393,12 +438,17 @@ class AutomationManager:
         task = 'fetch_invoices'
         consecutive_errors = 0
 
-        if not self._wait_for_initial_master(task):
+        # Wait for Tally connection before starting DC fetch
+        logger.info("%s: Waiting for Tally connection...", task)
+        while not self._is_stopped(task):
+            if self._check_tally_connected():
+                logger.info("%s: Tally connected - starting DC fetch loop", task)
+                break
+            self._wait_stop(task, timeout=5)
+        if self._is_stopped(task):
             return
 
-        logger.info("%s: Master data ready - starting DC fetch loop", task)
-
-        while not self.stop_flags[task].is_set():
+        while not self._is_stopped(task):
             try:
                 self._prepare_task_run(task)
 
@@ -442,7 +492,7 @@ class AutomationManager:
                 backoff = min(30 * consecutive_errors, 120)
                 logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
                 self._log_to_dashboard(f"=== AUTO: FETCH DCs ERROR: {e} (retry in {backoff}s) ===")
-                if self.stop_flags[task].wait(timeout=backoff):
+                if self._wait_stop(task, timeout=backoff):
                     return
 
     def _sync_loop(self):
@@ -459,7 +509,7 @@ class AutomationManager:
 
         logger.info("%s: Master data ready - starting sync loop", task)
 
-        while not self.stop_flags[task].is_set():
+        while not self._is_stopped(task):
             try:
                 self._prepare_task_run(task)
                 logger.info("Running %s...", task)
@@ -504,7 +554,7 @@ class AutomationManager:
                 backoff = min(30 * consecutive_errors, 120)
                 logger.error(f"Error in {task} (attempt {consecutive_errors}): {e}. Retrying in {backoff}s")
                 self._log_to_dashboard(f"=== AUTO: SYNC ERROR: {e} (retry in {backoff}s) ===")
-                if self.stop_flags[task].wait(timeout=backoff):
+                if self._wait_stop(task, timeout=backoff):
                     return
 
 

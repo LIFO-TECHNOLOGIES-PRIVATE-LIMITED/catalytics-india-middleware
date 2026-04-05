@@ -139,35 +139,8 @@ CREATE TABLE IF NOT EXISTS stock_sync_status (
 """
 
 
-_SOFT_DELETE_COLUMNS = {
-    "ledgers": ["is_deleted", "deleted_at"],
-    "stock_items": ["is_deleted", "deleted_at"],
-    "delivery_notes": ["is_deleted", "deleted_at"],
-}
-
-
-_soft_delete_ready = False
-
-
 def migrate_db(conn: sqlite3.Connection) -> None:
-    """Add is_deleted / deleted_at columns to tables that lack them."""
-    global _soft_delete_ready
-    for table, columns in _SOFT_DELETE_COLUMNS.items():
-        try:
-            existing = {
-                row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-        except Exception:
-            continue
-        for col in columns:
-            if col not in existing:
-                col_type = "INTEGER DEFAULT 0" if col == "is_deleted" else "TEXT"
-                try:
-                    conn.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"
-                    )
-                except Exception:
-                    pass  # Column may already exist from concurrent migration
+    """Run schema migrations for new columns."""
     # Ensure delivery_notes.tally_guid exists for GUID-based updates
     try:
         existing_dn = {row[1] for row in conn.execute("PRAGMA table_info(delivery_notes)").fetchall()}
@@ -180,8 +153,6 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_notes_guid ON delivery_notes(company_id, tally_guid)")
     except Exception:
         pass
-
-    _soft_delete_ready = True
 
 
 def now_ts() -> str:
@@ -370,16 +341,13 @@ def upsert_json_row(
 ) -> None:
     ts = now_ts()
     data_json = json_dumps(data)
-    restore_clause = ""
-    if _soft_delete_ready:
-        restore_clause = ",\n            is_deleted = 0,\n            deleted_at = NULL"
     conn.execute(
         f"""
         INSERT INTO {table} (company_id, name, data_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(company_id, name) DO UPDATE SET
             data_json = excluded.data_json,
-            updated_at = excluded.updated_at{restore_clause}
+            updated_at = excluded.updated_at
         """,
         (company_id, name, data_json, ts, ts),
     )
@@ -428,11 +396,8 @@ def upsert_delivery_note(
 ) -> int:
     ts = now_ts()
     data_json = json_dumps(data)
-    restore_clause = ""
-    if _soft_delete_ready:
-        restore_clause = ",\n            is_deleted = 0,\n            deleted_at = NULL"
     conn.execute(
-        f"""
+        """
         INSERT INTO delivery_notes
             (company_id, dc_no, voucher_date, party_ledger_name, tally_guid, reference, data_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -442,7 +407,7 @@ def upsert_delivery_note(
             tally_guid = excluded.tally_guid,
             reference = excluded.reference,
             data_json = excluded.data_json,
-            updated_at = excluded.updated_at{restore_clause}
+            updated_at = excluded.updated_at
         """,
         (company_id, dc_no, voucher_date, party_ledger_name, tally_guid, reference, data_json, ts, ts),
     )
@@ -505,51 +470,6 @@ def _safe_float(value: Any) -> Optional[float]:
         except (TypeError, ValueError):
             return None
 
-
-def mark_records_deleted(
-    conn: sqlite3.Connection,
-    table: str,
-    company_id: int,
-    names: Iterable[str],
-) -> int:
-    """Mark records as deleted by name. Returns count of records marked."""
-    ts = now_ts()
-    name_list = list(names)
-    if not name_list:
-        return 0
-    count = 0
-    # Batch in groups of 500 to stay within SQLite variable limits
-    for i in range(0, len(name_list), 500):
-        batch = name_list[i : i + 500]
-        placeholders = ",".join("?" for _ in batch)
-        cursor = conn.execute(
-            f"UPDATE {table} SET is_deleted = 1, deleted_at = ? WHERE company_id = ? AND name IN ({placeholders}) AND COALESCE(is_deleted, 0) = 0",
-            [ts, company_id] + batch,
-        )
-        count += cursor.rowcount
-    return count
-
-
-def mark_dc_records_deleted(
-    conn: sqlite3.Connection,
-    company_id: int,
-    dc_nos: Iterable[str],
-) -> int:
-    """Mark delivery notes as deleted by dc_no. Returns count of records marked."""
-    ts = now_ts()
-    dc_list = list(dc_nos)
-    if not dc_list:
-        return 0
-    count = 0
-    for i in range(0, len(dc_list), 500):
-        batch = dc_list[i : i + 500]
-        placeholders = ",".join("?" for _ in batch)
-        cursor = conn.execute(
-            f"UPDATE delivery_notes SET is_deleted = 1, deleted_at = ? WHERE company_id = ? AND dc_no IN ({placeholders}) AND COALESCE(is_deleted, 0) = 0",
-            [ts, company_id] + batch,
-        )
-        count += cursor.rowcount
-    return count
 
 
 def ensure_sync_status(
@@ -752,9 +672,10 @@ class Database:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path, timeout=120.0, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=120000")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._create_tables()
 
@@ -821,32 +742,45 @@ class Database:
         ))
 
     def update_customer(self, customer_id: int, data: dict):
-        """Update existing customer with fresh Tally data (GUID, name, GSTIN, address, etc.)
-        and mark for re-sync."""
-        self.execute("""
-            UPDATE customers
-            SET tally_guid = ?, name = ?, gstin = ?, pan = ?,
-                address = ?, state = ?, city = ?, pincode = ?,
-                phone = ?, email = ?, delivery_addresses_json = ?,
-                data_json = ?,
-                is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
-                last_updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (
-            data.get('tally_guid'),
-            data.get('name'),
-            data.get('gstin'),
-            data.get('pan'),
-            data.get('address'),
-            data.get('state'),
-            data.get('city'),
-            data.get('pincode'),
-            data.get('phone'),
-            data.get('email'),
-            data.get('delivery_addresses_json'),
-            data.get('data_json'),
-            customer_id,
-        ))
+        """Update existing customer with fresh Tally data.
+        Only resets is_synced=0 when data_json actually changed."""
+        existing = self.query(
+            "SELECT data_json FROM customers WHERE id = ?", (customer_id,)
+        )
+        data_changed = not existing or existing['data_json'] != data.get('data_json')
+
+        if data_changed:
+            self.execute("""
+                UPDATE customers
+                SET tally_guid = ?, name = ?, gstin = ?, pan = ?,
+                    address = ?, state = ?, city = ?, pincode = ?,
+                    phone = ?, email = ?, delivery_addresses_json = ?,
+                    data_json = ?,
+                    is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
+                    last_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (
+                data.get('tally_guid'),
+                data.get('name'),
+                data.get('gstin'),
+                data.get('pan'),
+                data.get('address'),
+                data.get('state'),
+                data.get('city'),
+                data.get('pincode'),
+                data.get('phone'),
+                data.get('email'),
+                data.get('delivery_addresses_json'),
+                data.get('data_json'),
+                customer_id,
+            ))
+        else:
+            # Data unchanged — just refresh metadata, keep is_synced as-is
+            self.execute("""
+                UPDATE customers
+                SET tally_guid = ?, last_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (data.get('tally_guid'), customer_id))
 
     # ========================================================================
     # PRODUCT OPERATIONS
@@ -914,39 +848,52 @@ class Database:
         ))
 
     def update_product(self, product_id: int, data: dict):
-        """Update existing product with fresh Tally data (GUID, name, HSN, GST, etc.)
-        and mark for re-sync."""
-        self.execute("""
-            UPDATE products
-            SET tally_guid = ?, name = ?, name_canonical = ?, hsn_code = ?, unit = ?,
-                rate = ?, description = ?, data_json = ?,
-                product_master_name = ?, variant_name = ?, unit_name = ?,
-                product_type_code = ?, product_type_name = ?,
-                gst_applicable = ?, gst_rate = ?, igst_rate = ?, cgst_rate = ?, sgst_rate = ?,
-                is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
-                last_updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (
-            data.get('tally_guid'),
-            data.get('name'),
-            data.get('name_canonical'),
-            data.get('hsn_code'),
-            data.get('unit'),
-            data.get('rate'),
-            data.get('description'),
-            data.get('data_json'),
-            data.get('product_master_name'),
-            data.get('variant_name'),
-            data.get('unit_name'),
-            data.get('product_type_code'),
-            data.get('product_type_name'),
-            data.get('gst_applicable'),
-            data.get('gst_rate', 0.0),
-            data.get('igst_rate', 0.0),
-            data.get('cgst_rate', 0.0),
-            data.get('sgst_rate', 0.0),
-            product_id,
-        ))
+        """Update existing product with fresh Tally data.
+        Only resets is_synced=0 when data_json actually changed."""
+        existing = self.query(
+            "SELECT data_json FROM products WHERE id = ?", (product_id,)
+        )
+        data_changed = not existing or existing['data_json'] != data.get('data_json')
+
+        if data_changed:
+            self.execute("""
+                UPDATE products
+                SET tally_guid = ?, name = ?, name_canonical = ?, hsn_code = ?, unit = ?,
+                    rate = ?, description = ?, data_json = ?,
+                    product_master_name = ?, variant_name = ?, unit_name = ?,
+                    product_type_code = ?, product_type_name = ?,
+                    gst_applicable = ?, gst_rate = ?, igst_rate = ?, cgst_rate = ?, sgst_rate = ?,
+                    is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
+                    last_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (
+                data.get('tally_guid'),
+                data.get('name'),
+                data.get('name_canonical'),
+                data.get('hsn_code'),
+                data.get('unit'),
+                data.get('rate'),
+                data.get('description'),
+                data.get('data_json'),
+                data.get('product_master_name'),
+                data.get('variant_name'),
+                data.get('unit_name'),
+                data.get('product_type_code'),
+                data.get('product_type_name'),
+                data.get('gst_applicable'),
+                data.get('gst_rate', 0.0),
+                data.get('igst_rate', 0.0),
+                data.get('cgst_rate', 0.0),
+                data.get('sgst_rate', 0.0),
+                product_id,
+            ))
+        else:
+            # Data unchanged — just refresh metadata, keep is_synced as-is
+            self.execute("""
+                UPDATE products
+                SET tally_guid = ?, last_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (data.get('tally_guid'), product_id))
 
     def get_unsynced_customers(self, limit=None):
         """Get customers that haven't been synced yet."""

@@ -71,19 +71,48 @@ VAPARIZER_TYPE_CODE = 'VAPARIZER'
 VAPARIZER_DEFAULT_VARIANT = '1 Nos'
 VAPARIZER_DEFAULT_UNIT = 'Nos'
 LPG_NAME_PATTERN = re.compile(
-    r'^(?P<base>LPG.*?)(?:\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+))?(?:\s+\((?P<legacy_type>\w+)\))?$',
+    r'^(?P<base>LPG(?:\s+[A-Za-z]+)*)(?:\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+))?(?:\s+\((?P<legacy_type>\w+)\))?$',
     re.IGNORECASE,
 )
 VAPARIZER_NAME_PATTERN = re.compile(
-    r'^(?P<base>.*?\bVAPARIZER\b.*?)(?:\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+))?$',
+    r'^(?P<base>.*?\bVA?POU?RIZER\b.*?)(?:\s+(?P<qty>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+))?$',
+    re.IGNORECASE,
+)
+# Also match names like "Monthly Rental (Vaporizer)" where the keyword is in parentheses
+VAPARIZER_PAREN_PATTERN = re.compile(
+    r'^(?P<base>.+?)\s*\(\s*(?:VA?POU?RIZER)\s*\)\s*$',
     re.IGNORECASE,
 )
 
 
+def _is_vaparizer_name(name: str) -> bool:
+    """Check if a name contains any spelling of vaporizer/vaparizer."""
+    upper = name.upper()
+    return 'VAPARIZER' in upper or 'VAPORIZER' in upper or 'VAPOURIZER' in upper
+
+
 def _parse_vaparizer_stock_item_name(normalized_name: str):
-    if 'VAPARIZER' not in normalized_name.upper():
+    if not _is_vaparizer_name(normalized_name):
         return None
 
+    # Try parenthesized form first: "Monthly Rental (Vaporizer)"
+    paren_match = VAPARIZER_PAREN_PATTERN.match(normalized_name)
+    if paren_match:
+        product_master_name = paren_match.group('base').strip()
+        variant_name = VAPARIZER_DEFAULT_VARIANT
+        unit_name = VAPARIZER_DEFAULT_UNIT
+        product_type_name = config.get_product_type_name(VAPARIZER_TYPE_CODE) or 'Vaparizer'
+        return {
+            'product_master_name': product_master_name,
+            'unit_name': unit_name,
+            'variant_name': variant_name,
+            'product_type_code': VAPARIZER_TYPE_CODE,
+            'product_type_name': product_type_name,
+            'canonical_name': f"{product_master_name} {variant_name} ({VAPARIZER_TYPE_CODE})",
+            'variant_defaulted': True,
+        }
+
+    # Standard form: "VAPARIZER 1 Nos" or just "VAPARIZER"
     match = VAPARIZER_NAME_PATTERN.match(normalized_name)
     if not match:
         return None
@@ -337,54 +366,21 @@ def fetch_products_from_all_companies():
                     f"canonical='{canonical_name}'"
                 )
 
-                # --- GUID-based lookup (takes priority over canonical name) ---
-                existing_by_guid = db.product_exists_by_guid(tally_guid) if tally_guid else None
-                if existing_by_guid:
-                    owner_company = existing_by_guid['tally_company']
+                # --- Name-based lookup (product name is the unique key) ---
+                existing_by_name = db.product_exists(product_name)
+                if not existing_by_name:
+                    existing_by_name = db.product_exists_normalized(canonical_name)
+
+                if existing_by_name:
+                    owner_company = existing_by_name['tally_company']
                     if owner_company == company_name:
                         try:
                             product_data = _map_stock_item_to_product(item, company_name, parsed)
                             product_data['name_canonical'] = canonical_name
-                            db.update_product(existing_by_guid['id'], product_data)
+                            db.update_product(existing_by_name['id'], product_data)
                             logger.info(
-                                f"[UPDATED by GUID] '{product_name}' "
-                                f"(company: {company_name}, GUID: {tally_guid}, "
-                                f"HSN: {product_data.get('hsn_code', 'N/A')})"
-                            )
-                            overall_stats['updated'] += 1
-                        except Exception as e:
-                            logger.error(f"[ERROR] Failed to update product '{product_name}' by GUID: {e}", exc_info=True)
-                            overall_stats['errors'] += 1
-                    else:
-                        logger.warning(
-                            f"[DUPLICATE SKIPPED by GUID] '{product_name}' "
-                            f"(GUID: {tally_guid}, owned by {owner_company}, attempted by {company_name})"
-                        )
-                        db.log_duplicate(
-                            entity_type='product',
-                            entity_name=canonical_name,
-                            tally_company=company_name,
-                            owned_by_company=owner_company,
-                            details=f"GUID: {tally_guid}, HSN: {item.get('HSNCODE', 'N/A')}",
-                        )
-                        overall_stats['duplicates_skipped'] += 1
-                    continue
-
-                # --- Canonical name-based lookup (fallback) ---
-                existing = db.product_exists_normalized(canonical_name)
-
-                if existing:
-                    owner_company = existing['tally_company']
-                    if owner_company == company_name:
-                        # Same company — update with fresh Tally data
-                        try:
-                            product_data = _map_stock_item_to_product(item, company_name, parsed)
-                            product_data['name_canonical'] = canonical_name
-                            db.update_product(existing['id'], product_data)
-                            logger.info(
-                                f"[UPDATED by name] '{product_name}' "
-                                f"(company: {company_name}, "
-                                f"GUID: {product_data.get('tally_guid', 'N/A')}, "
+                                f"[UPDATED] '{product_name}' "
+                                f"(company: {company_name}, GUID: {tally_guid or 'N/A'}, "
                                 f"HSN: {product_data.get('hsn_code', 'N/A')})"
                             )
                             overall_stats['updated'] += 1
@@ -392,18 +388,17 @@ def fetch_products_from_all_companies():
                             logger.error(f"[ERROR] Failed to update product '{product_name}': {e}", exc_info=True)
                             overall_stats['errors'] += 1
                     else:
-                        # Different company — cross-company duplicate, skip
                         logger.warning(
                             f"[DUPLICATE SKIPPED] '{product_name}' "
-                            f"(canonical: '{canonical_name}') "
-                            f"(owned by {owner_company}, attempted by {company_name})"
+                            f"(canonical: '{canonical_name}', "
+                            f"owned by {owner_company}, attempted by {company_name})"
                         )
                         db.log_duplicate(
                             entity_type='product',
                             entity_name=canonical_name,
                             tally_company=company_name,
                             owned_by_company=owner_company,
-                            details=f"HSN: {item.get('HSNCODE', 'N/A')}",
+                            details=f"GUID: {tally_guid or 'N/A'}, HSN: {item.get('HSNCODE', 'N/A')}",
                         )
                         overall_stats['duplicates_skipped'] += 1
                     continue

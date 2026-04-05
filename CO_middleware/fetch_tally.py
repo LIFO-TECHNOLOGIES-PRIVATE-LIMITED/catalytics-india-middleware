@@ -70,16 +70,21 @@ def _extract_tally_guid(voucher: Dict[str, Any]) -> str:
     return ""
 
 
+DEFAULT_DC_PAST_DAYS = 1
+DEFAULT_DC_FUTURE_DAYS = 1
+
+
 def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
     now = datetime.now()
-    if days_back:
-        from_dt = now - timedelta(days=days_back)
-        return from_dt.strftime("%Y%m%d"), now.strftime("%Y%m%d")
-    if now.month >= 4:
-        fy_start = datetime(now.year, 4, 1)
-    else:
-        fy_start = datetime(now.year - 1, 4, 1)
-    return fy_start.strftime("%Y%m%d"), now.strftime("%Y%m%d")
+    # Dynamic 3-day window: yesterday to tomorrow.
+    # Tally Day Book only returns data for the currently open date.
+    # By covering yesterday+today+tomorrow, whichever date is open in
+    # Tally will match and its DCs will be fetched.
+    # days_back > 1 expands the past side further.
+    effective_days_back = max(days_back, DEFAULT_DC_PAST_DAYS) if days_back is not None else DEFAULT_DC_PAST_DAYS
+    from_dt = now - timedelta(days=effective_days_back)
+    to_dt = now + timedelta(days=DEFAULT_DC_FUTURE_DAYS)
+    return from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")
 
 
 def _build_payload_hash(
@@ -110,7 +115,7 @@ def build_config(args: argparse.Namespace) -> FetchConfig:
         entity_id=args.entity_id or cfg.get_env_int("CATALYTICS_ENTITY_ID"),
         from_date=args.from_date or cfg.get_env("TALLY_FROM_DATE"),
         to_date=args.to_date or cfg.get_env("TALLY_TO_DATE"),
-        days_back=args.days_back or cfg.get_env_int("TALLY_DAYS_BACK"),
+        days_back=args.days_back if args.days_back is not None else cfg.get_env_int("TALLY_DAYS_BACK"),
         fetch_stock=bool(args.fetch_stock) or cfg.get_env_bool("TALLY_FETCH_STOCK", False),
         dry_run=bool(args.dry_run) or cfg.get_env_bool("TALLY_DRY_RUN", False),
         log_level=args.log_level or cfg.get_env("LOG_LEVEL", "INFO"),
@@ -128,11 +133,11 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     conn = db.connect(config.db_path)
     db.init_db(conn)
 
-    from_date, to_date = _default_date_range(config.days_back)
-    if config.from_date:
+    if config.from_date and config.to_date:
         from_date = config.from_date
-    if config.to_date:
         to_date = config.to_date
+    else:
+        from_date, to_date = _default_date_range(config.days_back)
 
     logger.info("Using date range %s to %s", from_date, to_date)
     companies = tally_api.get_companies(config.tally_url)
@@ -282,59 +287,11 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         if not config.dry_run:
             conn.commit()
 
-    # --- Delete detection (date-range scoped) ---
+    # --- Delete detection DISABLED ---
+    # Auto-delete detection is disabled because false positives (partial Tally
+    # response, date-range mismatch, Day Book timeout) cause DCs to be
+    # incorrectly marked as deleted and then cancelled on the server.
     deleted = 0
-    tally_dc_nos = set()
-    for voucher in vouchers:
-        dc_no = _normalize_dc_no(voucher)
-        if dc_no:
-            tally_dc_nos.add(dc_no.strip().lower())
-
-    # Safety: only detect deletions if Tally returned >0 vouchers
-    # and there are previously synced records (not a first-run scenario)
-    has_synced_records = conn.execute(
-        """SELECT 1 FROM sync_status ss
-           JOIN delivery_notes dn ON dn.id = ss.delivery_note_id
-           WHERE ss.is_synced = 1 AND dn.company_id = ? LIMIT 1""",
-        (company_id,),
-    ).fetchone() is not None
-
-    if tally_dc_nos and has_synced_records:
-        # Find active DCs in SQLite within the same date range
-        sqlite_dcs = conn.execute(
-            """SELECT id, dc_no FROM delivery_notes
-               WHERE company_id = ?
-                 AND COALESCE(is_deleted, 0) = 0
-                 AND voucher_date IS NOT NULL
-                 AND voucher_date >= ?
-                 AND voucher_date <= ?""",
-            (company_id, from_date, to_date),
-        ).fetchall()
-
-        dc_nos_to_delete = []
-        for row in sqlite_dcs:
-            if (row["dc_no"] or "").strip().lower() not in tally_dc_nos:
-                dc_nos_to_delete.append(row["dc_no"])
-
-        if dc_nos_to_delete:
-            deleted = db.mark_dc_records_deleted(conn, company_id, dc_nos_to_delete)
-            logger.info("Marked %d delivery notes as deleted (not in Tally response for date range %s-%s)", deleted, from_date, to_date)
-            # Mark deleted records as unsynced so they get propagated
-            for dc_no_del in dc_nos_to_delete:
-                row = conn.execute(
-                    "SELECT id FROM delivery_notes WHERE company_id = ? AND dc_no = ?",
-                    (company_id, dc_no_del),
-                ).fetchone()
-                if row:
-                    db.ensure_sync_status(
-                        conn,
-                        delivery_note_id=row["id"],
-                        is_synced=0,
-                        payload_hash="DELETED",
-                    )
-
-        if not config.dry_run:
-            conn.commit()
 
     logger.info(
         "Done. created=%d updated=%d skipped=%d deleted=%d ledgers=%d stock_items=%d",
