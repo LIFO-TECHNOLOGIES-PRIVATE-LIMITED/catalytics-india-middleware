@@ -83,14 +83,28 @@ class AutomationManager:
         if config.INVOICE_FETCH_START_DATE:
             logger.info(f"Invoice fetch configured from: {config.INVOICE_FETCH_START_DATE}")
         else:
-            logger.info("Invoice fetch will use today's date (no start date configured)")
+            logger.info("Invoice fetch will use Day Book range (Yesterday to Tomorrow)")
 
     def _load_state(self):
         """Load automation state from file"""
         if STATE_FILE.exists():
             try:
                 with open(STATE_FILE, 'r') as f:
-                    return json.load(f)
+                    state = json.load(f)
+                    
+                    # Merge missing intervals/runs from defaults (handles software updates)
+                    for key in ['intervals', 'last_runs', 'next_runs']:
+                        if key not in state:
+                            state[key] = {}
+                        
+                        default_val = getattr(self, '_get_default_state', lambda: {})().get(key, {})
+                        if key == 'intervals':
+                            default_val = DEFAULT_INTERVALS
+                        
+                        for task, val in default_val.items():
+                            if task not in state[key]:
+                                state[key][task] = val
+                    return state
             except Exception as e:
                 logger.error(f"Error loading state: {e}")
 
@@ -470,3 +484,22 @@ def get_manager():
     if _manager is None:
         _manager = AutomationManager()
     return _manager
+
+
+if __name__ == '__main__':
+    # Allow running as a standalone script
+    print("=== BOL Middleware Automation Manager (Standalone) ===")
+    manager = get_manager()
+    success = manager.start()
+    if success:
+        print("[INFO] Automation loops started. Press Ctrl+C to stop.")
+        try:
+            import time
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[INFO] Stopping automation...")
+            manager.stop()
+            print("[INFO] Done.")
+    else:
+        print("[ERROR] Automation is already running.")

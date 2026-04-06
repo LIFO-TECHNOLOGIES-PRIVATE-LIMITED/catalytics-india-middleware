@@ -23,7 +23,7 @@ def view_customer_sync_errors():
     print("="*80)
     
     database = db.Database()
-    conn = database.get_connection()
+    conn = database.conn
     cursor = conn.cursor()
     
     # Get all customers with sync errors
@@ -33,11 +33,11 @@ def view_customer_sync_errors():
             name,
             tally_company,
             is_synced,
-            sync_error,
-            sync_response_json,
+            last_sync_error,
+            last_response_json,
             sync_request_json
         FROM customers
-        WHERE sync_error IS NOT NULL
+        WHERE last_sync_error IS NOT NULL
         ORDER BY id DESC
     """)
     
@@ -126,8 +126,8 @@ def view_customer_sync_errors():
     
     error_types = {}
     for error_row in errors:
-        sync_error = error_row[4]
-        response_json = error_row[5]
+        sync_error = error_row[4]  # last_sync_error
+        response_json = error_row[5] # last_response_json
         
         error_type = "UNKNOWN"
         if response_json:

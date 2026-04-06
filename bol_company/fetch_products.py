@@ -2,14 +2,12 @@
 Fetch products from multiple Tally companies
 Parses stock item names to extract product master, unit, variant, and product type.
 
-Tally stock item name format:
-    INDUSTRIAL OXYGEN 4 CUM (CYL)
-    └─ product ─────┘ │ └┘  └─┘
-                      qty unit  type_code
+Product type detection (by keyword in name):
+    - Name contains "pallet"  → PALLET  (variant: 105, unit: cubic)
+    - Name contains "liquid"  → TANK    (variant: 230, unit: litter)
+    - Default                  → CYLINDER (variant: 7,   unit: cubic)
 
-Only stock items with a recognized type code in parentheses are fetched.
-Type codes configured via PRODUCT_TYPE_MAP in .env:
-    CYL:CYLINDER, PLT:PALLET, TNK:TANK, CON:CONTAINER
+All stock items are accepted regardless of name format.
 """
 import re
 import json
@@ -46,26 +44,30 @@ def _attach_product_fetch_file_handler():
 
 _attach_product_fetch_file_handler()
 
-# Regex: <PRODUCT NAME> <QTY> <UNIT> (<TYPE_CODE>)
-# Examples:
-#   INDUSTRIAL OXYGEN 4 CUM (CYL)  -> ("INDUSTRIAL OXYGEN", "4", "CUM", "CYL")
-#   LIQUID NITROGEN 210 LTR (CON)  -> ("LIQUID NITROGEN", "210", "LTR", "CON")
-STOCK_NAME_PATTERN = re.compile(
-    r'^(.+?)\s+(\d+(?:\.\d+)?)\s*(\w+)\s+\((\w+)\)$'
-)
+# BOL product type rules (checked in order against lower-case name):
+#   "pallet" → PALLET  | variant=105, unit=cubic
+#   "liquid" → TANK    | variant=230, unit=litter
+#   default  → CYLINDER | variant=7,   unit=cubic
+_BOL_TYPE_RULES = [
+    ('pallet', 'PLT', 'PALLET', '105', 'cubic'),
+    ('liquid', 'TNK', 'TANK',   '230', 'litter'),
+]
 
 
 def parse_stock_item_name(name):
     """
     Parse a Tally stock item name into product components.
-    BOL Logic:
-    1. Try Regex pattern <NAME> <QTY> <UNIT> (<TYPE>)
-    2. If no match, name is product_master_name, variant is "CUM", type is "CYL"
-    3. If name contains "liquid", type is always "CON" (CONTAINER)
-    4. Default variant is "CUM", default type is "CYL" (CYLINDER)
+
+    BOL keyword-based product type detection (checked in order):
+      - Name contains 'pallet' → PALLET  | variant=105, unit=cubic
+      - Name contains 'liquid' → TANK    | variant=230, unit=litter
+      - Default               → CYLINDER | variant=7,   unit=cubic
+
+    All stock item names are accepted (no strict format required).
+    The full stock item name is used as the product_master_name.
 
     Args:
-        name: e.g. "Ammonia Gas" or "INDUSTRIAL OXYGEN 4 CUM (CYL)"
+        name: e.g. "LIQUID OXYGEN GAS" or "Nitrogen Gas" or "PALLET 30 NO - 7 CM"
 
     Returns:
         dict with keys: product_master_name, unit_name, variant_name,
@@ -76,32 +78,26 @@ def parse_stock_item_name(name):
 
     # Normalize: collapse multiple spaces into single space
     normalized_name = ' '.join(name.strip().split())
-    
-    # BOL Defaults
+    name_lower = normalized_name.lower()
+
+    # Determine product type, variant, and unit by keyword detection
+    type_code = 'CYL'
+    type_name = 'CYLINDER'
+    canonical_variant = '7'
+    unit_name = 'cubic'
+
+    for keyword, t_code, t_name, variant, unit in _BOL_TYPE_RULES:
+        if keyword in name_lower:
+            type_code = t_code
+            type_name = t_name
+            canonical_variant = variant
+            unit_name = unit
+            break
+
     product_master_name = normalized_name
-    unit_name = "CUM"
-    canonical_variant = "CUM"
-    type_code = "CYL"
-    
-    match = STOCK_NAME_PATTERN.match(normalized_name)
-    if match:
-        product_master_name = match.group(1).strip()
-        quantity = match.group(2).strip()
-        unit_name = match.group(3).strip()
-        type_code = match.group(4).strip().upper()
-        canonical_variant = f"{quantity} {unit_name}"
-    
-    # Special BOL rule: if name contains "liquid", force type to CON (CONTAINER)
-    if "liquid" in normalized_name.lower():
-        type_code = "CON"
 
-    # Get type name from config map
-    type_map = config.PRODUCT_TYPE_MAP
-    type_name = type_map.get(type_code, "CYLINDER" if type_code == "CYL" else "CONTAINER" if type_code == "CON" else type_code)
-
-    # Create canonical name for uniqueness checking
-    # Format: "PRODUCT_MASTER VARIANT (TYPE_CODE)"
-    canonical_name = f"{product_master_name} {canonical_variant} ({type_code})"
+    # Canonical name for duplicate checking: "PRODUCT_MASTER (TYPE_CODE)"
+    canonical_name = f"{product_master_name} ({type_code})"
 
     return {
         'product_master_name': product_master_name,
@@ -116,8 +112,11 @@ def parse_stock_item_name(name):
 def fetch_products_from_all_companies():
     """
     Fetch products from all active Tally companies.
-    Only keeps stock items with recognized type codes in parentheses.
-    Parses name into: product_master_name, unit_name, variant_name, product_type.
+    Determines product type by keyword detection in the stock item name:
+      - 'pallet' → PALLET  (variant=105, unit=cubic)
+      - 'liquid' → TANK    (variant=230, unit=litter)
+      - default  → CYLINDER (variant=7, unit=cubic)
+    All stock items are accepted; no format restriction.
     First-come-first-served duplicate prevention.
     """
     db = Database(config.SQLITE_DB_PATH)
@@ -177,11 +176,8 @@ def fetch_products_from_all_companies():
                 parsed = parse_stock_item_name(product_name)
 
                 if not parsed:
-                    # Not a recognized product type — skip
-                    logger.debug(
-                        f"[SKIPPED] '{product_name}' — no matching type code "
-                        f"(expected one of: {list(config.PRODUCT_TYPE_MAP.keys())})"
-                    )
+                    # parse_stock_item_name only returns None for empty name — skip
+                    logger.debug(f"[SKIPPED] '{product_name}' — empty name")
                     overall_stats['skipped_no_type'] += 1
                     continue
 

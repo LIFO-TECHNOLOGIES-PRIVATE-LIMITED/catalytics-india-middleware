@@ -96,6 +96,8 @@ class CatalyticsSyncer:
         # They only check TALLY_MIDDLEWARE_API_KEY if it's configured in Django settings
         # Since it's not configured, we don't send authentication headers
         headers['Content-Type'] = 'application/json'
+        if self.api_key:
+            headers['Authorization'] = f'Bearer {self.api_key}'
 
         try:
             response = requests.request(
@@ -110,6 +112,56 @@ class CatalyticsSyncer:
         except requests.RequestException as e:
             logger.error(f"API request failed: {e}")
             raise
+
+    def _clean_ledger_data(self, ledger):
+        """Clean and truncate ledger fields to fit database limits before sync."""
+        if not isinstance(ledger, dict):
+            return ledger
+
+        # Field limits based on backend database schema
+        limits = {
+            'NAME': 200,
+            'GUID': 100,
+            'MOBILE': 15,
+            'LEDGERMOBILE': 15,
+            'PHONENUMBER': 15,
+            'PARTYGSTIN': 15,
+            'GSTIN': 15,
+            'INCOMETAXNUMBER': 10,  # PAN
+            'PINCODE': 10,
+            'STATENAME': 150,
+            'EMAIL': 254
+        }
+
+        # Clean specific fields
+        for field, max_len in limits.items():
+            val = ledger.get(field)
+            if val and isinstance(val, str):
+                val = val.strip()
+                # Special cleaning for mobile: if contains '/' or ',', take first part
+                if field in ('MOBILE', 'LEDGERMOBILE', 'PHONENUMBER'):
+                    for sep in ('/', ','):
+                        if sep in val:
+                            val = val.split(sep)[0].strip()
+                            
+                # Special cleaning for PAN/GSTIN: if contains ':', strip it
+                if field in ('PARTYGSTIN', 'GSTIN', 'INCOMETAXNUMBER') and val.startswith(':'):
+                    val = val.lstrip(':')
+                
+                # Truncate if still over limit
+                if len(val) > max_len:
+                    logger.warning(f"Truncating field {field} for ledger '{ledger.get('NAME')}': '{val}' -> '{val[:max_len]}'")
+                    val = val[:max_len]
+                
+                ledger[field] = val
+
+        # Clean primary address (limit 300 for billing)
+        addr = ledger.get('PRIMARY_ADDRESS')
+        if addr and isinstance(addr, str) and len(addr) > 300:
+            logger.warning(f"Truncating address for ledger '{ledger.get('NAME')}': length {len(addr)} -> 300")
+            ledger['PRIMARY_ADDRESS'] = addr[:300]
+            
+        return ledger
 
     # ========================================================================
     # DATA MATCHING / VALIDATION
@@ -628,6 +680,9 @@ class CatalyticsSyncer:
                         val = gst_detail.get('GSTIN', '')
                         if isinstance(val, str) and val.startswith(':'):
                             gst_detail['GSTIN'] = val.lstrip(':')
+
+                # Clean and truncate data before sync to avoid DB errors
+                ledger = self._clean_ledger_data(ledger)
 
                 # Store request payload for debugging
                 request_payload = {
@@ -1355,8 +1410,10 @@ class CatalyticsSyncer:
         if invoice.get('delivery_address') and not voucher_payload.get('CONSIGNEE'):
             voucher_payload['CONSIGNEE'] = {'ADDRESS': invoice.get('delivery_address')}
 
-        if not voucher_payload.get('INVENTORY'):
-            voucher_payload['INVENTORY'] = fallback_payload.get('INVENTORY', [])
+        # Prefer parsed inventory to ensure cleaned quantities (NOS) are sent
+        voucher_payload['INVENTORY'] = fallback_payload.get('INVENTORY', [])
+        if not voucher_payload['INVENTORY'] and stored_voucher.get('INVENTORY'):
+             voucher_payload['INVENTORY'] = stored_voucher.get('INVENTORY')
 
         if not voucher_payload.get('LEDGERENTRIES'):
             voucher_payload['LEDGERENTRIES'] = fallback_payload.get('LEDGERENTRIES', [])

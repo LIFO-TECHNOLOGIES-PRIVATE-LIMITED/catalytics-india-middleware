@@ -84,6 +84,13 @@ class Config:
         so that changes to .env take effect without restarting the dashboard.
         """
         load_dotenv(env_path, override=True)
+        
+        # Refresh sensitive API and DB settings
+        cls.CATALYTICS_API_KEY = os.getenv('CATALYTICS_API_KEY', cls.CATALYTICS_API_KEY)
+        cls.CATALYTICS_API_BASE = os.getenv('CATALYTICS_API_BASE', cls.CATALYTICS_API_BASE)
+        cls.POSTGRES_DB = os.getenv('POSTGRES_DB', cls.POSTGRES_DB)
+        cls.ENTITY_ID = int(os.getenv('ENTITY_ID', str(cls.ENTITY_ID)))
+        
         cls.INVOICE_FETCH_START_DATE = os.getenv('INVOICE_FETCH_START_DATE', '')
         cls.SYNC_INTERVAL_SECONDS = int(os.getenv('SYNC_INTERVAL_SECONDS', '30'))
         cls.FETCH_CUSTOMERS_INTERVAL_MINUTES = int(os.getenv('FETCH_CUSTOMERS_INTERVAL_MINUTES', '10'))

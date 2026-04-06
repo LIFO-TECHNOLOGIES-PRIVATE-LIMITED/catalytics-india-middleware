@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
 # Load configuration
-config.reload_from_env()
+config.config.reload_from_env()
 
 print("=" * 70)
 print("RESET FAILED INVOICES")
@@ -34,7 +34,7 @@ try:
     cursor.execute("""
         SELECT COUNT(*) as failed 
         FROM invoices 
-        WHERE is_synced = 0 AND sync_error IS NOT NULL
+        WHERE is_synced = 0 AND last_sync_error IS NOT NULL
     """)
     failed_count = cursor.fetchone()[0]
     
@@ -57,9 +57,9 @@ try:
     # Reset failed invoices
     cursor.execute("""
         UPDATE invoices 
-        SET sync_error = NULL,
-            sync_response_json = NULL
-        WHERE is_synced = 0 AND sync_error IS NOT NULL
+        SET last_sync_error = NULL,
+            last_response_json = NULL
+        WHERE is_synced = 0 AND last_sync_error IS NOT NULL
     """)
     
     conn.commit()
