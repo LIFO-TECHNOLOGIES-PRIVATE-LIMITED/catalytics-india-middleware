@@ -748,6 +748,9 @@ def parse_delivery_notes(response_xml: str):
                     data[key] = val
 
         data["INVENTORY"] = []
+        basic_user_description = (voucher.findtext(".//BASICUSERDESCRIPTION") or "").strip()
+        if basic_user_description:
+            data["BASICUSERDESCRIPTION"] = basic_user_description
         # Handle both INVENTORYENTRIES.LIST and ALLINVENTORYENTRIES.LIST
         for inv_tag in ["INVENTORYENTRIES.LIST", "ALLINVENTORYENTRIES.LIST"]:
             for inv in voucher.findall(f".//{inv_tag}"):
@@ -761,6 +764,16 @@ def parse_delivery_notes(response_xml: str):
                     v = (child.text or "").strip()
                     if v:
                         item[k] = v
+
+                # For Dissolved Acetylene, Tally often stores the intended qty
+                # (e.g. "2 Nos") in BASICUSERDESCRIPTION instead of BILLEDQTY.
+                # Copy it to item-level fields so fetch/save keeps the correct qty.
+                stock_name = (item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip().lower()
+                if "dissolved acetylene" in stock_name and basic_user_description:
+                    if not item.get("NARRATION"):
+                        item["NARRATION"] = basic_user_description
+                    item["BILLEDQTY"] = basic_user_description
+                    item["ACTUALQTY"] = basic_user_description
 
                 # Extract GODOWNNAME from BATCHALLOCATIONS.LIST
                 for batch in inv.findall(".//BATCHALLOCATIONS.LIST"):
@@ -967,16 +980,32 @@ def parse_delivery_notes(response_xml: str):
         if vehicle_no:
             data["VEHICLENO"] = vehicle_no
 
-        # "Dispatch Doc No." field — used to store driver name in Tally
+        # "Dispatch Doc No." field — often used to store driver/incharge text in Tally
         dispatch_doc_no = (
             voucher.findtext(".//BASICDOCUMENTNO") or
+            voucher.findtext(".//BASICSHIPDOCUMENTNO") or
             voucher.findtext(".//DISPATCHDOCUMENTNO") or
             voucher.findtext(".//DISPATCHDOCNO") or
             ""
         ).strip()
+
+        # Some Customer Pickup DCs store incharge person instead of driver.
+        incharge_name = (
+            voucher.findtext(".//INCHARGENAME") or
+            voucher.findtext(".//INCHARGE") or
+            voucher.findtext(".//CONTACTPERSON") or
+            voucher.findtext(".//BASICCONTACTPERSON") or
+            ""
+        ).strip()
+        if incharge_name:
+            data["INCHARGENAME"] = incharge_name
+
+        # Prefer explicit dispatch/driver field; fallback to incharge for pickup-style entries.
+        effective_driver_name = dispatch_doc_no or incharge_name
         if dispatch_doc_no:
             data["DISPATCHDOCNO"] = dispatch_doc_no
-            data["DRIVERNAME"] = dispatch_doc_no
+        if effective_driver_name:
+            data["DRIVERNAME"] = effective_driver_name
 
         # Extract ledger entries for tax information
         ledger_entries = []
@@ -1808,5 +1837,3 @@ class TallyClient:
             return float(qty_str)
         except (ValueError, TypeError, IndexError):
             return 0.0
-
-
