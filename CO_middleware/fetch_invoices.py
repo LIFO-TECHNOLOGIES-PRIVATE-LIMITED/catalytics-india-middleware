@@ -659,6 +659,38 @@ def _build_payload_hash(
     return db.sha256_text(db.json_dumps(payload))
 
 
+def _sync_customer_now(
+    *,
+    api_base_url: str,
+    entity_id: Optional[int],
+    company_name: str,
+    ledger: Dict[str, Any],
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Try immediate customer sync; returns (ok, response_json, error_msg)."""
+    if not api_base_url:
+        return False, None, "CATALYTICS_API_BASE_URL not set"
+    endpoint = api_base_url.rstrip('/') + '/tally-customer-payload/'
+    payload = {"entity_id": entity_id, "ledger": ledger}
+    if company_name:
+        payload["company_name"] = company_name
+    try:
+        resp = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+        if resp.status_code not in (200, 201):
+            return False, None, f"HTTP {resp.status_code} - {resp.text[:200]}"
+        result = resp.json()
+        response_json = json.dumps(result)
+        if result.get("status") != "success":
+            return False, response_json, f"API non-success: {result.get('message')}"
+        data = result.get("data", {}) or {}
+        if data.get("errors", 0) > 0:
+            return False, response_json, "API returned customer errors"
+        if data.get("created", 0) == 0 and data.get("updated", 0) == 0:
+            return False, response_json, "Customer not created/updated"
+        return True, response_json, None
+    except Exception as exc:
+        return False, None, str(exc)
+
+
 # ---------------------------------------------------------------------------
 # Delivery-term resolution: maps abbreviations/typos to standard terms.
 # Users in Tally may type single letters or short words in OTHERREFERENCE.
@@ -774,8 +806,9 @@ def build_config(args: argparse.Namespace) -> FetchConfig:
         log_level=args.log_level or cfg.get_env("LOG_LEVEL", "INFO"),
         log_json=bool(args.log_json) or cfg.get_env_bool("LOG_JSON", False),
         log_file=args.log_file or cfg.get_env("LOG_FILE"),
+        # Reference filtering is optional. Empty means "fetch all DCs".
         reference_keywords=_parse_reference_keywords(
-            cfg.get_env("DC_REFERENCE_KEYWORDS", "delivery,customer pickup,supplier,traders,dealers pickup")
+            cfg.get_env("DC_REFERENCE_KEYWORDS", "")
         ),
         master_db_path=(
             str(BASE_DIR / cfg.config.SQLITE_DB_PATH)
@@ -840,7 +873,8 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     )
 
     # Get date range
-    if config.from_date and config.to_date:
+    user_specified_range = bool(config.from_date and config.to_date)
+    if user_specified_range:
         from_date = config.from_date
         to_date = config.to_date
         logger.info("Using user-specified date range %s to %s", from_date, to_date)
@@ -857,6 +891,11 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     logger.info("Date Range:   %s to %s", from_date, to_date)
     logger.info("Days Back:    %s", config.days_back)
     logger.info("Fetch Stock:  %s", config.fetch_stock)
+    logger.info(
+        "Reference Filter: %s",
+        "ENABLED (user-specified range)" if (config.reference_keywords and user_specified_range)
+        else "DISABLED (default 3-day Day Book window)",
+    )
     logger.info("=" * 60)
 
     # get_delivery_notes uses Day Book (current date only)
@@ -939,7 +978,20 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
         voucher_date = voucher.get("DATE") or ""
         party_name = voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME") or ""
-        reference = voucher.get("REFERENCE") or voucher.get("PONUMBER") or ""
+        reference = (
+            voucher.get("OTHERREFERENCE")
+            or voucher.get("PONUMBER")
+            or voucher.get("REFERENCE")
+            or voucher.get("VOUCHERREFERENCE")
+            or ""
+        ).strip()
+
+        # Restrict to vouchers that carry a usable other/reference value.
+        if not reference:
+            skipped += 1
+            skipped_ref_filter += 1
+            logger.info("Skipping DC %s (%s): empty OTHERREFERENCE/REFERENCE", dc_no, party_name or "?")
+            continue
 
         # --- Liquid product pre-creation (BEFORE any validation so it always runs) ---
         inventory_items = voucher.get("INVENTORY") or []
@@ -1010,7 +1062,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                 break
 
         # --- Reference keyword filter ---
-        if config.reference_keywords:
+        if config.reference_keywords and user_specified_range:
             ref_text = _extract_reference_text(voucher)
             # Normal keyword match (full words in combined reference fields)
             _ref_matches = any(kw in ref_text for kw in config.reference_keywords)
@@ -1120,6 +1172,44 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                         party_name, dc_no, _cust_gstin or 'N/A',
                         _cust_state or 'N/A', _cust_pincode or 'N/A',
                     )
+
+                    # Immediate sync for auto-created customer.
+                    _cust_row = master_db_instance.conn.execute(
+                        "SELECT id FROM customers WHERE lower(replace(name, ' ', '')) = ? ORDER BY id DESC LIMIT 1",
+                        (normalized_party,),
+                    ).fetchone()
+                    _cust_id = int(_cust_row["id"]) if _cust_row else None
+                    _ledger_for_sync = {
+                        "NAME": party_name,
+                        "PARTYGSTIN": _cust_gstin,
+                        "GSTIN": _cust_gstin,
+                        "INCOMETAXNUMBER": _cust_pan,
+                        "STATENAME": _cust_state,
+                        "STATE": _cust_state,
+                        "PINCODE": _cust_pincode,
+                        "MOBILE": _cust_phone,
+                        "EMAIL": _cust_email,
+                        "PRIMARY_ADDRESS": _cust_address,
+                        "COUNTRY": _cust_country,
+                    }
+                    if _delivery_addresses:
+                        _ledger_for_sync["DELIVERY_ADDRESSES"] = _delivery_addresses
+                    _ok, _resp_json, _err = _sync_customer_now(
+                        api_base_url=_api_url,
+                        entity_id=config.entity_id,
+                        company_name=company_name,
+                        ledger=_ledger_for_sync,
+                    )
+                    if _cust_id is not None:
+                        if _ok:
+                            master_db_instance.mark_customer_synced(_cust_id, None, _resp_json)
+                            logger.info("[DC-DRIVEN NEW CUSTOMER] '%s' synced to server", party_name)
+                        else:
+                            master_db_instance.mark_customer_sync_failed(_cust_id, _err or "sync failed", _resp_json)
+                            logger.warning(
+                                "[DC-DRIVEN NEW CUSTOMER] '%s' local only; server sync failed: %s",
+                                party_name, _err or "unknown error",
+                            )
                 except Exception as exc:
                     logger.error("[DC-DRIVEN] Failed to create customer '%s' from DC %s: %s",
                                  party_name, dc_no, exc)
@@ -1399,10 +1489,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
 
 
 

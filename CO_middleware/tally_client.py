@@ -967,6 +967,17 @@ def parse_delivery_notes(response_xml: str):
         if vehicle_no:
             data["VEHICLENO"] = vehicle_no
 
+        # "Dispatch Doc No." field — used to store driver name in Tally
+        dispatch_doc_no = (
+            voucher.findtext(".//BASICDOCUMENTNO") or
+            voucher.findtext(".//DISPATCHDOCUMENTNO") or
+            voucher.findtext(".//DISPATCHDOCNO") or
+            ""
+        ).strip()
+        if dispatch_doc_no:
+            data["DISPATCHDOCNO"] = dispatch_doc_no
+            data["DRIVERNAME"] = dispatch_doc_no
+
         # Extract ledger entries for tax information
         ledger_entries = []
         for ledger_tag in ["LEDGERENTRIES.LIST", "ALLLEDGERENTRIES.LIST"]:
@@ -1409,11 +1420,13 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
         # Filter delivery vouchers by keyword matching on VOUCHERTYPENAME.
         # No separate Tally API call needed — the Day Book response already
         # contains the voucher type for each voucher.
-        delivery_keywords = ("delivery", "challan")
+        # Accept common custom/misspelled naming seen in Tally voucher types.
+        delivery_keywords = ("delivery", "delivary", "challan", "dc")
 
         def _is_delivery(v):
             vtype = (v.get("VOUCHERTYPENAME") or v.get("VOUCHERTYPE") or "").strip().lower()
-            return any(kw in vtype for kw in delivery_keywords)
+            # Match whole-word "dc" to avoid accidental matches in unrelated text.
+            return any(kw in vtype for kw in delivery_keywords if kw != "dc") or bool(re.search(r"\bdc\b", vtype))
 
         logger.info("[FUNCTION] Sending Day Book request to Tally...")
         print("[FUNCTION] Sending Day Book request to Tally...")
@@ -1795,6 +1808,5 @@ class TallyClient:
             return float(qty_str)
         except (ValueError, TypeError, IndexError):
             return 0.0
-
 
 

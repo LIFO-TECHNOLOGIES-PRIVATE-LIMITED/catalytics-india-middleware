@@ -80,6 +80,7 @@ class AutomationManager:
         self.threads = {}
         self.stop_flags = {}
         self.lock = threading.Lock()
+        self.run_lock = threading.Lock()
         self._master_initial_done = threading.Event()
         self.state = self._load_state()
 
@@ -194,10 +195,9 @@ class AutomationManager:
                 self.state['next_runs'][task] = (datetime.now() + timedelta(seconds=delay)).isoformat()
             self._save_state()
 
-        # DC fetch and sync start immediately — no need to wait for master fetch.
-        # DC-driven creation handles missing customers/products in real-time.
-        # Master fetch runs daily as a background full refresh.
-        self._master_initial_done.set()
+        # Run initial master fetch first, then unblock DC fetch/sync loops.
+        # This avoids startup write contention on SQLite.
+        self._master_initial_done.clear()
         logger.info("Starting automation threads...")
         self._start_thread('fetch_master', self._fetch_master_loop)
         self._start_thread('fetch_invoices', self._fetch_invoices_loop)
@@ -382,25 +382,26 @@ class AutomationManager:
                 prod_new = prod_updated = 0
                 cust_new = cust_updated = 0
 
-                if cfg.get_env_bool("AUTO_FETCH_PRODUCTS", False):
-                    try:
-                        result = fetch_products_from_all_companies()
-                        prod_new = result.get('new_saved', 0)
-                        prod_updated = result.get('updated', 0)
-                    except Exception as e:
-                        logger.error(f"Product fetch failed: {e}", exc_info=True)
-                else:
-                    logger.info("Product auto-fetch disabled (AUTO_FETCH_PRODUCTS=false)")
+                with self.run_lock:
+                    if cfg.get_env_bool("AUTO_FETCH_PRODUCTS", False):
+                        try:
+                            result = fetch_products_from_all_companies()
+                            prod_new = result.get('new_saved', 0)
+                            prod_updated = result.get('updated', 0)
+                        except Exception as e:
+                            logger.error(f"Product fetch failed: {e}", exc_info=True)
+                    else:
+                        logger.info("Product auto-fetch disabled (AUTO_FETCH_PRODUCTS=false)")
 
-                if cfg.get_env_bool("AUTO_FETCH_CUSTOMERS", False):
-                    try:
-                        result = fetch_customers_from_all_companies()
-                        cust_new = result.get('new_saved', 0)
-                        cust_updated = result.get('updated', 0)
-                    except Exception as e:
-                        logger.error(f"Customer fetch failed: {e}", exc_info=True)
-                else:
-                    logger.info("Customer auto-fetch disabled (AUTO_FETCH_CUSTOMERS=false)")
+                    if cfg.get_env_bool("AUTO_FETCH_CUSTOMERS", False):
+                        try:
+                            result = fetch_customers_from_all_companies()
+                            cust_new = result.get('new_saved', 0)
+                            cust_updated = result.get('updated', 0)
+                        except Exception as e:
+                            logger.error(f"Customer fetch failed: {e}", exc_info=True)
+                    else:
+                        logger.info("Customer auto-fetch disabled (AUTO_FETCH_CUSTOMERS=false)")
 
                 self._log_to_dashboard(
                     f"=== AUTO: FETCH MASTER DATA COMPLETED "
@@ -448,6 +449,9 @@ class AutomationManager:
         if self._is_stopped(task):
             return
 
+        if not self._wait_for_initial_master(task):
+            return
+
         while not self._is_stopped(task):
             try:
                 self._prepare_task_run(task)
@@ -470,7 +474,8 @@ class AutomationManager:
 
                 fetch_created = fetch_updated = 0
                 try:
-                    result = fetch_invoices_once(build_fetch_invoices_config(fetch_args))
+                    with self.run_lock:
+                        result = fetch_invoices_once(build_fetch_invoices_config(fetch_args))
                     fetch_created = result.get('created', 0)
                     fetch_updated = result.get('updated', 0)
                     if fetch_created or fetch_updated:
@@ -519,22 +524,23 @@ class AutomationManager:
                 customer_stats = {'sent': 0, 'ok': 0, 'failed': 0}
                 dc_stats = {'sent': 0, 'ok': 0, 'failed': 0}
 
-                master_sync_args = self._build_master_sync_args()
-                try:
-                    product_stats = sync_products_once(build_product_sync_config(master_sync_args))
-                except Exception as e:
-                    logger.error(f"Product sync failed: {e}", exc_info=True)
+                with self.run_lock:
+                    master_sync_args = self._build_master_sync_args()
+                    try:
+                        product_stats = sync_products_once(build_product_sync_config(master_sync_args))
+                    except Exception as e:
+                        logger.error(f"Product sync failed: {e}", exc_info=True)
 
-                try:
-                    customer_stats = sync_customers_once(build_customer_sync_config(master_sync_args))
-                except Exception as e:
-                    logger.error(f"Customer sync failed: {e}", exc_info=True)
+                    try:
+                        customer_stats = sync_customers_once(build_customer_sync_config(master_sync_args))
+                    except Exception as e:
+                        logger.error(f"Customer sync failed: {e}", exc_info=True)
 
-                dc_sync_args = self._build_dc_sync_args()
-                try:
-                    dc_stats = sync_dc_once(build_dc_sync_config(dc_sync_args))
-                except Exception as e:
-                    logger.error(f"DC sync failed: {e}", exc_info=True)
+                    dc_sync_args = self._build_dc_sync_args()
+                    try:
+                        dc_stats = sync_dc_once(build_dc_sync_config(dc_sync_args))
+                    except Exception as e:
+                        logger.error(f"DC sync failed: {e}", exc_info=True)
 
                 self._log_to_dashboard(
                     "=== AUTO: SYNC COMPLETED "
@@ -567,4 +573,3 @@ def get_manager():
     if _manager is None:
         _manager = AutomationManager()
     return _manager
-

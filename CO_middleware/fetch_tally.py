@@ -1,9 +1,11 @@
 ﻿import argparse
 from dataclasses import dataclass
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import os
+import requests
 import sys
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -105,6 +107,42 @@ def _build_payload_hash(
     return db.sha256_text(db.json_dumps(payload))
 
 
+def _normalize_name_key(value: str) -> str:
+    return str(value or "").replace(" ", "").strip().lower()
+
+
+def _sync_customer_now(
+    *,
+    api_base_url: str,
+    entity_id: Optional[int],
+    company_name: str,
+    ledger: Dict[str, Any],
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Try immediate customer sync; returns (ok, response_json, error_msg)."""
+    if not api_base_url:
+        return False, None, "CATALYTICS_API_BASE_URL not set"
+    endpoint = api_base_url.rstrip('/') + '/tally-customer-payload/'
+    payload = {"entity_id": entity_id, "ledger": ledger}
+    if company_name:
+        payload["company_name"] = company_name
+    try:
+        resp = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+        if resp.status_code not in (200, 201):
+            return False, None, f"HTTP {resp.status_code} - {resp.text[:200]}"
+        result = resp.json()
+        response_json = json.dumps(result)
+        if result.get("status") != "success":
+            return False, response_json, f"API non-success: {result.get('message')}"
+        data = result.get("data", {}) or {}
+        if data.get("errors", 0) > 0:
+            return False, response_json, "API returned customer errors"
+        if data.get("created", 0) == 0 and data.get("updated", 0) == 0:
+            return False, response_json, "Customer not created/updated"
+        return True, response_json, None
+    except Exception as exc:
+        return False, None, str(exc)
+
+
 def build_config(args: argparse.Namespace) -> FetchConfig:
     env_path = getattr(args, "config", None) or DEFAULT_ENV_PATH
     cfg.load_env_file(env_path)
@@ -162,6 +200,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
     vouchers = tally_api.get_delivery_notes(company_name, config.tally_url, from_date, to_date)
     logger.info("Fetched %d delivery notes from Tally", len(vouchers))
+    customer_api_url = cfg.get_env("CATALYTICS_API_BASE_URL", "") or ""
 
     created = 0
     updated = 0
@@ -174,6 +213,19 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
         dc_no = _normalize_dc_no(voucher)
         if not dc_no:
             skipped += 1
+            continue
+
+        # Restrict to vouchers that carry a usable other/reference value.
+        ref_value = (
+            voucher.get("OTHERREFERENCE")
+            or voucher.get("PONUMBER")
+            or voucher.get("REFERENCE")
+            or voucher.get("VOUCHERREFERENCE")
+            or ""
+        ).strip()
+        if not ref_value:
+            skipped += 1
+            logger.info("Skipping DC %s: empty OTHERREFERENCE/REFERENCE", dc_no)
             continue
 
         existing_json = None
@@ -201,7 +253,156 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
         voucher_date = voucher.get("DATE") or ""
         party_name = voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME") or ""
-        reference = voucher.get("REFERENCE") or voucher.get("PONUMBER") or ""
+        reference = ref_value
+
+        # DC-driven customer creation: if party does not exist in local DB, create it from voucher data.
+        normalized_party = _normalize_name_key(party_name)
+        if normalized_party:
+            exists = conn.execute(
+                "SELECT id FROM customers WHERE lower(replace(name, ' ', '')) = ?",
+                (normalized_party,),
+            ).fetchone()
+            if not exists:
+                cust_gstin = (voucher.get("PARTYGSTIN") or voucher.get("CONSIGNEEGSTIN") or "").strip()
+                cust_pan = (voucher.get("BUYERPINNUMBER") or "").strip()
+                cust_state = (voucher.get("STATENAME") or voucher.get("CONSIGNEESTATENAME") or "").strip()
+                cust_pincode = (voucher.get("PARTYPINCODE") or voucher.get("CONSIGNEEPINCODE") or "").strip()
+                cust_country = (voucher.get("COUNTRYOFRESIDENCE") or "").strip()
+
+                cust_phone = ""
+                cust_email = ""
+                cust_address = ""
+                addr_lines = voucher.get("ADDRESSES") or []
+                if isinstance(addr_lines, list):
+                    addr_parts: List[str] = []
+                    for line in addr_lines:
+                        text = str(line).strip()
+                        low = text.lower()
+                        if low.startswith("phone:"):
+                            cust_phone = text[6:].strip()
+                        elif low.startswith("email:"):
+                            cust_email = text[6:].strip()
+                        elif text:
+                            addr_parts.append(text)
+                    cust_address = ", ".join(addr_parts)
+
+                consignee = voucher.get("CONSIGNEE") or {}
+                delivery_addresses = []
+                if isinstance(consignee, dict) and (consignee.get("ADDRESS") or consignee.get("NAME")):
+                    delivery_addresses.append({
+                        "name": consignee.get("NAME", ""),
+                        "address": consignee.get("ADDRESS", ""),
+                        "state": consignee.get("STATE", ""),
+                        "country": cust_country or "India",
+                        "pincode": consignee.get("PINCODE", ""),
+                        "gstin": consignee.get("GSTIN", ""),
+                    })
+
+                customer_data_json = json.dumps({
+                    "NAME": party_name,
+                    "PARTYGSTIN": cust_gstin,
+                    "INCOMETAXNUMBER": cust_pan,
+                    "STATE": cust_state,
+                    "PINCODE": cust_pincode,
+                    "MOBILE": cust_phone,
+                    "EMAIL": cust_email,
+                    "COUNTRY": cust_country,
+                    "_source": "dc_voucher",
+                    "_dc_no": dc_no,
+                })
+                try:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO customers (
+                            tally_guid, name, tally_company, gstin, pan,
+                            address, state, city, pincode, phone, email,
+                            delivery_addresses_json, data_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "",
+                            party_name,
+                            company_name,
+                            cust_gstin,
+                            cust_pan,
+                            cust_address,
+                            cust_state,
+                            "",
+                            cust_pincode,
+                            cust_phone,
+                            cust_email,
+                            json.dumps(delivery_addresses) if delivery_addresses else None,
+                            customer_data_json,
+                        ),
+                    )
+                    customer_id = int(cur.lastrowid)
+                    logger.info(
+                        "[DC-DRIVEN NEW CUSTOMER] '%s' created from DC %s (GSTIN: %s, state: %s, pincode: %s)",
+                        party_name,
+                        dc_no,
+                        cust_gstin or "N/A",
+                        cust_state or "N/A",
+                        cust_pincode or "N/A",
+                    )
+
+                    ledger_for_sync = {
+                        "NAME": party_name,
+                        "PARTYGSTIN": cust_gstin,
+                        "GSTIN": cust_gstin,
+                        "INCOMETAXNUMBER": cust_pan,
+                        "STATENAME": cust_state,
+                        "STATE": cust_state,
+                        "PINCODE": cust_pincode,
+                        "MOBILE": cust_phone,
+                        "EMAIL": cust_email,
+                        "PRIMARY_ADDRESS": cust_address,
+                        "COUNTRY": cust_country,
+                    }
+                    if delivery_addresses:
+                        ledger_for_sync["DELIVERY_ADDRESSES"] = delivery_addresses
+                    ok, response_json, err_msg = _sync_customer_now(
+                        api_base_url=customer_api_url,
+                        entity_id=config.entity_id,
+                        company_name=company_name,
+                        ledger=ledger_for_sync,
+                    )
+                    if ok:
+                        conn.execute(
+                            """
+                            UPDATE customers
+                            SET is_synced = 1,
+                                last_response_json = ?,
+                                last_sync_at = CURRENT_TIMESTAMP,
+                                last_sync_error = NULL
+                            WHERE id = ?
+                            """,
+                            (response_json, customer_id),
+                        )
+                        logger.info("[DC-DRIVEN NEW CUSTOMER] '%s' synced to server", party_name)
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE customers
+                            SET sync_attempts = sync_attempts + 1,
+                                last_sync_error = ?,
+                                last_response_json = ?,
+                                last_sync_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (err_msg or "sync failed", response_json, customer_id),
+                        )
+                        logger.warning(
+                            "[DC-DRIVEN NEW CUSTOMER] '%s' local only; server sync failed: %s",
+                            party_name,
+                            err_msg or "unknown error",
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "[DC-DRIVEN] Failed to create customer '%s' from DC %s: %s",
+                        party_name,
+                        dc_no,
+                        exc,
+                    )
 
         dn_id = db.upsert_delivery_note(
             conn,
@@ -333,6 +534,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-

@@ -1,6 +1,7 @@
 ﻿import argparse
 from dataclasses import dataclass
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 import os
 import sys
@@ -726,6 +727,41 @@ def _remap_liquid_inventory_items(
             )
 
 
+_DA_GAS_PRODUCT_KEY = "dissolved acetylene gas (cyl)"
+
+
+def _fix_da_gas_qty(items: List[Dict[str, Any]]) -> None:
+    """
+    For 'Dissolved Acetylene Gas (Cyl)' items, BILLEDQTY/ACTUALQTY in Tally is
+    incorrect. The correct qty is stored in the item's NARRATION description field.
+    Extracts the first number from NARRATION and sets it as the qty.
+    Mutates items in-place.
+    """
+    for item in items:
+        stock_name = (item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
+        if stock_name.lower() != _DA_GAS_PRODUCT_KEY:
+            continue
+        narration = (item.get("NARRATION") or "").strip()
+        if not narration:
+            logger.warning("[DA GAS QTY] '%s' — no NARRATION found, keeping original qty", stock_name)
+            continue
+        match = re.search(r'\d+(?:\.\d+)?', narration)
+        if match:
+            qty_str = match.group(0)
+            logger.info(
+                "[DA GAS QTY] '%s' narration='%s' -> qty=%s (was BILLEDQTY=%s ACTUALQTY=%s)",
+                stock_name, narration, qty_str,
+                item.get("BILLEDQTY", ""), item.get("ACTUALQTY", ""),
+            )
+            item["BILLEDQTY"] = qty_str
+            item["ACTUALQTY"] = qty_str
+        else:
+            logger.warning(
+                "[DA GAS QTY] '%s' narration='%s' — no number found, keeping original qty",
+                stock_name, narration,
+            )
+
+
 def _build_payload_for_note(
     conn,
     note: Dict[str, Any],
@@ -743,6 +779,9 @@ def _build_payload_for_note(
     # Remap liquid product names to their canonical form before syncing
     if liquid_master_map is not None and liquid_variant_map is not None:
         _remap_liquid_inventory_items(items, liquid_master_map, liquid_variant_map)
+
+    # Fix qty for Dissolved Acetylene Gas (Cyl) — correct qty is in NARRATION
+    _fix_da_gas_qty(items)
 
     voucher["INVENTORY"] = items
 
