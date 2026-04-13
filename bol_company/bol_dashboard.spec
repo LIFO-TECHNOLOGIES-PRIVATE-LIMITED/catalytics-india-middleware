@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('templates', 'templates')]
 binaries = []
-hiddenimports = ['fetch_customers', 'fetch_products', 'fetch_invoices', 'sync_to_catalytics', 'verify_sync', 'automation_manager', 'data_matcher']
+hiddenimports = ['fetch_customers', 'fetch_products', 'fetch_invoices', 'sync_to_catalytics', 'verify_sync', 'automation_manager', 'data_matcher', 'log_capture', 'fetch_master_data']
 tmp_ret = collect_all('psycopg2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

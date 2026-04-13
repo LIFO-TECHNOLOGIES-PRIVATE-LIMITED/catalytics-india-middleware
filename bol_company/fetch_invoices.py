@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from config import config, BASE_DIR
 from db import Database, json_dumps, json_loads, sha256_text
 from tally_client import TallyClient
-from fetch_products import parse_stock_item_name
+from fetch_products import parse_stock_item_name, canonical_unit_name
 
 # Try to import dashboard logger (optional - may not be available)
 try:
@@ -155,25 +155,43 @@ def _invoice_in_date_range(invoice, from_date, to_date):
 
 
 def _has_delivery_info(invoice):
-    """Return True only when Other References indicates delivery/pickup."""
-    raw = invoice.get('raw_voucher', {}) or {}
-    vtype = str(raw.get('VOUCHERTYPENAME') or raw.get('VOUCHERTYPE') or '').strip().lower()
-    if 'sale' in vtype or 'invoice' in vtype:
-        return True
+    """
+    Mandatory check: Other Reference (BASICORDERREF / OTHERREFERENCE) must indicate
+    delivery or customer pickup.
 
-    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip().lower()
+    Accepted values:
+      D / delivery / delivery challan / dispatch  → Delivery type
+      C / customer pickup / pickup / self pickup  → Customer Pickup type
+
+    Returns True only when Other Reference contains one of these values.
+    If the field is empty or has a different value, returns False (invoice skipped).
+    """
+    raw = invoice.get('raw_voucher', {}) or {}
+    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip()
+
     if not other_ref:
         return False
 
-    other_ref_norm = ' '.join(other_ref.split())
+    other_ref_lower = other_ref.lower()
+    other_ref_norm = ' '.join(other_ref_lower.split())
     other_ref_compact = other_ref_norm.replace(' ', '')
 
-    exact = {'dc'}
-    substrings = ('delivery', 'delivery challan', 'dispatch', 'customer pickup', 'pickup', 'self pickup', 'self')
+    # D = Delivery, C = Customer Pickup (exact single-char match)
+    if other_ref_norm == 'd' or other_ref_norm == 'c':
+        return True
 
-    if other_ref_norm in exact: return True
-    if any(key in other_ref_norm for key in substrings): return True
-    if 'customerpickup' in other_ref_compact or 'deliverychallan' in other_ref_compact: return True
+    # Delivery keywords
+    if any(kw in other_ref_norm for kw in ('delivery', 'dispatch')):
+        return True
+    if 'deliverychallan' in other_ref_compact:
+        return True
+
+    # Customer Pickup keywords
+    if any(kw in other_ref_norm for kw in ('customer pickup', 'pickup', 'self pickup')):
+        return True
+    if 'customerpickup' in other_ref_compact:
+        return True
+
     return False
 
 
@@ -181,21 +199,181 @@ def _normalize_name_key(value):
     return str(value or '').replace(' ', '').strip().lower()
 
 
+def _auto_fetch_customer(db, tally, company_name, customer_name):
+    """Auto-fetch a single customer from Tally and save to SQLite.
+    Returns the customer data_json dict on success, None on failure."""
+    import json as _json
+    from tally_client import get_ledger_by_name
+
+    try:
+        ledger = get_ledger_by_name(company_name, customer_name, tally.url)
+        if not ledger:
+            logger.warning(f"[AUTO-FETCH] Customer '{customer_name}' not found in Tally")
+            return None
+
+        guid = ledger.get('GUID') or ledger.get('MASTERID') or ''
+        name = (ledger.get('NAME') or customer_name).strip()
+        normalized_name = ' '.join(name.split())
+
+        customer_data = {
+            'tally_guid': str(guid).strip(),
+            'name': normalized_name,
+            'tally_company': company_name,
+            'gstin': (ledger.get('GSTIN') or ledger.get('PARTYGSTIN') or '').lstrip(':'),
+            'pan': ledger.get('INCOMETAXNUMBER') or ledger.get('PANNUMBER') or '',
+            'address': ', '.join(ledger.get('ADDRESSES', [])) if ledger.get('ADDRESSES') else '',
+            'state': ledger.get('STATENAME') or '',
+            'city': '',
+            'pincode': ledger.get('PINCODE') or '',
+            'phone': ledger.get('MOBILE') or ledger.get('LEDGERMOBILE') or '',
+            'email': ledger.get('EMAIL') or ledger.get('LEDGEREMAIL') or '',
+        }
+        # Simple dict for data_json (same format as fetch_customers)
+        simple_data = {
+            'guid': customer_data['tally_guid'],
+            'name': customer_data['name'],
+            'parent_group': ledger.get('PARENT') or '',
+            'gstin': customer_data['gstin'],
+            'pan': customer_data['pan'],
+            'address': customer_data['address'],
+            'state': customer_data['state'],
+            'city': '',
+            'pincode': customer_data['pincode'],
+            'phone': customer_data['phone'],
+            'email': customer_data['email'],
+        }
+        customer_data['data_json'] = _json.dumps(simple_data)
+
+        # GUID-based: update if exists, insert if new
+        existing = db.customer_exists_by_guid(customer_data['tally_guid']) if customer_data['tally_guid'] else None
+        if existing:
+            db.update_customer(existing['id'], customer_data)
+            logger.info(f"[AUTO-FETCH] Customer '{normalized_name}' updated in SQLite (GUID: {customer_data['tally_guid']})")
+        else:
+            db.insert_customer(customer_data)
+            logger.info(f"[AUTO-FETCH] Customer '{normalized_name}' saved to SQLite (GUID: {customer_data['tally_guid']})")
+
+        return simple_data
+
+    except Exception as e:
+        logger.error(f"[AUTO-FETCH] Failed to fetch customer '{customer_name}': {e}")
+        return None
+
+
+def _auto_fetch_product(db, tally, company_name, product_name):
+    """Auto-fetch a single product from Tally and save to SQLite.
+    Returns the product data_json dict on success, None on failure."""
+    import json as _json
+    from tally_client import get_stock_item_by_name
+
+    try:
+        stock = get_stock_item_by_name(company_name, product_name, tally.url)
+        if not stock:
+            logger.warning(f"[AUTO-FETCH] Product '{product_name}' not found in Tally")
+            return None
+
+        guid = stock.get('GUID') or stock.get('MASTERID') or ''
+        name = (stock.get('NAME') or product_name).strip()
+
+        # Parse product type from name
+        parsed = parse_stock_item_name(name)
+        if not parsed:
+            parsed = {
+                'product_master_name': name,
+                'unit_name': canonical_unit_name('cubic'),
+                'variant_name': '7',
+                'product_type_code': 'CYL',
+                'product_type_name': 'CYLINDER',
+                'canonical_name': f'{name} (CYL)',
+            }
+
+        # Simple dict for data_json (same format as fetch_products / TallyClient.get_products)
+        simple_data = {
+            'guid': str(guid).strip(),
+            'name': name,
+            'hsn_code': stock.get('HSNCODE') or '',
+            'unit': stock.get('BASEUNITS') or '',
+            'rate': 0.0,
+            'gst_applicable': '',
+            'gst_rate': stock.get('GST_RATE') or 0.0,
+            'igst_rate': stock.get('IGST_RATE') or 0.0,
+            'cgst_rate': stock.get('CGST_RATE') or 0.0,
+            'sgst_rate': stock.get('SGST_RATE') or 0.0,
+            'description': stock.get('PARENT') or '',
+        }
+
+        product_data = {
+            'tally_guid': simple_data['guid'],
+            'name': name,
+            'name_canonical': parsed['canonical_name'],
+            'tally_company': company_name,
+            'hsn_code': simple_data['hsn_code'],
+            'unit': simple_data['unit'],
+            'rate': simple_data['rate'],
+            'description': simple_data['description'],
+            'data_json': _json.dumps(simple_data),
+            'product_master_name': parsed['product_master_name'],
+            'variant_name': parsed['variant_name'],
+            'unit_name': parsed['unit_name'],
+            'product_type_code': parsed['product_type_code'],
+            'product_type_name': parsed['product_type_name'],
+            'gst_applicable': simple_data['gst_applicable'],
+            'gst_rate': simple_data['gst_rate'],
+            'igst_rate': simple_data['igst_rate'],
+            'cgst_rate': simple_data['cgst_rate'],
+            'sgst_rate': simple_data['sgst_rate'],
+        }
+
+        # GUID-based: update if exists, insert if new
+        existing = db.product_exists_by_guid(product_data['tally_guid']) if product_data['tally_guid'] else None
+        if existing:
+            db.update_product(existing['id'], product_data)
+            logger.info(f"[AUTO-FETCH] Product '{name}' updated in SQLite (GUID: {product_data['tally_guid']})")
+        else:
+            db.insert_product(product_data)
+            logger.info(f"[AUTO-FETCH] Product '{name}' saved to SQLite (GUID: {product_data['tally_guid']})")
+
+        return simple_data
+
+    except Exception as e:
+        logger.error(f"[AUTO-FETCH] Failed to fetch product '{product_name}': {e}")
+        return None
+
+
 def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date, ledger_cache, stock_cache, overall_stats):
     """Process a batch of invoices and save to database."""
     overall_stats['total_fetched'] += len(invoices)
-    
+
     for invoice in invoices:
         voucher_no = invoice.get('voucher_no', '')
         customer_name = invoice.get('customer_name', '')
+        voucher_date = invoice.get('voucher_date', '')
 
-        if not voucher_no or not customer_name: continue
+        if not voucher_no or not customer_name:
+            logger.warning(
+                f"[SKIP:EMPTY] Invoice skipped — "
+                f"voucher_no={'(empty)' if not voucher_no else voucher_no}, "
+                f"customer={'(empty)' if not customer_name else customer_name}"
+            )
+            continue
 
         if not _invoice_in_date_range(invoice, from_date, to_date):
+            logger.info(
+                f"[SKIP:DATE] #{voucher_no} | date={voucher_date} | "
+                f"customer='{customer_name}' | reason: before from_date {from_date}"
+            )
             overall_stats['skipped_date'] += 1
             continue
 
         if not _has_delivery_info(invoice):
+            raw = invoice.get('raw_voucher', {}) or {}
+            vtype = str(raw.get('VOUCHERTYPENAME') or raw.get('VOUCHERTYPE') or '').strip()
+            other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip()
+            logger.info(
+                f"[SKIP:NO_DELIVERY] #{voucher_no} | date={voucher_date} | "
+                f"customer='{customer_name}' | voucher_type='{vtype}' | "
+                f"other_ref='{other_ref}'"
+            )
             overall_stats['skipped_no_delivery'] += 1
             continue
 
@@ -210,8 +388,24 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
 
         ledger_data = ledger_cache[ledger_cache_key]
         if not ledger_data:
-            overall_stats['skipped_missing_customer'] += 1
-            continue
+            # Auto-fetch customer from Tally and save to SQLite
+            logger.info(
+                f"[AUTO-FETCH:CUSTOMER] #{voucher_no} | customer='{customer_name}' "
+                f"not in SQLite — fetching from Tally..."
+            )
+            fetched = _auto_fetch_customer(db, tally, company_name, customer_name)
+            if fetched:
+                ledger_cache[ledger_cache_key] = fetched
+                ledger_data = fetched
+                overall_stats.setdefault('auto_fetched_customers', 0)
+                overall_stats['auto_fetched_customers'] += 1
+            else:
+                logger.warning(
+                    f"[SKIP:MISSING_CUSTOMER] #{voucher_no} | date={voucher_date} | "
+                    f"customer='{customer_name}' | reason: not found in SQLite or Tally"
+                )
+                overall_stats['skipped_missing_customer'] += 1
+                continue
 
         inventory_items = invoice.get('items', [])
         stock_items_map = {}
@@ -226,15 +420,39 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                     stock_cache[stock_cache_key] = json_loads(row['data_json']) if (row and row['data_json']) else None
                 except Exception:
                     stock_cache[stock_cache_key] = None
-            
+
             if stock_cache.get(stock_cache_key):
                 stock_items_map[item_name] = stock_cache[stock_cache_key]
             else:
                 missing_products.append(item_name)
 
+        # Auto-fetch missing products from Tally
         if missing_products:
-            overall_stats['skipped_missing_product'] += 1
-            continue
+            still_missing = []
+            for mp_name in missing_products:
+                logger.info(
+                    f"[AUTO-FETCH:PRODUCT] #{voucher_no} | product='{mp_name}' "
+                    f"not in SQLite — fetching from Tally..."
+                )
+                fetched = _auto_fetch_product(db, tally, company_name, mp_name)
+                if fetched:
+                    normalized_mp = _normalize_name_key(mp_name)
+                    cache_key = f"{company_name}::{normalized_mp}"
+                    stock_cache[cache_key] = fetched
+                    stock_items_map[mp_name] = fetched
+                    overall_stats.setdefault('auto_fetched_products', 0)
+                    overall_stats['auto_fetched_products'] += 1
+                else:
+                    still_missing.append(mp_name)
+
+            if still_missing:
+                logger.warning(
+                    f"[SKIP:MISSING_PRODUCT] #{voucher_no} | date={voucher_date} | "
+                    f"customer='{customer_name}' | missing {len(still_missing)} product(s) "
+                    f"(not found in SQLite or Tally): {still_missing}"
+                )
+                overall_stats['skipped_missing_product'] += 1
+                continue
 
         try:
             full_voucher_payload = _build_full_voucher_payload(invoice)
@@ -275,15 +493,33 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             existing = db.invoice_exists(voucher_no, company_name)
             if not existing:
                 db.insert_invoice(invoice_record)
+                logger.info(
+                    f"[NEW] #{voucher_no} | date={voucher_date} | "
+                    f"customer='{customer_name}' | items={len(inventory_items)} | "
+                    f"amount={invoice.get('total_amount', 0.0)}"
+                )
                 overall_stats['new_saved'] += 1
             elif (existing['payload_hash'] != payload_hash) or (existing['data_json'] != data_json):
                 db.update_invoice(existing['id'], invoice_record)
+                logger.info(
+                    f"[UPDATED] #{voucher_no} | date={voucher_date} | "
+                    f"customer='{customer_name}' | SQLite ID={existing['id']} | "
+                    f"reason: payload changed"
+                )
                 overall_stats['updated_saved'] += 1
             else:
+                logger.debug(
+                    f"[UNCHANGED] #{voucher_no} | date={voucher_date} | "
+                    f"customer='{customer_name}' | no changes"
+                )
                 overall_stats['already_exists'] += 1
 
         except Exception as e:
-            logger.error(f"Failed to process invoice #{voucher_no}: {e}")
+            logger.error(
+                f"[ERROR] #{voucher_no} | date={voucher_date} | "
+                f"customer='{customer_name}' | error: {e}",
+                exc_info=True
+            )
             overall_stats['errors'] += 1
 
 
@@ -356,15 +592,17 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     logger.info(f"\n{'='*60}")
     logger.info("FINAL FETCH SUMMARY")
     logger.info(f"{'='*60}")
-    logger.info(f"Total Fetched:    {overall_stats['total_fetched']}")
-    logger.info(f"New Saved:        {overall_stats['new_saved']}")
-    logger.info(f"Updated Saved:    {overall_stats['updated_saved']}")
-    logger.info(f"Skipped Date:     {overall_stats['skipped_date']}")
-    logger.info(f"Skipped No Del:   {overall_stats['skipped_no_delivery']}")
-    logger.info(f"Skipped Cust:     {overall_stats['skipped_missing_customer']}")
-    logger.info(f"Skipped Prod:     {overall_stats['skipped_missing_product']}")
-    logger.info(f"Already Exist:    {overall_stats['already_exists']}")
-    logger.info(f"Errors:           {overall_stats['errors']}")
+    logger.info(f"Total Fetched:       {overall_stats['total_fetched']}")
+    logger.info(f"New Saved:           {overall_stats['new_saved']}")
+    logger.info(f"Updated Saved:       {overall_stats['updated_saved']}")
+    logger.info(f"Auto-Fetch Cust:     {overall_stats.get('auto_fetched_customers', 0)}")
+    logger.info(f"Auto-Fetch Prod:     {overall_stats.get('auto_fetched_products', 0)}")
+    logger.info(f"Skipped Date:        {overall_stats['skipped_date']}")
+    logger.info(f"Skipped No Del:      {overall_stats['skipped_no_delivery']}")
+    logger.info(f"Skipped Cust:        {overall_stats['skipped_missing_customer']}")
+    logger.info(f"Skipped Prod:        {overall_stats['skipped_missing_product']}")
+    logger.info(f"Already Exist:       {overall_stats['already_exists']}")
+    logger.info(f"Errors:              {overall_stats['errors']}")
     logger.info(f"{'='*60}")
     
     db.close()

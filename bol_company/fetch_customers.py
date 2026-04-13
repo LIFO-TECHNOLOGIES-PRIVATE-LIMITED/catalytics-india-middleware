@@ -1,6 +1,6 @@
 """
-Fetch customers from multiple Tally companies
-Implements duplicate prevention based on customer name
+Fetch customers from multiple Tally companies (all ledger groups).
+GUID-based create/update logic — existing customers are updated, new ones created.
 """
 import json
 import logging
@@ -40,10 +40,9 @@ def _normalize_customer_name(raw_name):
 
 def fetch_customers_from_all_companies():
     """
-    Fetch customers from all active Tally companies
-    First-come-first-served duplicate prevention
+    Fetch ALL customers (all ledger groups) from all active Tally companies.
+    GUID-based create/update — existing customers updated, new ones created.
     """
-    # Initialize
     db = Database(config.SQLITE_DB_PATH)
     tally = TallyClient(config.TALLY_URL)
     active_companies = config.get_active_companies()
@@ -53,22 +52,19 @@ def fetch_customers_from_all_companies():
         return {
             'total_fetched': 0,
             'new_saved': 0,
-            'duplicates_skipped': 0,
+            'updated': 0,
             'errors': 0,
         }
 
     logger.info(f"Starting customer fetch from {len(active_companies)} companies")
     logger.info(f"Active companies: {', '.join(active_companies)}")
 
-    # Overall statistics
     overall_stats = {
         'total_fetched': 0,
         'new_saved': 0,
-        'duplicates_skipped': 0,
+        'updated': 0,
         'errors': 0
     }
-
-    # Process each company in order (priority by configuration order)
 
     for company_name in active_companies:
         company_key = config.get_company_key(company_name)
@@ -77,7 +73,6 @@ def fetch_customers_from_all_companies():
         logger.info(f"{'='*60}")
 
         try:
-            # Step 1: Fetch customers from Tally
             customers = tally.get_customers(company_name)
             overall_stats['total_fetched'] += len(customers)
 
@@ -87,64 +82,47 @@ def fetch_customers_from_all_companies():
 
             logger.info(f"Fetched {len(customers)} customers from Tally")
 
-            # Step 2: Process each customer with duplicate check
             for customer in customers:
                 customer_name = _normalize_customer_name(customer.get('name'))
                 customer['name'] = customer_name
-                parent_group = customer.get('parent_group', '')
+                tally_guid = customer.get('guid', '')
 
                 if not customer_name:
-                    logger.warning(f"Skipping customer with empty name")
+                    logger.warning("Skipping customer with empty name")
                     continue
 
+                customer_data = {
+                    'tally_guid': tally_guid,
+                    'name': customer_name,
+                    'tally_company': company_name,
+                    'gstin': customer.get('gstin', ''),
+                    'pan': customer.get('pan', ''),
+                    'address': customer.get('address', ''),
+                    'state': customer.get('state', ''),
+                    'city': customer.get('city', ''),
+                    'pincode': customer.get('pincode', ''),
+                    'phone': customer.get('phone', ''),
+                    'email': customer.get('email', ''),
+                    'data_json': json.dumps(customer),
+                }
 
-                # Step 3: Check if customer name already exists
-                existing = db.customer_exists(customer_name)
-
-                if existing:
-                    # Duplicate found - skip and log
-                    owner_company = existing['tally_company']
-                    logger.warning(
-                        f"[DUPLICATE SKIPPED] '{customer_name}' "
-                        f"(owned by {owner_company}, attempted by {company_name})"
-                    )
-
-                    # Log duplicate for audit
-                    db.log_duplicate(
-                        entity_type='customer',
-                        entity_name=customer_name,
-                        tally_company=company_name,
-                        owned_by_company=owner_company,
-                        details=f"GSTIN: {customer.get('gstin', 'N/A')}"
-                    )
-
-                    overall_stats['duplicates_skipped'] += 1
-                    continue
-
-                # Step 4: New customer - save to SQLite
                 try:
-                    customer_data = {
-                        'tally_guid': customer['guid'],
-                        'name': customer_name,
-                        'tally_company': company_name,
-                        'gstin': customer.get('gstin', ''),
-                        'pan': customer.get('pan', ''),
-                        'address': customer.get('address', ''),
-                        'state': customer.get('state', ''),
-                        'city': customer.get('city', ''),
-                        'pincode': customer.get('pincode', ''),
-                        'phone': customer.get('phone', ''),
-                        'email': customer.get('email', ''),
-                        'data_json': json.dumps(customer)  # Store full Tally response
-                    }
+                    existing = db.customer_exists_by_guid(tally_guid) if tally_guid else None
 
-                    db.insert_customer(customer_data)
-
-                    logger.info(
-                        f"[NEW CUSTOMER] '{customer_name}' saved "
-                        f"(company: {company_name}, GSTIN: {customer.get('gstin', 'N/A')})"
-                    )
-                    overall_stats['new_saved'] += 1
+                    if existing:
+                        db.update_customer(existing['id'], customer_data)
+                        logger.info(
+                            f"[UPDATED] '{customer_name}' (GUID: {tally_guid}, "
+                            f"SQLite ID: {existing['id']})"
+                        )
+                        overall_stats['updated'] += 1
+                    else:
+                        db.insert_customer(customer_data)
+                        logger.info(
+                            f"[NEW CUSTOMER] '{customer_name}' saved "
+                            f"(company: {company_name}, GUID: {tally_guid})"
+                        )
+                        overall_stats['new_saved'] += 1
 
                 except Exception as e:
                     logger.error(
@@ -160,17 +138,15 @@ def fetch_customers_from_all_companies():
             )
             overall_stats['errors'] += 1
 
-    # Step 5: Print summary
     logger.info(f"\n{'='*60}")
     logger.info("CUSTOMER FETCH SUMMARY")
     logger.info(f"{'='*60}")
-    logger.info(f"Total Fetched from Tally: {overall_stats['total_fetched']}")
-    logger.info(f"New Customers Saved: {overall_stats['new_saved']}")
-    logger.info(f"Duplicates Skipped: {overall_stats['duplicates_skipped']}")
-    logger.info(f"Errors: {overall_stats['errors']}")
+    logger.info(f"Total Fetched from Tally:   {overall_stats['total_fetched']}")
+    logger.info(f"New Customers Created:      {overall_stats['new_saved']}")
+    logger.info(f"Existing Customers Updated: {overall_stats['updated']}")
+    logger.info(f"Errors:                     {overall_stats['errors']}")
     logger.info(f"{'='*60}")
 
-    # Step 6: Update database statistics
     db_stats = db.get_statistics()
     logger.info(f"\nDatabase Statistics:")
     logger.info(f"Total Customers: {db_stats['total_customers']}")

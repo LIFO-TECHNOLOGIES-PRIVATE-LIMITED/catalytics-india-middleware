@@ -379,24 +379,59 @@ def get_sundry_debtors(company_name: str, url: Optional[str] = None, group_name:
     resp = send_request(xml, url)
     return parse_ledgers(resp)
 
+def get_all_customer_ledgers(company_name: str, url: Optional[str] = None):
+    """Fetch ALL ledgers from Tally (no group filter).
+    Returns every ledger with full fields (GUID, address, GST, etc.)."""
+    from xml.sax.saxutils import escape as xml_escape
+    safe_company = xml_escape(company_name)
+    xml = f"""
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>AllCustomerLedgers</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVCURRENTCOMPANY>{safe_company}</SVCURRENTCOMPANY>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION ISMODIFY="No" ISFIXED="No" ISINITIALIZE="Yes" ISOPTION="No" ISINTERNAL="No" NAME="AllCustomerLedgers">
+            <TYPE>Ledger</TYPE>
+            <NATIVEMETHOD>Name</NATIVEMETHOD>
+            <NATIVEMETHOD>GUID</NATIVEMETHOD>
+            <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>Parent</NATIVEMETHOD>
+            <NATIVEMETHOD>Mobile</NATIVEMETHOD>
+            <NATIVEMETHOD>Email</NATIVEMETHOD>
+            <NATIVEMETHOD>PANNumber</NATIVEMETHOD>
+            <NATIVEMETHOD>IncomeTaxNumber</NATIVEMETHOD>
+            <NATIVEMETHOD>GSTRegistration</NATIVEMETHOD>
+            <NATIVEMETHOD>PartyGSTIN</NATIVEMETHOD>
+            <NATIVEMETHOD>GSTIN</NATIVEMETHOD>
+            <NATIVEMETHOD>Address</NATIVEMETHOD>
+            <NATIVEMETHOD>StateName</NATIVEMETHOD>
+            <NATIVEMETHOD>PinCode</NATIVEMETHOD>
+            <NATIVEMETHOD>CountryName</NATIVEMETHOD>
+            <NATIVEMETHOD>LedgerMobile</NATIVEMETHOD>
+            <NATIVEMETHOD>LedgerEmail</NATIVEMETHOD>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>
+"""
+    resp = send_request(xml, url)
+    return parse_ledgers(resp)
+
+
 def get_customer_ledgers(company_name: str, url: Optional[str] = None, group_names: Optional[List[str]] = None):
-    """Fetch customer ledgers from one or more Tally groups."""
-    groups = [g.strip() for g in (group_names or []) if g and g.strip()]
-    if not groups:
-        groups = ["Sundry Debtors"]
-
-    seen = {}
-    for group in groups:
-        ledgers = get_sundry_debtors(company_name, url, group_name=group)
-        for ledger in ledgers:
-            key = ledger.get("GUID") or ledger.get("NAME") or ""
-            if not key:
-                continue
-            if key in seen:
-                continue
-            seen[key] = ledger
-
-    return list(seen.values())
+    """Fetch customer ledgers from Tally — all groups, no filter."""
+    return get_all_customer_ledgers(company_name, url)
 
 
 def get_ledgers(company_name: str, url: Optional[str] = None):
@@ -1532,16 +1567,10 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
         
         normalized = []
         for v in raw_vouchers:
-            # Filter specifically for Sales or Delivery Note type vouchers
-            # We check both the VOUCHERTYPENAME and the internal VCHTYPE field
+            # Filter: only Sales voucher type (and sales under group)
             vtype = (v.get('VOUCHERTYPENAME') or v.get('VOUCHERTYPE') or v.get('VCHTYPE') or '').strip().lower()
-            
-            # Use Tally's native predicates if possible, but here we are post-filtering
-            is_valid = False
-            if 'sale' in vtype or 'invoice' in vtype or 'delivery' in vtype or 'challan' in vtype:
-                is_valid = True
-            
-            if not is_valid:
+
+            if 'sale' not in vtype:
                 continue
                 
             vno = (v.get('VOUCHERNUMBER') or v.get('VCHNUMBER') or v.get('VOUCHERNO') or '').strip()
@@ -1662,9 +1691,7 @@ class TallyClient:
     
     def get_customers(self, company_name: str) -> List[Dict]:
         """
-        Fetch customers from Tally company.
-        Defaults to Sundry Debtors, but can include multiple groups via
-        CUSTOMER_LEDGER_GROUPS env var (comma-separated).
+        Fetch ALL customers (all ledger groups) from Tally company.
 
         Args:
             company_name: Tally company name
@@ -1672,10 +1699,7 @@ class TallyClient:
         Returns:
             List of customer dictionaries with normalized fields
         """
-        import os
-        groups_env = os.getenv("CUSTOMER_LEDGER_GROUPS", "Sundry Debtors")
-        group_names = [g.strip() for g in groups_env.replace(";", ",").split(",") if g.strip()]
-        ledgers = get_customer_ledgers(company_name, self.url, group_names)
+        ledgers = get_all_customer_ledgers(company_name, self.url)
 
         customers = []
         for ledger in ledgers:

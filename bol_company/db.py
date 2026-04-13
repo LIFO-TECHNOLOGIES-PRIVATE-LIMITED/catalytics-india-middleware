@@ -86,8 +86,8 @@ class Database:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS customers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tally_guid TEXT,
-                name TEXT UNIQUE NOT NULL,
+                tally_guid TEXT UNIQUE,
+                name TEXT NOT NULL,
                 tally_company TEXT NOT NULL,
                 gstin TEXT,
                 pan TEXT,
@@ -114,9 +114,9 @@ class Database:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tally_guid TEXT,
+                tally_guid TEXT UNIQUE,
                 name TEXT NOT NULL,
-                name_canonical TEXT UNIQUE NOT NULL,
+                name_canonical TEXT NOT NULL,
                 tally_company TEXT NOT NULL,
                 hsn_code TEXT,
                 unit TEXT,
@@ -218,6 +218,11 @@ class Database:
         """)
 
         cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_customers_guid
+            ON customers(tally_guid)
+        """)
+
+        cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_customers_synced
             ON customers(is_synced)
         """)
@@ -225,6 +230,11 @@ class Database:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_products_name
             ON products(name)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_products_guid
+            ON products(tally_guid)
         """)
 
         cursor.execute("""
@@ -331,6 +341,78 @@ class Database:
             except Exception as e:
                 logger.debug(f"Migration skipped for {table}: {e}")
 
+        # Migrate customers: drop old UNIQUE on name, add UNIQUE on tally_guid
+        try:
+            indexes = {row[1] for row in cursor.execute("PRAGMA index_list(customers)").fetchall()}
+            if 'sqlite_autoindex_customers_1' in indexes:
+                idx_info = cursor.execute("PRAGMA index_info(sqlite_autoindex_customers_1)").fetchall()
+                col_names = {row[2] for row in idx_info}
+                if 'name' in col_names:
+                    logger.info("Migrating customers table: UNIQUE name -> UNIQUE tally_guid")
+                    cursor.execute("ALTER TABLE customers RENAME TO customers_old")
+                    cursor.execute("""
+                        CREATE TABLE customers (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            tally_guid TEXT UNIQUE,
+                            name TEXT NOT NULL,
+                            tally_company TEXT NOT NULL,
+                            gstin TEXT, pan TEXT,
+                            address TEXT, state TEXT, city TEXT, pincode TEXT,
+                            phone TEXT, email TEXT, data_json TEXT,
+                            sync_request_json TEXT, last_response_json TEXT,
+                            first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            is_synced INTEGER DEFAULT 0,
+                            catalytics_id INTEGER,
+                            sync_attempts INTEGER DEFAULT 0,
+                            last_sync_error TEXT,
+                            last_sync_at TIMESTAMP
+                        )
+                    """)
+                    cursor.execute("INSERT INTO customers SELECT * FROM customers_old")
+                    cursor.execute("DROP TABLE customers_old")
+                    logger.info("Customers table migrated: GUID-based uniqueness")
+        except Exception as e:
+            logger.debug(f"Customers GUID migration skipped: {e}")
+
+        # Migrate products: drop old UNIQUE on name_canonical, add UNIQUE on tally_guid
+        try:
+            indexes = {row[1] for row in cursor.execute("PRAGMA index_list(products)").fetchall()}
+            # If the old auto-created unique index on name_canonical exists, rebuild table
+            if 'sqlite_autoindex_products_1' in indexes:
+                # Check if it's the name_canonical unique constraint
+                idx_info = cursor.execute("PRAGMA index_info(sqlite_autoindex_products_1)").fetchall()
+                col_names = {row[2] for row in idx_info}
+                if 'name_canonical' in col_names:
+                    logger.info("Migrating products table: UNIQUE name_canonical -> UNIQUE tally_guid")
+                    cursor.execute("ALTER TABLE products RENAME TO products_old")
+                    cursor.execute("""
+                        CREATE TABLE products (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            tally_guid TEXT UNIQUE,
+                            name TEXT NOT NULL,
+                            name_canonical TEXT NOT NULL,
+                            tally_company TEXT NOT NULL,
+                            hsn_code TEXT, unit TEXT, rate REAL, description TEXT, data_json TEXT,
+                            product_master_name TEXT, variant_name TEXT, unit_name TEXT,
+                            product_type_code TEXT, product_type_name TEXT,
+                            gst_applicable TEXT, gst_rate REAL, igst_rate REAL, cgst_rate REAL, sgst_rate REAL,
+                            sync_request_json TEXT, last_response_json TEXT,
+                            first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            is_synced INTEGER DEFAULT 0,
+                            catalytics_id INTEGER,
+                            sync_attempts INTEGER DEFAULT 0,
+                            last_sync_error TEXT,
+                            last_sync_at TIMESTAMP
+                        )
+                    """)
+                    cursor.execute("INSERT INTO products SELECT * FROM products_old")
+                    cursor.execute("DROP TABLE products_old")
+                    logger.info("Products table migrated: GUID-based uniqueness")
+        except Exception as e:
+            logger.debug(f"Products GUID migration skipped: {e}")
+
         self.conn.commit()
 
     def close(self):
@@ -348,12 +430,11 @@ class Database:
     # CUSTOMER OPERATIONS
     # ========================================================================
 
-    def customer_exists(self, name):
-        """Check if customer name already exists (ignores whitespace differences)"""
-        normalized = ''.join((name or '').split())
+    def customer_exists_by_guid(self, tally_guid):
+        """Check if customer exists by Tally GUID (primary lookup key)."""
         result = self.query(
-            "SELECT id, tally_company FROM customers WHERE REPLACE(name, ' ', '') = ?",
-            (normalized,)
+            "SELECT * FROM customers WHERE tally_guid = ?",
+            (tally_guid,)
         )
         return result if result else None
 
@@ -381,17 +462,19 @@ class Database:
         ))
 
     def update_customer(self, customer_id, customer_data):
-        """Update existing customer with fresh data and mark for re-sync"""
+        """Update existing customer by id with fresh data and mark for re-sync."""
         self.execute("""
             UPDATE customers
-            SET tally_guid = ?, gstin = ?, pan = ?,
+            SET name = ?, tally_company = ?,
+                gstin = ?, pan = ?,
                 address = ?, state = ?, city = ?, pincode = ?,
                 phone = ?, email = ?, data_json = ?,
                 is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
                 last_updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
         """, (
-            customer_data.get('tally_guid'),
+            customer_data.get('name'),
+            customer_data.get('tally_company'),
             customer_data.get('gstin'),
             customer_data.get('pan'),
             customer_data.get('address'),
@@ -404,24 +487,13 @@ class Database:
             customer_id,
         ))
 
-    def get_unsynced_customers(self, limit=None):
-        """Get customers that haven't been synced.
-
-        Args:
-            limit: max rows to return; if None, return all unsynced.
-        """
-        if limit is None:
-            return self.query_all("""
-                SELECT * FROM customers
-                WHERE is_synced = 0
-                ORDER BY first_fetched_at
-            """)
+    def get_unsynced_customers(self):
+        """Get all customers that haven't been synced."""
         return self.query_all("""
             SELECT * FROM customers
             WHERE is_synced = 0
             ORDER BY first_fetched_at
-            LIMIT ?
-        """, (limit,))
+        """)
 
     def mark_customer_synced(self, customer_id, catalytics_id, response_json=None):
         """Mark customer as successfully synced"""
@@ -450,28 +522,11 @@ class Database:
     # PRODUCT OPERATIONS
     # ========================================================================
 
-    def product_exists(self, name):
-        """Check if product name already exists"""
+    def product_exists_by_guid(self, tally_guid):
+        """Check if product exists by Tally GUID (primary lookup key)."""
         result = self.query(
-            "SELECT id, tally_company FROM products WHERE name = ?",
-            (name,)
-        )
-        return result if result else None
-
-    def product_exists_normalized(self, canonical_name):
-        """
-        Check if product exists using canonical (normalized) name.
-        Canonical name handles spacing variations like "1.5CUM" vs "1.5 CUM".
-        
-        Args:
-            canonical_name: Normalized product name (e.g., "ARGON B TYPE 1.5 CUM (CYL)")
-            
-        Returns:
-            Product record if exists, None otherwise
-        """
-        result = self.query(
-            "SELECT id, tally_company, name FROM products WHERE name_canonical = ?",
-            (canonical_name,)
+            "SELECT * FROM products WHERE tally_guid = ?",
+            (tally_guid,)
         )
         return result if result else None
 
@@ -509,11 +564,11 @@ class Database:
         ))
 
     def update_product(self, product_id, product_data):
-        """Update existing product with fresh data and mark for re-sync"""
+        """Update existing product by id with fresh data and mark for re-sync."""
         self.execute("""
             UPDATE products
-            SET tally_guid = ?, hsn_code = ?, unit = ?,
-                rate = ?, description = ?, data_json = ?,
+            SET name = ?, name_canonical = ?, tally_company = ?,
+                hsn_code = ?, unit = ?, rate = ?, description = ?, data_json = ?,
                 product_master_name = ?, variant_name = ?, unit_name = ?,
                 product_type_code = ?, product_type_name = ?,
                 gst_applicable = ?, gst_rate = ?, igst_rate = ?, cgst_rate = ?, sgst_rate = ?,
@@ -521,7 +576,9 @@ class Database:
                 last_updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
         """, (
-            product_data.get('tally_guid'),
+            product_data.get('name'),
+            product_data.get('name_canonical'),
+            product_data.get('tally_company'),
             product_data.get('hsn_code'),
             product_data.get('unit'),
             product_data.get('rate'),
@@ -540,14 +597,13 @@ class Database:
             product_id,
         ))
 
-    def get_unsynced_products(self, limit=50):
-        """Get products that haven't been synced"""
+    def get_unsynced_products(self):
+        """Get all products that haven't been synced"""
         return self.query_all("""
             SELECT * FROM products
             WHERE is_synced = 0
             ORDER BY first_fetched_at
-            LIMIT ?
-        """, (limit,))
+        """)
 
     def mark_product_synced(self, product_id, catalytics_id, response_json=None):
         """Mark product as successfully synced"""
@@ -669,8 +725,8 @@ class Database:
             invoice_id
         ))
 
-    def get_unsynced_invoices(self, limit=50, max_attempts=10):
-        """Get invoices that haven't been synced.
+    def get_unsynced_invoices(self, max_attempts=10):
+        """Get all invoices that haven't been synced.
         Excludes deleted invoices and invoices that failed too many times."""
         return self.query_all("""
             SELECT * FROM invoices
@@ -678,8 +734,7 @@ class Database:
               AND COALESCE(is_deleted, 0) = 0
               AND COALESCE(sync_attempts, 0) < ?
             ORDER BY first_fetched_at
-            LIMIT ?
-        """, (max_attempts, limit))
+        """, (max_attempts,))
 
     def mark_invoice_synced(self, invoice_id, dc_no, catalytics_dc_id, response_json=None):
         """Mark invoice as successfully synced"""

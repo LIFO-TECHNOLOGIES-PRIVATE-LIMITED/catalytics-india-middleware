@@ -29,12 +29,118 @@ if not env_path.exists() and env_example_path.exists():
 load_dotenv(env_path)
 
 
+def _safe_db_name(name: str) -> str:
+    """Sanitize a string for use as a filename (no spaces/special chars)."""
+    name = name.strip().lower()
+    name = name.replace(" ", "_")
+    for ch in '<>:"/\\|?*':
+        name = name.replace(ch, "_")
+    return name
+
+
+def _normalize_sqlite_db_path(raw: str | None) -> str:
+    """
+    Resolve SQLITE_DB_PATH from .env into an absolute path.
+
+    Rules (same as CO_middleware):
+      - If the value is empty / not set → default to {ENTITY_NAME}.sqlite in BASE_DIR
+      - If the value is a directory (or ends with / or \\) → append {ENTITY_NAME}.sqlite
+      - If the value has no file extension → treat as directory, append {ENTITY_NAME}.sqlite
+      - Relative paths are resolved against BASE_DIR
+      - Parent directories are created if missing
+      - If the file does not exist yet, it is created (empty) so that Database() can open it
+    """
+    entity_name = os.getenv('ENTITY_NAME', 'bol')
+    safe_name = _safe_db_name(entity_name) + ".sqlite"
+
+    value = (raw or "").strip()
+    if not value:
+        # No env value → default beside the app
+        return str(BASE_DIR / safe_name)
+
+    ends_with_sep = value.endswith("/") or value.endswith("\\")
+
+    p = Path(value)
+    if not p.is_absolute():
+        p = BASE_DIR / value
+
+    # If it points at a directory (existing or trailing slash) → append derived name
+    try:
+        if ends_with_sep or (p.exists() and p.is_dir()):
+            p = p / safe_name
+    except Exception:
+        if ends_with_sep:
+            p = p / safe_name
+
+    # If no extension → treat as directory, append derived name
+    if p.suffix == "":
+        p = p / safe_name
+
+    # Ensure parent dirs exist and touch the file if new
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.touch()
+    except Exception:
+        pass
+
+    return str(p)
+
+
+def _normalize_tally_db_path(raw: str | None) -> str:
+    '''Normalize TALLY_DB_PATH overrides (mirrors CO_middleware behaviour).'''
+    value = (raw or "").strip()
+    if not value:
+        return ""
+
+    company_name = os.getenv('TALLY_COMPANY') or os.getenv('ENTITY_NAME', 'bol')
+    safe_name = _safe_db_name(company_name) + ".sqlite"
+
+    ends_with_sep = value.endswith('/') or value.endswith('\\')
+    p = Path(value)
+    if not p.is_absolute():
+        p = BASE_DIR / value
+
+    try:
+        if ends_with_sep or (p.exists() and p.is_dir()):
+            p = p / safe_name
+    except Exception:
+        if ends_with_sep:
+            p = p / safe_name
+
+    if p.suffix == "":
+        p = p / safe_name
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.touch()
+    except Exception:
+        pass
+
+    return str(p)
+
+
+def _resolve_database_paths() -> tuple[str, str]:
+    '''Return the paths used for SQLITE_DB_PATH and TALLY_DB_PATH.'''
+    sqlite_path = _normalize_sqlite_db_path(os.getenv('SQLITE_DB_PATH'))
+    tally_path = _normalize_tally_db_path(os.getenv('TALLY_DB_PATH'))
+    if tally_path:
+        sqlite_path = tally_path
+    else:
+        tally_path = sqlite_path
+    return sqlite_path, tally_path
+
+
 class Config:
     """Configuration class for BOL Middleware"""
 
     # Entity Configuration
     ENTITY_NAME = os.getenv('ENTITY_NAME', 'bol')
     ENTITY_ID = int(os.getenv('ENTITY_ID', '25'))
+
+    # Default admin user ID for created_by / modified_by in Catalytics backend
+    DEFAULT_ADMIN_USER_ID = int(os.getenv('DEFAULT_ADMIN_USER_ID', '55'))
 
     # Default filling station (used when invoice has empty godown/location)
     DEFAULT_FILLING_STATION = os.getenv('DEFAULT_FILLING_STATION', 'Main Warehouse')
@@ -67,7 +173,7 @@ class Config:
     FETCH_INVOICES_INTERVAL_MINUTES = int(os.getenv('FETCH_INVOICES_INTERVAL_MINUTES', '10'))
     SYNC_INVOICES_INTERVAL_SECONDS = int(os.getenv('SYNC_INVOICES_INTERVAL_SECONDS', os.getenv('SYNC_INTERVAL_SECONDS', '30')))
     SYNC_MASTER_INTERVAL_MINUTES = int(os.getenv('SYNC_MASTER_INTERVAL_MINUTES', '5'))
-    SYNC_BATCH_SIZE = int(os.getenv('SYNC_BATCH_SIZE', '50'))
+    # SYNC_BATCH_SIZE removed — all unsynced records are synced in one pass
     CUSTOMER_SYNC_WORKERS = int(os.getenv('CUSTOMER_SYNC_WORKERS', '10'))  # concurrent threads for customer sync
 
 
@@ -90,7 +196,11 @@ class Config:
         cls.CATALYTICS_API_BASE = os.getenv('CATALYTICS_API_BASE', cls.CATALYTICS_API_BASE)
         cls.POSTGRES_DB = os.getenv('POSTGRES_DB', cls.POSTGRES_DB)
         cls.ENTITY_ID = int(os.getenv('ENTITY_ID', str(cls.ENTITY_ID)))
-        
+        cls.ENTITY_NAME = os.getenv('ENTITY_NAME', cls.ENTITY_NAME)
+        sql_path, tally_path = _resolve_database_paths()
+        cls.SQLITE_DB_PATH = sql_path
+        cls.TALLY_DB_PATH = tally_path
+
         cls.INVOICE_FETCH_START_DATE = os.getenv('INVOICE_FETCH_START_DATE', '')
         cls.SYNC_INTERVAL_SECONDS = int(os.getenv('SYNC_INTERVAL_SECONDS', '30'))
         cls.FETCH_CUSTOMERS_INTERVAL_MINUTES = int(os.getenv('FETCH_CUSTOMERS_INTERVAL_MINUTES', '10'))
@@ -99,10 +209,13 @@ class Config:
         cls.FETCH_INVOICES_INTERVAL_MINUTES = int(os.getenv('FETCH_INVOICES_INTERVAL_MINUTES', '10'))
         cls.SYNC_INVOICES_INTERVAL_SECONDS = int(os.getenv('SYNC_INVOICES_INTERVAL_SECONDS', os.getenv('SYNC_INTERVAL_SECONDS', '30')))
         cls.SYNC_MASTER_INTERVAL_MINUTES = int(os.getenv('SYNC_MASTER_INTERVAL_MINUTES', '5'))
-        cls.SYNC_BATCH_SIZE = int(os.getenv('SYNC_BATCH_SIZE', '50'))
+        # SYNC_BATCH_SIZE removed — all unsynced records are synced in one pass
         cls.CUSTOMER_SYNC_WORKERS = int(os.getenv('CUSTOMER_SYNC_WORKERS', '10'))
+        cls.DEFAULT_ADMIN_USER_ID = int(os.getenv('DEFAULT_ADMIN_USER_ID', '55'))
         cls.DEFAULT_FILLING_STATION = os.getenv('DEFAULT_FILLING_STATION', 'Main Warehouse')
         cls.DEFAULT_FILLING_STATION_ID = os.getenv('DEFAULT_FILLING_STATION_ID', '1')
+        cls.MASTER_SYNC_TIME = os.getenv('MASTER_SYNC_TIME', cls.MASTER_SYNC_TIME)
+        cls.MASTER_SYNC_FAILURE_RETRY_MINUTES = int(os.getenv('MASTER_SYNC_FAILURE_RETRY_MINUTES', str(cls.MASTER_SYNC_FAILURE_RETRY_MINUTES)))
         return cls.INVOICE_FETCH_START_DATE
 
     @classmethod
@@ -122,8 +235,14 @@ class Config:
     RUN_DAILY_AUDIT = os.getenv('RUN_DAILY_AUDIT', 'true').lower() == 'true'
     AUDIT_TIME = os.getenv('AUDIT_TIME', '02:00')
 
-    # Database
-    SQLITE_DB_PATH = str(BASE_DIR / os.getenv('SQLITE_DB_PATH', 'bol.sqlite'))
+    # Daily master sync time (HH:MM) — fetch + sync all customers & products once per day
+    MASTER_SYNC_TIME = os.getenv('MASTER_SYNC_TIME', '02:00')
+    MASTER_SYNC_FAILURE_RETRY_MINUTES = int(os.getenv('MASTER_SYNC_FAILURE_RETRY_MINUTES', '30'))
+
+    # Database — resolved via _normalize_sqlite_db_path (see CO_middleware pattern)
+    _sqlite_path, _tally_path = _resolve_database_paths()
+    SQLITE_DB_PATH = _sqlite_path
+    TALLY_DB_PATH = _tally_path
 
     # PostgreSQL (optional)
     POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'localhost')
@@ -248,7 +367,6 @@ if __name__ == '__main__':
     print(f"\nActive Companies: {config.get_active_companies()}")
     print(f"\nSync Configuration:")
     print(f"  Sync Interval: {config.SYNC_INTERVAL_SECONDS}s")
-    print(f"  Batch Size: {config.SYNC_BATCH_SIZE}")
     print(f"  Invoice Fetch Start Date: {config.INVOICE_FETCH_START_DATE or 'Today (not configured)'}")
     print(f"\nProduct Type Mapping ({len(config.PRODUCT_TYPE_MAP)} types):")
     for code, full_name in config.PRODUCT_TYPE_MAP.items():

@@ -5,7 +5,7 @@ cd /d "%~dp0"
 
 echo ============================================================
 echo   BOL Middleware - Build and Deploy
-echo   Building new release with lightweight DC sync API
+echo   Building release with GUID-based DC sync + admin user ID
 echo ============================================================
 echo.
 
@@ -47,6 +47,8 @@ py -m PyInstaller ^
     --hidden-import verify_sync ^
     --hidden-import automation_manager ^
     --hidden-import data_matcher ^
+    --hidden-import log_capture ^
+    --hidden-import fetch_master_data ^
     dashboard.py
 
 if errorlevel 1 (
@@ -74,21 +76,23 @@ if errorlevel 1 (
     exit /b 1
 )
 
+copy /y ".env" "%RELEASE_DIR%\.env" >nul
 copy /y ".env.example" "%RELEASE_DIR%\.env.example" >nul
-copy /y ".env.example" "%RELEASE_DIR%\.env" >nul
 copy /y "README_CLIENT_SETUP.txt" "%RELEASE_DIR%\" >nul
 copy /y "RELEASE_NOTES.md" "%RELEASE_DIR%\" >nul
 copy /y "Start_Dashboard.bat" "%RELEASE_DIR%\" >nul
+copy /y "Stop_Dashboard.bat" "%RELEASE_DIR%\" >nul
 copy /y "Install_AutoStart.bat" "%RELEASE_DIR%\" >nul
 copy /y "Remove_AutoStart.bat" "%RELEASE_DIR%\" >nul
 
 echo [OK] Files copied:
 echo   - bol_dashboard.exe
-echo   - .env (from .env.example)
+echo   - .env (current config)
 echo   - .env.example
 echo   - README_CLIENT_SETUP.txt
 echo   - RELEASE_NOTES.md
 echo   - Start_Dashboard.bat
+echo   - Stop_Dashboard.bat
 echo   - Install_AutoStart.bat
 echo   - Remove_AutoStart.bat
 echo   - logs\ (empty folder)
@@ -113,24 +117,26 @@ echo   Folder: %RELEASE_DIR%
 echo   Zip:    %ZIP_PATH%
 echo.
 echo What's New in This Release:
-echo   - Lightweight DC sync API with name-based matching
-echo   - Auto-creates customers and products during invoice sync
-echo   - Improved product matching (5 strategies)
-echo   - Full Tally name saved in Product.short_name
-echo   - Eliminates race condition in invoice sync
+echo   - created_by / modified_by set from DEFAULT_ADMIN_USER_ID (env)
+echo   - created_on set to actual invoice date (not server timestamp)
+echo   - PO number / PO date: empty when not provided (no dc_no fallback)
+echo   - Delivery/Customer Pickup filter on Other Reference field
+echo   - GUID-based create/update for customers, products, and DCs
+echo   - Batch invoice sync via /import/tally-dc-guid-payload/
+echo   - Auto-fetch missing customers/products from Tally during invoice fetch
+echo   - Smart DB path: auto-derives from ENTITY_NAME if dir/empty
 echo.
 echo Deployment Steps:
 echo   1. Unzip on client system
-echo   2. Edit .env with client configuration
+echo   2. Review .env (set DEFAULT_ADMIN_USER_ID, ENTITY_ID, etc.)
 echo   3. Double-click bol_dashboard.exe
 echo   4. Dashboard auto-creates logs and database
-echo   5. Access dashboard at http://localhost:5000
+echo   5. Access dashboard at http://localhost:8787
 echo.
-echo Auto-Initialization:
-echo   - logs/ folder auto-created
-echo   - bol.sqlite auto-created with all tables
-echo   - automation_state.json auto-created
-echo   - No manual setup required!
+echo Key .env Settings:
+echo   DEFAULT_ADMIN_USER_ID=55   (sets created_by/modified_by in backend)
+echo   ENTITY_ID=24               (Catalytics entity)
+echo   INVOICE_FETCH_START_DATE   (YYYYMMDD, fetch from this date)
 echo.
 echo ============================================================
 

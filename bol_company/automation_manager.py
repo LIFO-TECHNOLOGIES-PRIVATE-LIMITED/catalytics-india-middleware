@@ -177,10 +177,10 @@ class AutomationManager:
             self._save_state()
 
         # Start automation threads
-        self._start_thread('fetch_master', self._fetch_master_loop)
-        self._start_thread('fetch_invoices', self._fetch_invoices_loop)
-        self._start_thread('sync', self._sync_loop)
-        self._start_thread('sync_master', self._sync_master_loop)
+        # Thread 1: Daily master sync — fetch + sync customers & products once per day
+        self._start_thread('fetch_master', self._daily_master_sync_loop)
+        # Thread 2: Invoice fetch + sync — every 20 seconds
+        self._start_thread('sync', self._invoice_fetch_sync_loop)
 
         logger.info("Automation started")
         return True
@@ -261,181 +261,190 @@ class AutomationManager:
         finally:
             root.removeHandler(handler)
 
-    def _fetch_master_loop(self):
-        """Continuous loop for fetching master data (customers + products)"""
+    def _daily_master_sync_loop(self):
+        """
+        Daily master data sync (CO_middleware pattern):
+        Runs ONCE per day at MASTER_SYNC_TIME (default 02:00).
+        1. Fetch ALL customers from Tally → save to SQLite
+        2. Fetch ALL products from Tally → save to SQLite
+        3. Sync ALL customers to Catalytics (batch)
+        4. Sync ALL products to Catalytics (batch)
+        """
         from fetch_customers import fetch_customers_from_all_companies
         from fetch_products import fetch_products_from_all_companies
-
-        task = 'fetch_master'
-        while not self.stop_flags[task].is_set():
-            try:
-                # Update next run time
-                interval = self.state['intervals'][task]
-                next_run = datetime.now() + timedelta(seconds=interval)
-                with self.lock:
-                    self.state['next_runs'][task] = next_run.isoformat()
-                    self._save_state()
-
-                # Skip if previous run still active
-                if not self._running_tasks[task].acquire(blocking=False):
-                    logger.info(f"[SKIP] {task} still running from previous cycle, skipping")
-                    self.stop_flags[task].wait(timeout=interval)
-                    continue
-
-                try:
-                    if not self._try_acquire_global('fetch_master'):
-                        self.stop_flags[task].wait(timeout=interval)
-                        continue
-                    # Run fetch
-                    logger.info(f"Running {task}...")
-                    self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA STARTED ===")
-
-                    ok1, _ = self._run_with_log_capture(fetch_customers_from_all_companies)
-                    ok2, _ = self._run_with_log_capture(fetch_products_from_all_companies)
-
-                    if ok1 and ok2:
-                        self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA COMPLETED ===")
-                    else:
-                        self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA FAILED ===")
-
-                    # Update last run time
-                    with self.lock:
-                        self.state['last_runs'][task] = datetime.now().isoformat()
-                        self._save_state()
-
-                    logger.info(f"{task} completed")
-                finally:
-                    self._release_global()
-                    self._running_tasks[task].release()
-
-                # Wait for interval or stop signal
-                self.stop_flags[task].wait(timeout=interval)
-
-            except Exception as e:
-                logger.error(f"Error in {task}: {e}")
-                self._log_to_dashboard(f"=== AUTO: FETCH MASTER DATA ERROR: {e} ===")
-                self.stop_flags[task].wait(timeout=10)
-
-    def _fetch_invoices_loop(self):
-        """Continuous loop for fetching invoices"""
-        from fetch_invoices import fetch_invoices_from_all_companies
-
-        task = 'fetch_invoices'
-        while not self.stop_flags[task].is_set():
-            try:
-                # Update next run time
-                interval = self.state['intervals'][task]
-                next_run = datetime.now() + timedelta(seconds=interval)
-                with self.lock:
-                    self.state['next_runs'][task] = next_run.isoformat()
-                    self._save_state()
-
-                # Skip if previous run still active
-                if not self._running_tasks[task].acquire(blocking=False):
-                    logger.info(f"[SKIP] {task} still running from previous cycle, skipping")
-                    self.stop_flags[task].wait(timeout=interval)
-                    continue
-
-                try:
-                    if not self._try_acquire_global('fetch_invoices'):
-                        self.stop_flags[task].wait(timeout=interval)
-                        continue
-                    # Run fetch
-                    logger.info(f"Running {task}...")
-                    self._log_to_dashboard(f"=== AUTO: FETCH INVOICES STARTED ===")
-
-                    ok, _ = self._run_with_log_capture(fetch_invoices_from_all_companies)
-
-                    if ok:
-                        self._log_to_dashboard(f"=== AUTO: FETCH INVOICES COMPLETED ===")
-                    else:
-                        self._log_to_dashboard(f"=== AUTO: FETCH INVOICES FAILED ===")
-
-                    # Update last run time
-                    with self.lock:
-                        self.state['last_runs'][task] = datetime.now().isoformat()
-                        self._save_state()
-
-                    logger.info(f"{task} completed")
-                finally:
-                    self._release_global()
-                    self._running_tasks[task].release()
-
-                # Wait for interval or stop signal
-                self.stop_flags[task].wait(timeout=interval)
-
-            except Exception as e:
-                logger.error(f"Error in {task}: {e}")
-                self._log_to_dashboard(f"=== AUTO: FETCH INVOICES ERROR: {e} ===")
-                self.stop_flags[task].wait(timeout=10)
-
-    def _sync_master_loop(self):
-        """Continuous loop for syncing customers and products"""
         from sync_to_catalytics import CatalyticsSyncer
 
-        task = 'sync_master'
+        task = 'fetch_master'
         syncer = CatalyticsSyncer()
+
+        # Parse daily sync time from .env (default 02:00)
+        sync_time_str = getattr(config, 'MASTER_SYNC_TIME', None) or '02:00'
+        try:
+            sync_hour, sync_minute = [int(x) for x in sync_time_str.split(':')]
+        except Exception:
+            sync_hour, sync_minute = 2, 0
+
+        # Run once immediately on first start, then daily (with retry on failure)
+        retry_minutes = getattr(config, 'MASTER_SYNC_FAILURE_RETRY_MINUTES', 30)
+        first_run = True
+        last_run_success = True
+
         while not self.stop_flags[task].is_set():
             try:
-                interval = self.state['intervals'][task]
-                next_run = datetime.now() + timedelta(seconds=interval)
-                with self.lock:
-                    self.state['next_runs'][task] = next_run.isoformat()
-                    self._save_state()
+                now = datetime.now()
 
+                if first_run:
+                    # Run immediately on startup
+                    first_run = False
+                    logger.info(f"[DAILY MASTER] First run — starting immediately")
+                else:
+                    if last_run_success:
+                        next_run = now.replace(hour=sync_hour, minute=sync_minute, second=0, microsecond=0)
+                        if next_run <= now:
+                            next_run += timedelta(days=1)
+                        wait_seconds = (next_run - now).total_seconds()
+                        wait_desc = f"{int(wait_seconds // 3600)}h {int((wait_seconds % 3600) // 60)}m"
+                        logger.info(
+                            f"[DAILY MASTER] Next run at {next_run.strftime('%Y-%m-%d %H:%M')} "
+                            f"({wait_desc})"
+                        )
+                    else:
+                        next_run = now + timedelta(minutes=retry_minutes)
+                        wait_seconds = (next_run - now).total_seconds()
+                        logger.warning(
+                            f"[DAILY MASTER] Previous run failed — retrying at {next_run.strftime('%Y-%m-%d %H:%M')}"
+                            f" (in {retry_minutes}m)"
+                        )
+
+                    with self.lock:
+                        self.state['next_runs'][task] = next_run.isoformat()
+                        self._save_state()
+
+                    # Wait until scheduled time (check stop flag every 60s)
+                    while wait_seconds > 0 and not self.stop_flags[task].is_set():
+                        sleep_chunk = min(wait_seconds, 60)
+                        self.stop_flags[task].wait(timeout=sleep_chunk)
+                        wait_seconds -= sleep_chunk
+
+                    if self.stop_flags[task].is_set():
+                        return
+
+                # Acquire locks
                 if not self._running_tasks[task].acquire(blocking=False):
-                    logger.info(f"[SKIP] {task} still running from previous cycle, skipping")
-                    self.stop_flags[task].wait(timeout=interval)
+                    logger.info(f"[SKIP] {task} still running, skipping")
                     continue
 
                 try:
-                    if not self._try_acquire_global(task):
-                        self.stop_flags[task].wait(timeout=interval)
+                    if not self._try_acquire_global('daily_master'):
                         continue
 
-                    logger.info(f"Running {task}...")
-                    self._log_to_dashboard(f"=== AUTO: SYNC MASTER STARTED ===")
+                    self._log_to_dashboard("=== DAILY MASTER SYNC STARTED ===")
+                    logger.info("[DAILY MASTER] === FETCH + SYNC ALL MASTER DATA ===")
+                    success = True
 
-                    ok1, _ = self._run_with_log_capture(syncer.sync_customers)
-                    ok2, _ = self._run_with_log_capture(syncer.sync_products)
+                    # Step 1: Fetch customers from Tally
+                    cust_result = {'new_saved': 0, 'updated': 0, 'errors': 0}
+                    try:
+                        cust_result = fetch_customers_from_all_companies()
+                        logger.info(
+                            f"[DAILY MASTER] Customers fetched: "
+                            f"new={cust_result.get('new_saved', 0)}, "
+                            f"updated={cust_result.get('updated', 0)}"
+                        )
+                    except Exception as e:
+                        success = False
+                        logger.error(f"[DAILY MASTER] Customer fetch failed: {e}", exc_info=True)
 
-                    if ok1 and ok2:
-                        self._log_to_dashboard(f"=== AUTO: SYNC MASTER COMPLETED ===")
-                    else:
-                        self._log_to_dashboard(f"=== AUTO: SYNC MASTER FAILED ===")
+                    # Step 2: Fetch products from Tally
+                    prod_result = {'new_saved': 0, 'duplicates_skipped': 0, 'errors': 0}
+                    try:
+                        prod_result = fetch_products_from_all_companies()
+                        logger.info(
+                            f"[DAILY MASTER] Products fetched: "
+                            f"new={prod_result.get('new_saved', 0)}, "
+                            f"updated={prod_result.get('duplicates_skipped', 0)}"
+                        )
+                    except Exception as e:
+                        success = False
+                        logger.error(f"[DAILY MASTER] Product fetch failed: {e}", exc_info=True)
+
+                    # Step 3: Sync customers to Catalytics (batch)
+                    cust_sync = {'synced': 0, 'failed': 0}
+                    try:
+                        cust_sync = syncer.sync_customers()
+                        logger.info(
+                            f"[DAILY MASTER] Customers synced: "
+                            f"ok={cust_sync.get('synced', 0)}, "
+                            f"failed={cust_sync.get('failed', 0)}"
+                        )
+                    except Exception as e:
+                        success = False
+                        logger.error(f"[DAILY MASTER] Customer sync failed: {e}", exc_info=True)
+
+                    # Step 4: Sync products to Catalytics (batch)
+                    prod_sync = {'synced': 0, 'failed': 0}
+                    try:
+                        prod_sync = syncer.sync_products()
+                        logger.info(
+                            f"[DAILY MASTER] Products synced: "
+                            f"ok={prod_sync.get('synced', 0)}, "
+                            f"failed={prod_sync.get('failed', 0)}"
+                        )
+                    except Exception as e:
+                        success = False
+                        logger.error(f"[DAILY MASTER] Product sync failed: {e}", exc_info=True)
+
+                    self._log_to_dashboard(
+                        f"=== DAILY MASTER SYNC COMPLETED "
+                        f"(cust fetch={cust_result.get('new_saved', 0)}+{cust_result.get('updated', 0)} "
+                        f"sync={cust_sync.get('synced', 0)} | "
+                        f"prod fetch={prod_result.get('new_saved', 0)}+{prod_result.get('duplicates_skipped', 0)} "
+                        f"sync={prod_sync.get('synced', 0)}) ==="
+                    )
 
                     with self.lock:
                         self.state['last_runs'][task] = datetime.now().isoformat()
+                        # Also update sync_master last run
+                        self.state['last_runs']['sync_master'] = datetime.now().isoformat()
                         self._save_state()
 
-                    logger.info(f"{task} completed")
+                    logger.info("[DAILY MASTER] Complete")
+
                 finally:
                     self._release_global()
                     self._running_tasks[task].release()
 
-                self.stop_flags[task].wait(timeout=interval)
+                last_run_success = success
 
             except Exception as e:
-                logger.error(f"Error in {task}: {e}")
-                self._log_to_dashboard(f"=== AUTO: SYNC MASTER ERROR: {e} ===")
-                self.stop_flags[task].wait(timeout=10)
+                last_run_success = False
+                logger.error(f"[DAILY MASTER] Error: {e}", exc_info=True)
+                self._log_to_dashboard(f"=== DAILY MASTER SYNC ERROR: {e} ===")
+                self.stop_flags[task].wait(timeout=60)
 
-    def _sync_loop(self):
-        """Continuous loop for syncing to Catalytics"""
+    # _fetch_invoices_loop and _sync_loop removed — merged into _invoice_fetch_sync_loop
+
+    def _invoice_fetch_sync_loop(self):
+        """
+        Combined invoice fetch + sync loop — runs every 20 seconds.
+        1. Fetch invoices from Tally Day Book (auto-fetches missing customers/products)
+        2. Sync unsynced invoices to Catalytics (batch)
+        """
+        from fetch_invoices import fetch_invoices_from_all_companies
         from sync_to_catalytics import CatalyticsSyncer
 
         task = 'sync'
-        syncer = CatalyticsSyncer()  # Reuse single instance (single DB connection)
+        syncer = CatalyticsSyncer()
+        interval = 20  # Fixed 20 seconds
+
         while not self.stop_flags[task].is_set():
             try:
-                # Update next run time
-                interval = self.state['intervals'][task]
                 next_run = datetime.now() + timedelta(seconds=interval)
                 with self.lock:
                     self.state['next_runs'][task] = next_run.isoformat()
+                    self.state['next_runs']['fetch_invoices'] = next_run.isoformat()
                     self._save_state()
 
-                # Skip if previous run still active
                 if not self._running_tasks[task].acquire(blocking=False):
                     logger.info(f"[SKIP] {task} still running from previous cycle, skipping")
                     self.stop_flags[task].wait(timeout=interval)
@@ -445,33 +454,36 @@ class AutomationManager:
                     if not self._try_acquire_global('sync'):
                         self.stop_flags[task].wait(timeout=interval)
                         continue
-                    # Run sync
-                    logger.info(f"Running {task}...")
-                    self._log_to_dashboard(f"=== AUTO: SYNC INVOICES STARTED ===")
+                    logger.info(f"Running invoice fetch + sync...")
 
-                    ok, _ = self._run_with_log_capture(syncer.sync_invoices_simple)
+                    # Step 1: Fetch invoices from Tally Day Book
+                    self._log_to_dashboard(f"=== AUTO: INVOICE FETCH + SYNC STARTED ===")
+                    fetch_ok, _ = self._run_with_log_capture(fetch_invoices_from_all_companies)
 
-                    if ok:
-                        self._log_to_dashboard(f"=== AUTO: SYNC INVOICES COMPLETED ===")
+                    # Step 2: Sync unsynced invoices to Catalytics
+                    sync_ok, _ = self._run_with_log_capture(syncer.sync_invoices_to_dc)
+
+                    if fetch_ok and sync_ok:
+                        self._log_to_dashboard(f"=== AUTO: INVOICE FETCH + SYNC COMPLETED ===")
                     else:
-                        self._log_to_dashboard(f"=== AUTO: SYNC INVOICES FAILED ===")
+                        self._log_to_dashboard(f"=== AUTO: INVOICE FETCH + SYNC FAILED ===")
 
-                    # Update last run time
                     with self.lock:
                         self.state['last_runs'][task] = datetime.now().isoformat()
+                        self.state['last_runs']['fetch_invoices'] = datetime.now().isoformat()
                         self._save_state()
 
-                    logger.info(f"{task} completed")
+                    logger.info(f"Invoice fetch + sync completed")
                 finally:
                     self._release_global()
                     self._running_tasks[task].release()
 
-                # Wait for interval or stop signal
+                # Wait 20 seconds
                 self.stop_flags[task].wait(timeout=interval)
 
             except Exception as e:
-                logger.error(f"Error in {task}: {e}")
-                self._log_to_dashboard(f"=== AUTO: SYNC ERROR: {e} ===")
+                logger.error(f"Error in invoice fetch+sync: {e}")
+                self._log_to_dashboard(f"=== AUTO: INVOICE FETCH+SYNC ERROR: {e} ===")
                 self.stop_flags[task].wait(timeout=10)
 
 

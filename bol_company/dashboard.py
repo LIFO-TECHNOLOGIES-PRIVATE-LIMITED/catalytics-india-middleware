@@ -227,7 +227,6 @@ def api_status():
                 for key in config.TALLY_COMPANY_ACTIVE
                 if config.TALLY_COMPANIES.get(key)
             },
-            'sync_batch_size': config.SYNC_BATCH_SIZE,
             'invoice_fetch_start_date': config.INVOICE_FETCH_START_DATE or 'Today',
             'product_type_map': config.PRODUCT_TYPE_MAP
         }
@@ -760,7 +759,7 @@ def trigger_sync_invoices():
         dashboard_logger.write_log("=== INVOICE SYNC TO CATALYTICS STARTED (LIGHTWEIGHT API) ===")
 
         syncer = CatalyticsSyncer()
-        success, output = _guarded_run("Sync Invoices", syncer.sync_invoices_simple)
+        success, output = _guarded_run("Sync Invoices", syncer.sync_invoices_to_dc)
 
         dashboard_logger.write_log(
             f"=== INVOICE SYNC TO CATALYTICS {'COMPLETED' if success else 'FAILED'} ==="
