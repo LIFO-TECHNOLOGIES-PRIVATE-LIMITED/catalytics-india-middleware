@@ -173,6 +173,8 @@ class Database:
                 deleted_at TIMESTAMP,
                 dc_no TEXT,
                 catalytics_dc_id INTEGER,
+                is_instant INTEGER DEFAULT 0,
+                dc_synced INTEGER DEFAULT 0,
                 sync_attempts INTEGER DEFAULT 0,
                 last_sync_error TEXT,
                 last_sync_at TIMESTAMP,
@@ -303,6 +305,9 @@ class Database:
                 ('godown_name', 'TEXT'),
                 ('location_name', 'TEXT'),
                 ('filling_station', 'TEXT'),
+                ('is_instant', 'INTEGER DEFAULT 0'),
+                ('dc_synced', 'INTEGER DEFAULT 0'),
+                ('dc_name', 'TEXT'),
             ],
             'products': [
                 ('product_master_name', 'TEXT'),
@@ -606,8 +611,9 @@ class Database:
                 billing_address, delivery_address,
                 total_amount, tax_amount, items_json, data_json,
                 ledger_data_json, stock_items_json, payload_hash,
-                first_fetched_at, is_deleted
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0)
+                godown_name, location_name, filling_station,
+                first_fetched_at, is_deleted, is_instant
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0, ?)
         """, (
             invoice_data.get('voucher_no'),
             invoice_data.get('tally_company'),
@@ -623,7 +629,11 @@ class Database:
             invoice_data.get('data_json'),
             invoice_data.get('ledger_data_json'),
             invoice_data.get('stock_items_json'),
-            invoice_data.get('payload_hash')
+            invoice_data.get('payload_hash'),
+            invoice_data.get('godown_name'),
+            invoice_data.get('location_name'),
+            invoice_data.get('filling_station'),
+            invoice_data.get('is_instant', 0)
         ))
 
     def update_invoice(self, invoice_id, invoice_data):
@@ -643,13 +653,15 @@ class Database:
                 ledger_data_json = ?,
                 stock_items_json = ?,
                 payload_hash = ?,
+                godown_name = ?,
+                location_name = ?,
+                filling_station = ?,
+                is_instant = ?,
                 last_updated_at = CURRENT_TIMESTAMP,
                 is_synced = 0,
                 sync_attempts = 0,
                 is_deleted = 0,
                 deleted_at = NULL,
-                dc_no = NULL,
-                catalytics_dc_id = NULL,
                 last_sync_error = NULL
             WHERE id = ?
         """, (
@@ -666,6 +678,10 @@ class Database:
             invoice_data.get('ledger_data_json'),
             invoice_data.get('stock_items_json'),
             invoice_data.get('payload_hash'),
+            invoice_data.get('godown_name'),
+            invoice_data.get('location_name'),
+            invoice_data.get('filling_station'),
+            invoice_data.get('is_instant', 0),
             invoice_id
         ))
 
@@ -681,18 +697,21 @@ class Database:
             LIMIT ?
         """, (max_attempts, limit))
 
-    def mark_invoice_synced(self, invoice_id, dc_no, catalytics_dc_id, response_json=None):
+    def mark_invoice_synced(self, invoice_id, dc_no, catalytics_dc_id, response_json=None, dc_name=None):
         """Mark invoice as successfully synced"""
         self.execute("""
             UPDATE invoices
             SET is_synced = 1,
+                dc_synced = 1,
                 dc_no = ?,
                 catalytics_dc_id = ?,
+                dc_name = ?,
                 last_response_json = ?,
                 last_sync_at = CURRENT_TIMESTAMP,
                 last_sync_error = NULL
             WHERE id = ?
-        """, (dc_no, catalytics_dc_id, response_json, invoice_id))
+        """, (dc_no, catalytics_dc_id, dc_name, response_json, invoice_id))
+
 
     def mark_invoice_sync_failed(self, invoice_id, error_msg, response_json=None):
         """Mark invoice sync as failed"""
@@ -704,6 +723,15 @@ class Database:
                 last_sync_at = CURRENT_TIMESTAMP
             WHERE id = ?
         """, (error_msg, response_json, invoice_id))
+
+    def update_invoice_dc_info(self, invoice_id, dc_no, catalytics_dc_id):
+        """Update invoice with DC information without marking as synced."""
+        self.execute("""
+            UPDATE invoices
+            SET dc_no = ?,
+                catalytics_dc_id = ?
+            WHERE id = ?
+        """, (dc_no, catalytics_dc_id, invoice_id))
 
     # ========================================================================
     # INVOICE DELETION TRACKING

@@ -177,6 +177,20 @@ def _has_delivery_info(invoice):
     return False
 
 
+def _is_instant_invoice(invoice):
+    """Return True if the invoice appears to be an Instant DC invoice based on Tally fields."""
+    raw = invoice.get('raw_voucher', {}) or {}
+    vtype = str(raw.get('VOUCHERTYPENAME') or raw.get('VOUCHERTYPE') or '').strip().lower()
+    if 'instant' in vtype:
+        return True
+
+    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip().lower()
+    if 'instant' in other_ref:
+        return True
+
+    return False
+
+
 def _normalize_name_key(value):
     return str(value or '').replace(' ', '').strip().lower()
 
@@ -256,6 +270,19 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             data_json = json_dumps(enriched_voucher)
             payload_hash = _compute_payload_hash(full_voucher_payload, inventory_items, ledger_data, stock_items_map)
 
+            # Extract Godown/Filling Station info for DB columns
+            g_name = enriched_voucher.get('GODOWNNAME') or ''
+            l_name = enriched_voucher.get('LOCATIONNAME') or ''
+            f_station = enriched_voucher.get('FILLINGSTATION') or ''
+            
+            # If all empty at voucher level, pick from first inventory row
+            if not g_name and not l_name and not f_station:
+                for inv in enriched_voucher.get('INVENTORY', []) or []:
+                    if not isinstance(inv, dict): continue
+                    g_name = inv.get('GODOWNNAME') or ''
+                    l_name = inv.get('LOCATIONNAME') or ''
+                    if g_name or l_name: break
+
             invoice_record = {
                 'voucher_no': voucher_no,
                 'tally_company': company_name,
@@ -269,7 +296,13 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 'tax_amount': invoice.get('tax_amount', 0.0),
                 'items_json': json_dumps(inventory_items),
                 'data_json': data_json,
+                'ledger_data_json': json_dumps(ledger_data),
+                'stock_items_json': json_dumps(stock_items_map),
                 'payload_hash': payload_hash,
+                'godown_name': g_name,
+                'location_name': l_name,
+                'filling_station': f_station,
+                'is_instant': 1 if _is_instant_invoice(invoice) else 0
             }
 
             existing = db.invoice_exists(voucher_no, company_name)
