@@ -1820,52 +1820,92 @@ class CatalyticsSyncer:
             batch = invoices[batch_start:batch_start + batch_size]
             logger.info(f"\n--- Batch {batch_idx + 1}/{total_batches} ({len(batch)} invoices) ---")
 
-                # Parse invoice items for validation and matching
-                items_json = invoice.get('items_json', '[]')
+            batch_invoices = []
+            batch_vouchers = []
+            all_ledgers = {}
+            all_stock_items = {}
+
+            # Step 1: Build the batch payload from valid invoices.
+            for invoice_row in batch:
+                invoice = dict(invoice_row)
+                invoice_id = invoice['id']
+                voucher_no = invoice.get('tally_voucher_no', '')
+                company = invoice.get('tally_company', '')
+
                 try:
-                    import json as json_lib
-                    items = json_lib.loads(items_json) if isinstance(items_json, str) else (items_json or [])
-                except:
-                    items = []
+                    # Parse invoice items for validation and matching
+                    items_json = invoice.get('items_json', '[]')
+                    try:
+                        import json as json_lib
+                        items = json_lib.loads(items_json) if isinstance(items_json, str) else (items_json or [])
+                    except Exception:
+                        items = []
 
-                # INSTANT INVOICE MATCHING LOGIC
-                # 1. Check if we already have a matched DC ID stored in local DB
-                matched_dc_id = invoice.get('catalytics_dc_id')
-                matched_dc = None
-                
-                if not matched_dc_id:
-                    logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
-                    matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
-                    if matched_dc:
-                        matched_dc_id = matched_dc.get('id')
-                        logger.info(f"✓ Found potential match: DC {matched_dc['dc_no']} (ID: {matched_dc_id})")
-                        # Update local info immediately so we don't lose the link
-                        self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
-                        # Update memory dict for the rest of the loop
-                        invoice['catalytics_dc_id'] = matched_dc_id
-                        invoice['dc_no'] = matched_dc['dc_no']
-                        # Remove from batch list to avoid double matching
-                        instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
-                else:
-                    logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
+                    # INSTANT INVOICE MATCHING LOGIC
+                    # 1. Check if we already have a matched DC ID stored in local DB
+                    matched_dc_id = invoice.get('catalytics_dc_id')
+                    matched_dc = None
 
-                # Proceed with sync (always building full payload)
+                    if not matched_dc_id:
+                        logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
+                        matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
+                        if matched_dc:
+                            matched_dc_id = matched_dc.get('id')
+                            logger.info(f"Found potential match: DC {matched_dc['dc_no']} (ID: {matched_dc_id})")
+                            # Update local info immediately so we don't lose the link
+                            self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
+                            # Update memory dict for the rest of the loop
+                            invoice['catalytics_dc_id'] = matched_dc_id
+                            invoice['dc_no'] = matched_dc['dc_no']
+                            # Remove from batch list to avoid double matching
+                            instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
+                    else:
+                        logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
 
-                # Validate customer and products exist before syncing
-                is_valid, validation_error = self._validate_invoice_for_sync(invoice, items)
-                if not is_valid:
-                    logger.warning(
-                        f"[VALIDATION FAILED] Invoice #{voucher_no}: {validation_error} — SKIPPING"
-                    )
+                    # Proceed with sync (always building full payload)
+
+                    # Validate customer and products exist before syncing
+                    is_valid, validation_error = self._validate_invoice_for_sync(invoice, items)
+                    if not is_valid:
+                        logger.warning(
+                            f"[VALIDATION FAILED] Invoice #{voucher_no}: {validation_error} - SKIPPING"
+                        )
+                        stats['failed'] += 1
+                        continue
+
+                    voucher_payload = self._build_invoice_voucher_payload(invoice)
+                    if matched_dc_id:
+                        voucher_payload['MATCHED_DC_ID'] = matched_dc_id
+                        logger.info(f"Adding MATCHED_DC_ID={matched_dc_id} to Tally payload")
+
+                    ledgers_map, stock_items_map = self._build_invoice_support_payloads(company, voucher_payload)
+                    all_ledgers.update(ledgers_map)
+                    all_stock_items.update(stock_items_map)
+                    batch_vouchers.append(voucher_payload)
+                    batch_invoices.append(invoice)
+
+                    per_invoice_payload = {
+                        'entity_id': self.entity_id,
+                        'company_name': company,
+                        'voucher': voucher_payload,
+                        'ledgers': ledgers_map,
+                        'stock_items': stock_items_map,
+                        'allow_tally_fetch': False,
+                        'created_by': config.DEFAULT_ADMIN_USER_ID,
+                    }
+                    try:
+                        self.db.execute(
+                            'UPDATE invoices SET sync_request_json = ? WHERE id = ?',
+                            (json.dumps(per_invoice_payload), invoice_id)
+                        )
+                    except Exception as exc:
+                        logger.error(f"Failed to save sync request for invoice #{voucher_no}: {exc}")
+
+                except Exception as exc:
+                    logger.error(f"Error preparing invoice #{voucher_no}: {exc}", exc_info=True)
+                    self.db.mark_invoice_sync_failed(invoice_id, str(exc))
                     stats['failed'] += 1
                     continue
-
-                voucher_payload = self._build_invoice_voucher_payload(invoice)
-                if matched_dc_id:
-                    voucher_payload['MATCHED_DC_ID'] = matched_dc_id
-                    logger.info(f"Adding MATCHED_DC_ID={matched_dc_id} to Tally payload")
-
-                ledgers_map, stock_items_map = self._build_invoice_support_payloads(company, voucher_payload)
 
             if not batch_vouchers:
                 continue
@@ -1888,103 +1928,6 @@ class CatalyticsSyncer:
                     json=request_payload,
                     timeout=180,
                 )
-
-                if response.status_code in [200, 201]:
-                    result = response.json()
-                    response_json = json.dumps(result)
-
-                    if result.get('status') != 'success':
-                        raise ValueError(f"API returned non-success status: {result.get('message')}")
-
-                    data = result.get('data', {})
-                    created = data.get('created', 0)
-                    updated = data.get('updated', 0)
-                    errors = data.get('errors', 0)
-
-                    if errors > 0:
-                        error_msg = data.get('results', [{}])[0].get('message', 'Unknown error')
-                        raise ValueError(f"API error: {error_msg}")
-
-                    if created == 0 and updated == 0:
-                        raise ValueError('DC not created or updated')
-
-                    logger.info(f"API sync successful: Created={created}, Updated={updated}")
-                    stats['synced'] += 1
-
-                    dc_result = self._extract_dc_result_for_invoice(result, voucher_no)
-                    resolved_dc_no = str(
-                        dc_result.get('dc_no')
-                        or voucher_payload.get('VOUCHERNUMBER')
-                        or voucher_no
-                        or ''
-                    ).strip()
-
-                    if not resolved_dc_no:
-                        raise ValueError('Could not resolve DC number from response payload')
-
-                    catalytics_dc_id = (
-                        dc_result.get('dc_id')
-                        or dc_result.get('id')
-                        or dc_result.get('delivery_challan_id')
-                    )
-
-                    if self.verify_enabled:
-                        verify_result = self.verifier.verify_dc_by_number(
-                            dc_no=resolved_dc_no,
-                            expected_date=invoice.get('voucher_date'),
-                            expected_customer=invoice.get('customer_name'),
-                        )
-
-                        if not verify_result.get('exists'):
-                            error_msg = f"DB verification failed for DC #{resolved_dc_no}"
-                            logger.error(error_msg)
-                            self.db.mark_invoice_sync_failed(invoice_id, error_msg, response_json)
-                            stats['failed'] += 1
-                            continue
-
-                        catalytics_dc_id = catalytics_dc_id or verify_result.get('id')
-
-                    # Step 2: Update filling station ID on the DC (if godown/filling_station field is empty)
-                    filling_station_id = self._get_filling_station_id(invoice)
-                    if filling_station_id and catalytics_dc_id:
-                        fs_updated, fs_error = self._update_dc_filling_station(
-                            resolved_dc_no,
-                            catalytics_dc_id,
-                            filling_station_id
-                        )
-                        if fs_updated:
-                            logger.info(f"DC #{resolved_dc_no}: filling station ID set to {filling_station_id}")
-                        else:
-                            logger.warning(f"DC #{resolved_dc_no}: filling station update failed: {fs_error}")
-
-                    self.db.mark_invoice_synced(
-                        invoice_id,
-                        resolved_dc_no,
-                        catalytics_dc_id,
-                        response_json,
-                        dc_name="instant dc" if matched_dc_id else "tally dc"
-                    )
-                    stats['verified'] += 1
-
-                    logger.info(
-                        f"SUCCESS: Invoice #{voucher_no} synced as DC "
-                        f"(DC No={resolved_dc_no}, Catalytics ID={catalytics_dc_id}, SQLite ID={invoice_id})"
-                    )
-
-                else:
-                    error_msg = f"API error: HTTP {response.status_code}"
-                    error_response_json = None
-                    try:
-                        error_result = response.json()
-                        error_response_json = json.dumps(error_result)
-                        error_detail = error_result.get('message', response.text[:200])
-                        error_msg = f"{error_msg} - {error_detail}"
-                    except Exception:
-                        error_msg = f"{error_msg} - {response.text[:200]}"
-
-                    logger.error(f"Sync failed for invoice #{voucher_no}: {error_msg}")
-                    self.db.mark_invoice_sync_failed(invoice_id, error_msg, error_response_json)
-                    stats['failed'] += 1
 
             except Exception as e:
                 logger.error(f"Batch {batch_idx + 1} API request failed: {e}")
