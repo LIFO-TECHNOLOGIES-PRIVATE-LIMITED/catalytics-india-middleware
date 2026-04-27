@@ -1,5 +1,6 @@
 ﻿import argparse
 from dataclasses import dataclass
+from datetime import datetime
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -171,6 +172,16 @@ def _get_default_fill_station_id() -> str:
         return explicit
     fallback = os.getenv("DEFAULT_FILLING_STATION", "").strip()
     return fallback if fallback.isdigit() else ""
+
+
+def _get_default_admin_user_id() -> Optional[int]:
+    raw = (os.getenv("DEFAULT_ADMIN_USER_ID") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 # Cache: fill station ID -> station name from backend
@@ -533,6 +544,19 @@ def _enrich_voucher(
     voucher.setdefault("DATE", note.get("voucher_date") or "")
     voucher.setdefault("PARTYLEDGERNAME", note.get("party_ledger_name") or "")
 
+    # Set backend audit ownership fields from default admin user.
+    admin_user_id = _get_default_admin_user_id()
+    if admin_user_id is not None:
+        voucher.setdefault("created_by", admin_user_id)
+        voucher.setdefault("modified_by", admin_user_id)
+
+    # Use voucher/invoice date for creation timestamp fields.
+    created_date = _normalize_date_yyyymmdd(voucher.get("DATE") or note.get("voucher_date"))
+    if created_date:
+        created_iso = f"{created_date[0:4]}-{created_date[4:6]}-{created_date[6:8]}"
+        voucher.setdefault("created_at", created_iso)
+        voucher.setdefault("created_on", created_iso)
+
     # ADDRESSES â€" billing address (from voucher data or party)
     if not voucher.get("ADDRESSES"):
         addr = (voucher.get("ADDRESS") or voucher.get("MAILINGNAME") or "").strip()
@@ -822,6 +846,233 @@ def _norm_dc_no(value: Any) -> str:
     return str(value).strip()
 
 
+def _normalize_date_yyyymmdd(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) >= 8:
+        return digits[:8]
+
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y%m%d")
+        except Exception:
+            continue
+    return ""
+
+
+def _safe_qty(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
+
+
+def _build_item_qty_map(
+    items: List[Dict[str, Any]],
+    *,
+    is_portal_item: bool = False,
+) -> Dict[str, float]:
+    product_map: Dict[str, float] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        if is_portal_item:
+            product_obj = item.get("product")
+            if isinstance(product_obj, dict):
+                name = str(product_obj.get("name") or "").strip()
+            else:
+                name = str(item.get("product_name") or item.get("name") or "").strip()
+            qty = _safe_qty(item.get("quantity") or item.get("qty"))
+        else:
+            name = str(item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
+            qty = _safe_qty(item.get("BILLEDQTY") or item.get("ACTUALQTY") or item.get("QTY"))
+
+        if not name or qty is None:
+            continue
+
+        key = _normalize_name_key(name)
+        product_map[key] = product_map.get(key, 0.0) + qty
+
+    return product_map
+
+
+def _parse_instant_dc_results(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            return [data]
+        results = payload.get("results")
+        if isinstance(results, list):
+            return [item for item in results if isinstance(item, dict)]
+        if isinstance(results, dict):
+            return [results]
+    return []
+
+
+def _fetch_unsynced_instant_dcs(api_base_url: str, entity_id: Optional[int]) -> List[Dict[str, Any]]:
+    logger.info("Fetching unsynced Instant DCs from portal for matching")
+    try:
+        params: Dict[str, Any] = {}
+        if entity_id:
+            params["entity_id"] = entity_id
+
+        url = _server_base_url(api_base_url) + "/transaction/delivery_challan/instant/unsynced"
+        response = requests.get(url, params=params, timeout=20)
+        if response.status_code != 200:
+            logger.warning("Unsynced Instant DC fetch failed: HTTP %s", response.status_code)
+            return []
+
+        basic_results = _parse_instant_dc_results(response.json())
+        if not basic_results:
+            return []
+
+        needs_detail_fetch = bool(basic_results and not basic_results[0].get("dc_date"))
+        if not needs_detail_fetch:
+            return basic_results
+
+        logger.info("Instant DC list missing dc_date; fetching per-DC details")
+        full_results: List[Dict[str, Any]] = []
+        for basic in basic_results:
+            dc_id = basic.get("id")
+            if not dc_id:
+                full_results.append(basic)
+                continue
+
+            try:
+                detail_url = _server_base_url(api_base_url) + f"/transaction/delivery_challan/{dc_id}"
+                detail_resp = requests.get(detail_url, timeout=20)
+                if detail_resp.status_code == 200:
+                    parsed_detail = _parse_instant_dc_results(detail_resp.json())
+                    full_results.append(parsed_detail[0] if parsed_detail else basic)
+                else:
+                    full_results.append(basic)
+            except Exception:
+                full_results.append(basic)
+        return full_results
+    except Exception as exc:
+        logger.warning("Failed to fetch unsynced Instant DCs: %s", exc)
+        return []
+
+
+def _find_matching_instant_dc(
+    note: Dict[str, Any],
+    voucher: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    instant_dcs: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not instant_dcs:
+        return None
+
+    invoice_date = _normalize_date_yyyymmdd(note.get("voucher_date") or voucher.get("DATE"))
+    if not invoice_date:
+        return None
+
+    customer_name = (
+        note.get("party_ledger_name")
+        or voucher.get("PARTYLEDGERNAME")
+        or voucher.get("PARTYNAME")
+        or ""
+    )
+    customer_name_norm = _normalize_name_key(customer_name)
+    if not customer_name_norm:
+        return None
+
+    invoice_products = _build_item_qty_map(items, is_portal_item=False)
+    if not invoice_products:
+        return None
+
+    try:
+        invoice_dt = datetime.strptime(invoice_date, "%Y%m%d")
+    except Exception:
+        return None
+
+    for dc in instant_dcs:
+        dc_id = dc.get("id")
+        if not dc_id:
+            continue
+        if dc.get("is_instant_dc") is False:
+            continue
+        if dc.get("dc_synced") is True:
+            continue
+
+        dc_date_norm = _normalize_date_yyyymmdd(dc.get("dc_date") or dc.get("date"))
+        if not dc_date_norm:
+            continue
+
+        try:
+            dc_dt = datetime.strptime(dc_date_norm, "%Y%m%d")
+            delta = (invoice_dt - dc_dt).days
+            if delta < 0 or delta > 7:
+                continue
+        except Exception:
+            if dc_date_norm != invoice_date:
+                continue
+
+        customer_obj = dc.get("customer")
+        if isinstance(customer_obj, dict):
+            dc_customer_norm = _normalize_name_key(customer_obj.get("name"))
+        else:
+            dc_customer_norm = _normalize_name_key(dc.get("customer_name"))
+        if dc_customer_norm != customer_name_norm:
+            continue
+
+        dc_items = dc.get("order_details") or dc.get("items") or []
+        dc_products = _build_item_qty_map(dc_items, is_portal_item=True)
+        if len(dc_products) != len(invoice_products):
+            continue
+
+        if all(abs(dc_products.get(name, -10**9) - qty) < 1e-6 for name, qty in invoice_products.items()):
+            return dc
+
+    return None
+
+
+def _mark_instant_dc_synced_on_portal(
+    api_base_url: str,
+    dc_pk: Any,
+    tally_voucher_no: Optional[str] = None,
+) -> bool:
+    """Mark matched instant DC as synced on the portal."""
+    dc_id = str(dc_pk or "").strip()
+    if not dc_id:
+        return False
+
+    payload: Dict[str, Any] = {}
+    if tally_voucher_no:
+        payload["tally_voucher_no"] = str(tally_voucher_no).strip()
+
+    try:
+        url = _server_base_url(api_base_url) + f"/transaction/delivery_challan/instant/{dc_id}/mark-synced"
+        resp = requests.post(url, json=payload, timeout=20)
+        if resp.status_code == 200:
+            return True
+        logger.warning("Instant DC mark-synced failed for id=%s: HTTP %s", dc_id, resp.status_code)
+        return False
+    except Exception as exc:
+        logger.warning("Instant DC mark-synced error for id=%s: %s", dc_id, exc)
+        return False
+
+
 def _update_sync_status(
     conn,
     *,
@@ -976,6 +1227,9 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("No unsynced delivery notes found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
+    instant_dcs = _fetch_unsynced_instant_dcs(config.api_base_url, config.entity_id)
+    logger.info("Retrieved %d unsynced Instant DCs for matching", len(instant_dcs))
+
     # Build liquid product name map once for this sync run
     liquid_master_map, liquid_variant_map = _build_liquid_name_maps(config.master_db_path)
     if liquid_master_map or liquid_variant_map:
@@ -995,6 +1249,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
 
     for note in notes:
         dc_no = _norm_dc_no(note.get("dc_no"))
+        matched_dc_id: Optional[int] = None
         try:
             payload, payload_hash = _build_payload_for_note(
                 conn,
@@ -1021,6 +1276,17 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             continue
 
         voucher = payload["voucher"]
+        items = voucher.get("INVENTORY") or []
+        tally_voucher_no = str(voucher.get("VOUCHERNUMBER") or dc_no).strip()
+
+        matched_dc = _find_matching_instant_dc(note, voucher, items, instant_dcs)
+        if matched_dc and matched_dc.get("id"):
+            matched_dc_id = matched_dc.get("id")
+            voucher["MATCHED_DC_ID"] = matched_dc_id
+            logger.info("Matched Instant DC for %s -> portal DC %s (id=%s)",
+                        dc_no or "?", matched_dc.get("dc_no"), matched_dc_id)
+            instant_dcs = [dc for dc in instant_dcs if dc.get("id") != matched_dc_id]
+
         logger.info(
             "Syncing DC #%s | party=%s | date=%s | filling_station=%s | po=%s | items=%d | terms=%s",
             dc_no or "?",
@@ -1123,6 +1389,17 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                                     payload_hash=payload_hash, response_json=response_json, error_text=None)
                 total_ok += 1
 
+                if matched_dc_id:
+                    mark_ok = _mark_instant_dc_synced_on_portal(
+                        config.api_base_url,
+                        matched_dc_id,
+                        tally_voucher_no=tally_voucher_no,
+                    )
+                    if mark_ok:
+                        logger.info("Marked Instant DC as synced on portal (id=%s)", matched_dc_id)
+                    else:
+                        logger.warning("Could not mark Instant DC as synced on portal (id=%s)", matched_dc_id)
+
                 # Step 2: Always update fill_station after successful DC sync
                 default_fs_id = _get_default_fill_station_id()
                 if default_fs_id:
@@ -1187,13 +1464,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
 
 
 

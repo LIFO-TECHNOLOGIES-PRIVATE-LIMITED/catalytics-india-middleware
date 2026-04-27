@@ -82,9 +82,8 @@ def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
     # Tally Day Book only returns data for the currently open date.
     # By covering yesterday+today+tomorrow, whichever date is open in
     # Tally will match and its DCs will be fetched.
-    # days_back > 1 expands the past side further.
-    effective_days_back = max(days_back, DEFAULT_DC_PAST_DAYS) if days_back is not None else DEFAULT_DC_PAST_DAYS
-    from_dt = now - timedelta(days=effective_days_back)
+    # Keep this fixed at 3 days only; do not expand into older daybooks.
+    from_dt = now - timedelta(days=DEFAULT_DC_PAST_DAYS)
     to_dt = now + timedelta(days=DEFAULT_DC_FUTURE_DAYS)
     return from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")
 

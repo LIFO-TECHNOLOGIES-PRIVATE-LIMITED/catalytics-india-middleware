@@ -260,6 +260,7 @@ def get_path_base_dir() -> Path:
 _FALLBACK_ENV_TEMPLATE = """# Auto-generated default middleware configuration
 ENTITY_NAME=Chennai Oxygen
 ENTITY_ID=1
+DEFAULT_ADMIN_USER_ID=55
 DEFAULT_FILLING_STATION=
 DEFAULT_FILLING_STATION_ID=
 CATALYTICS_API_BASE_URL=http://localhost:8000/
@@ -277,7 +278,7 @@ PRODUCT_TYPE_MAP=CYL:CYLINDER,PLT:PALLET,TNK:TANK,CON:CONTAINER
 PRODUCT_EXACT_KEYWORDS=
 TALLY_FETCH_STOCK=false
 TALLY_DAYS_BACK=0
-DC_REFERENCE_KEYWORDS=delivery,customer pickup,supplier,traders
+DC_REFERENCE_KEYWORDS=
 SYNC_INVOICES_INTERVAL_SECONDS=120
 FETCH_MASTER_INTERVAL_MINUTES=30
 FETCH_INVOICES_INTERVAL_SECONDS=120
@@ -353,6 +354,7 @@ class Config:
     # Entity Configuration
     ENTITY_NAME = os.getenv('ENTITY_NAME', 'Chennai Oxygen')
     ENTITY_ID = int(os.getenv('ENTITY_ID', '1'))
+    DEFAULT_ADMIN_USER_ID = int(os.getenv('DEFAULT_ADMIN_USER_ID', '55'))
 
     # Default filling station
     DEFAULT_FILLING_STATION = os.getenv('DEFAULT_FILLING_STATION', '')
@@ -408,6 +410,7 @@ class Config:
         cls.SYNC_MASTER_INTERVAL_MINUTES = int(os.getenv('SYNC_MASTER_INTERVAL_MINUTES', '5'))
         cls.SYNC_BATCH_SIZE = int(os.getenv('SYNC_BATCH_SIZE', '10'))
         cls.CUSTOMER_SYNC_WORKERS = int(os.getenv('CUSTOMER_SYNC_WORKERS', '5'))
+        cls.DEFAULT_ADMIN_USER_ID = int(os.getenv('DEFAULT_ADMIN_USER_ID', '55'))
         cls.DEFAULT_FILLING_STATION = os.getenv('DEFAULT_FILLING_STATION', '')
         cls.DEFAULT_FILLING_STATION_ID = os.getenv('DEFAULT_FILLING_STATION_ID', '')
         cls.LOG_FILE = _normalize_log_path(os.getenv('LOG_FILE', 'logs/app.log'))
@@ -506,8 +509,6 @@ class Config:
 
 
 config = Config()
-
-
 
 
 
