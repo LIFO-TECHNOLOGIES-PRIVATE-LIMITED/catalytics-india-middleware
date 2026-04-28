@@ -87,6 +87,27 @@ class CatalyticsSyncer:
         self.tally_url = config.TALLY_URL
         self._filling_station_cache = {}  # name -> id cache
 
+    @staticmethod
+    def _row_get(row, key, default=None):
+        if row is None:
+            return default
+        if hasattr(row, 'get'):
+            return row.get(key, default)
+        try:
+            return row[key]
+        except Exception:
+            return default
+
+    @staticmethod
+    def _endpoint_allows_anonymous(endpoint):
+        path = '/' + endpoint.lstrip('/')
+        return path.startswith('/import/') or path in {
+            '/transaction/delivery_challan/instant/unsynced',
+        } or (
+            path.startswith('/transaction/delivery_challan/instant/')
+            and path.endswith('/mark-synced')
+        )
+
     def _api_request(self, method, endpoint, **kwargs):
         """Make API request to Catalytics"""
         # Robust URL construction: strip any slashes and join with single slash
@@ -101,7 +122,7 @@ class CatalyticsSyncer:
         # They only check TALLY_MIDDLEWARE_API_KEY if it's configured in Django settings
         # Since it's not configured, we don't send authentication headers
         headers['Content-Type'] = 'application/json'
-        if self.api_key:
+        if self.api_key and not self._endpoint_allows_anonymous(endpoint):
             headers['Authorization'] = f'Bearer {self.api_key}'
 
         try:
@@ -196,6 +217,14 @@ class CatalyticsSyncer:
         )
         if result:
             return True, None
+
+        customer_name_norm = self._normalize_name(customer_name)
+        candidates = self.db.query_all(
+            "SELECT id, name FROM customers WHERE is_synced = 1"
+        ) or []
+        for row in candidates:
+            if self._normalize_name(self._row_get(row, 'name', '')) == customer_name_norm:
+                return True, None
         return False, f"Customer '{customer_name}' not found in Catalytics"
 
     def _products_exist(self, items):
@@ -218,6 +247,224 @@ class CatalyticsSyncer:
 
         if missing_products:
             return False, f"Products not found in Catalytics: {', '.join(missing_products)}"
+        return True, None
+
+    def _get_customer_row_by_name(self, customer_name):
+        if not customer_name:
+            return None
+        result = self.db.query(
+            "SELECT * FROM customers WHERE name = ? ORDER BY id DESC LIMIT 1",
+            (customer_name,)
+        )
+        if result:
+            return result
+
+        customer_name_norm = self._normalize_name(customer_name)
+        candidates = self.db.query_all(
+            "SELECT * FROM customers ORDER BY id DESC"
+        ) or []
+        for row in candidates:
+            if self._normalize_name(self._row_get(row, 'name', '')) == customer_name_norm:
+                return row
+        return None
+
+    def _get_product_row_by_name(self, product_name):
+        if not product_name:
+            return None
+        return self.db.query(
+            "SELECT * FROM products WHERE name = ? ORDER BY id DESC LIMIT 1",
+            (product_name,)
+        )
+
+    def _auto_fetch_customer_to_sqlite(self, company_name, customer_name):
+        try:
+            ledger = tally_client.get_ledger_by_name(company_name, customer_name, self.tally_url)
+            if not ledger:
+                return None, f"Customer '{customer_name}' not found in Tally"
+
+            guid = str(ledger.get('GUID') or ledger.get('MASTERID') or '').strip()
+            name = (ledger.get('NAME') or customer_name).strip()
+            normalized_name = ' '.join(name.split())
+
+            customer_data = {
+                'tally_guid': guid,
+                'name': normalized_name,
+                'tally_company': company_name,
+                'gstin': (ledger.get('GSTIN') or ledger.get('PARTYGSTIN') or '').lstrip(':'),
+                'pan': ledger.get('INCOMETAXNUMBER') or ledger.get('PANNUMBER') or '',
+                'address': ', '.join(ledger.get('ADDRESSES', [])) if ledger.get('ADDRESSES') else '',
+                'state': ledger.get('STATENAME') or '',
+                'city': '',
+                'pincode': ledger.get('PINCODE') or '',
+                'phone': ledger.get('MOBILE') or ledger.get('LEDGERMOBILE') or '',
+                'email': ledger.get('EMAIL') or ledger.get('LEDGEREMAIL') or '',
+                'data_json': json.dumps({
+                    'guid': guid,
+                    'name': normalized_name,
+                    'parent_group': ledger.get('PARENT') or '',
+                    'gstin': (ledger.get('GSTIN') or ledger.get('PARTYGSTIN') or '').lstrip(':'),
+                    'pan': ledger.get('INCOMETAXNUMBER') or ledger.get('PANNUMBER') or '',
+                    'address': ', '.join(ledger.get('ADDRESSES', [])) if ledger.get('ADDRESSES') else '',
+                    'state': ledger.get('STATENAME') or '',
+                    'city': '',
+                    'pincode': ledger.get('PINCODE') or '',
+                    'phone': ledger.get('MOBILE') or ledger.get('LEDGERMOBILE') or '',
+                    'email': ledger.get('EMAIL') or ledger.get('LEDGEREMAIL') or '',
+                }),
+            }
+
+            existing = self.db.customer_exists_by_guid(guid) if guid else self._get_customer_row_by_name(normalized_name)
+            if existing:
+                self.db.update_customer(existing['id'], customer_data)
+            else:
+                self.db.insert_customer(customer_data)
+
+            return self._get_customer_row_by_name(normalized_name), None
+        except Exception as exc:
+            return None, str(exc)
+
+    def sync_single_product(self, product_row):
+        name = (self._row_get(product_row, 'name') or '').strip()
+        try:
+            stock_item, error = self._prepare_stock_item(product_row)
+            if not stock_item:
+                return {'success': False, 'error': error or f"Could not prepare product '{name}'", 'catalytics_id': None}
+
+            request_payload = {
+                'entity_id': self.entity_id,
+                'stock_items': [stock_item],
+                'created_by': config.DEFAULT_ADMIN_USER_ID,
+            }
+            response = self._api_request(
+                'POST',
+                '/import/tally-product-payload/',
+                json=request_payload
+            )
+            if response.status_code not in [200, 201]:
+                error_msg = f"HTTP {response.status_code}"
+                try:
+                    error_msg += f" - {response.json().get('message', response.text[:200])}"
+                except Exception:
+                    pass
+                return {'success': False, 'error': error_msg, 'catalytics_id': None}
+
+            result = response.json()
+            data = result.get('data', result)
+            results_list = data.get('results', [])
+            first_result = results_list[0] if results_list else {}
+            status = first_result.get('status', 'error')
+            catalytics_id = first_result.get('product_id') or first_result.get('id')
+            if status not in ('created', 'updated'):
+                return {'success': False, 'error': first_result.get('message', 'Product not created or updated'), 'catalytics_id': None}
+
+            self.db.mark_product_synced(self._row_get(product_row, 'id'), catalytics_id, json.dumps(first_result))
+            logger.info(f"✓ Product '{name}' synced (status={status}, ID={catalytics_id})")
+            return {'success': True, 'error': None, 'catalytics_id': catalytics_id}
+        except Exception as exc:
+            logger.error(f"Error syncing product '{name}': {exc}")
+            return {'success': False, 'error': str(exc), 'catalytics_id': None}
+
+    def _auto_fetch_product_to_sqlite(self, company_name, product_name):
+        try:
+            stock = tally_client.get_stock_item_by_name(company_name, product_name, self.tally_url)
+            if not stock:
+                return None, f"Product '{product_name}' not found in Tally"
+
+            guid = str(stock.get('GUID') or stock.get('MASTERID') or '').strip()
+            name = (stock.get('NAME') or product_name).strip()
+            parsed = parse_stock_item_name(name) or {
+                'product_master_name': name,
+                'unit_name': canonical_unit_name('cubic'),
+                'variant_name': '7',
+                'product_type_code': 'CYL',
+                'product_type_name': 'CYLINDER',
+                'canonical_name': f'{name} (CYL)',
+            }
+            simple_data = {
+                'guid': guid,
+                'name': name,
+                'hsn_code': stock.get('HSNCODE') or '',
+                'unit': stock.get('BASEUNITS') or '',
+                'rate': 0.0,
+                'gst_applicable': '',
+                'gst_rate': stock.get('GST_RATE') or 0.0,
+                'igst_rate': stock.get('IGST_RATE') or 0.0,
+                'cgst_rate': stock.get('CGST_RATE') or 0.0,
+                'sgst_rate': stock.get('SGST_RATE') or 0.0,
+                'description': stock.get('PARENT') or '',
+            }
+            product_data = {
+                'tally_guid': guid,
+                'name': name,
+                'name_canonical': parsed['canonical_name'],
+                'tally_company': company_name,
+                'hsn_code': simple_data['hsn_code'],
+                'unit': simple_data['unit'],
+                'rate': simple_data['rate'],
+                'description': simple_data['description'],
+                'data_json': json.dumps(simple_data),
+                'product_master_name': parsed['product_master_name'],
+                'variant_name': parsed['variant_name'],
+                'unit_name': parsed['unit_name'],
+                'product_type_code': parsed['product_type_code'],
+                'product_type_name': parsed['product_type_name'],
+                'gst_applicable': simple_data['gst_applicable'],
+                'gst_rate': simple_data['gst_rate'],
+                'igst_rate': simple_data['igst_rate'],
+                'cgst_rate': simple_data['cgst_rate'],
+                'sgst_rate': simple_data['sgst_rate'],
+            }
+            existing = self.db.product_exists_by_guid(guid) if guid else self._get_product_row_by_name(name)
+            if existing:
+                self.db.update_product(existing['id'], product_data)
+            else:
+                self.db.insert_product(product_data)
+            return self._get_product_row_by_name(name), None
+        except Exception as exc:
+            return None, str(exc)
+
+    def _ensure_invoice_dependencies_synced(self, invoice, items):
+        company = invoice.get('tally_company', '')
+        customer_name = (invoice.get('customer_name') or '').strip()
+
+        customer_ok, _ = self._customer_exists(customer_name)
+        if not customer_ok:
+            customer_row = self._get_customer_row_by_name(customer_name)
+            if not customer_row:
+                logger.info(f"[AUTO-RECOVER:CUSTOMER] Fetching missing customer '{customer_name}' from Tally...")
+                customer_row, error = self._auto_fetch_customer_to_sqlite(company, customer_name)
+                if not customer_row:
+                    return False, error
+            if not self._row_get(customer_row, 'is_synced'):
+                ledger, error = self._prepare_ledger(customer_row)
+                if not ledger:
+                    return False, error
+                sync_result = self.sync_single_customer(customer_row, ledger)
+                if not sync_result.get('success'):
+                    return False, sync_result.get('error')
+
+        for item in items or []:
+            product_name = (item.get('item_name') or '').strip()
+            if not product_name:
+                continue
+            result = self.db.query(
+                "SELECT id, is_synced FROM products WHERE name = ? LIMIT 1",
+                (product_name,)
+            )
+            if result and self._row_get(result, 'is_synced') == 1:
+                continue
+
+            product_row = self._get_product_row_by_name(product_name)
+            if not product_row:
+                logger.info(f"[AUTO-RECOVER:PRODUCT] Fetching missing product '{product_name}' from Tally...")
+                product_row, error = self._auto_fetch_product_to_sqlite(company, product_name)
+                if not product_row:
+                    return False, error
+            if not self._row_get(product_row, 'is_synced'):
+                sync_result = self.sync_single_product(product_row)
+                if not sync_result.get('success'):
+                    return False, sync_result.get('error')
+
         return True, None
 
     def _fetch_unsynced_instant_dcs(self):
@@ -1031,9 +1278,9 @@ class CatalyticsSyncer:
         Returns:
             dict: {'success': bool, 'error': str, 'catalytics_id': int}
         """
-        customer_id = customer_dict.get('id')
-        name = customer_dict.get('name')
-        company = customer_dict.get('tally_company')
+        customer_id = self._row_get(customer_dict, 'id')
+        name = self._row_get(customer_dict, 'name')
+        company = self._row_get(customer_dict, 'tally_company')
         
         try:
             logger.info(f"Syncing single customer '{name}' (company: {company})...")
@@ -1101,6 +1348,12 @@ class CatalyticsSyncer:
                     first_result = results_list[0]
                     if isinstance(first_result, dict):
                         catalytics_id = first_result.get('customer_id')
+
+                if customer_id:
+                    try:
+                        self.db.mark_customer_synced(customer_id, catalytics_id, json.dumps(result))
+                    except Exception as exc:
+                        logger.warning(f"Customer '{name}' synced remotely but failed to update local sync state: {exc}")
                 
                 logger.info(f"✓ Customer '{name}' synced (Created={created}, Updated={updated}, ID={catalytics_id})")
                 
@@ -1867,18 +2120,33 @@ class CatalyticsSyncer:
                     # Validate customer and products exist before syncing
                     is_valid, validation_error = self._validate_invoice_for_sync(invoice, items)
                     if not is_valid:
-                        logger.warning(
-                            f"[VALIDATION FAILED] Invoice #{voucher_no}: {validation_error} - SKIPPING"
+                        logger.info(
+                            f"[AUTO-RECOVER] Invoice #{voucher_no}: {validation_error}. "
+                            f"Attempting customer/product fetch+sync..."
                         )
-                        stats['failed'] += 1
-                        continue
+                        recovered, recover_error = self._ensure_invoice_dependencies_synced(invoice, items)
+                        if not recovered:
+                            logger.warning(
+                                f"[VALIDATION FAILED] Invoice #{voucher_no}: {recover_error} - SKIPPING"
+                            )
+                            stats['failed'] += 1
+                            continue
+                        is_valid, validation_error = self._validate_invoice_for_sync(invoice, items)
+                        if not is_valid:
+                            logger.warning(
+                                f"[VALIDATION FAILED] Invoice #{voucher_no}: {validation_error} - SKIPPING"
+                            )
+                            stats['failed'] += 1
+                            continue
 
-                    voucher_payload = self._build_invoice_voucher_payload(invoice)
+                    voucher_payload, ledgers_map, stock_items_map, prep_error = self._prepare_voucher_payload(invoice)
+                    if prep_error or not voucher_payload:
+                        raise ValueError(prep_error or f"Could not prepare payload for invoice #{voucher_no}")
+
                     if matched_dc_id:
                         voucher_payload['MATCHED_DC_ID'] = matched_dc_id
                         logger.info(f"Adding MATCHED_DC_ID={matched_dc_id} to Tally payload")
 
-                    ledgers_map, stock_items_map = self._build_invoice_support_payloads(company, voucher_payload)
                     all_ledgers.update(ledgers_map)
                     all_stock_items.update(stock_items_map)
                     batch_vouchers.append(voucher_payload)
