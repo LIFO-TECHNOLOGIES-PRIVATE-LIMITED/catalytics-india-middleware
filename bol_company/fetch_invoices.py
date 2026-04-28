@@ -6,8 +6,10 @@ Fetch invoices from multiple Tally companies with enhanced change detection.
 - Filters by config start date (from-date onward) and delivery information
 """
 import logging
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
+import requests
 
 from config import config, BASE_DIR
 from db import Database, json_dumps, json_loads, sha256_text
@@ -28,6 +30,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+_VEHICLE_MASTER_CACHE = None
 
 def _attach_invoice_fetch_file_handler():
     """Log invoice fetch operations to a dedicated file."""
@@ -154,45 +157,94 @@ def _invoice_in_date_range(invoice, from_date, to_date):
     return vd >= from_date
 
 
-def _has_delivery_info(invoice):
+def _normalize_vehicle_no(vehicle_no):
+    return re.sub(r'[^A-Za-z0-9]', '', str(vehicle_no or '')).upper()
+
+
+def _extract_vehicle_no(invoice):
+    raw = invoice.get('raw_voucher', {}) or {}
+    for key in (
+        'DISPATCHEDTHROUGH',
+        'BASICSHIPPEDBY',
+        'MOTORVEHICLENO',
+        'BASICMOTORVEHICLENO',
+        'GOODSVEHICLENUMBER',
+        'VEHICLENO',
+        'VEHICLE_NO',
+        'VEHICLE_NUMBER',
+        'vehicle_no',
+        'vehicle_number',
+        'vehicle',
+    ):
+        value = raw.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ''
+
+
+def _fetch_vehicle_master_numbers():
+    global _VEHICLE_MASTER_CACHE
+    if _VEHICLE_MASTER_CACHE is not None:
+        return _VEHICLE_MASTER_CACHE
+
+    base = config.CATALYTICS_API_BASE.rstrip('/')
+    url = f"{base}/api/master/vehicle"
+    headers = {
+        'Content-Type': 'application/json',
+        'Entity-Id': str(config.ENTITY_ID),
+    }
+    if config.CATALYTICS_API_KEY:
+        headers['Authorization'] = f'Bearer {config.CATALYTICS_API_KEY}'
+
+    normalized_numbers = set()
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params={'limit_start': 0, 'limit_end': 100000},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json() or {}
+        for vehicle in payload.get('data') or []:
+            normalized = _normalize_vehicle_no((vehicle or {}).get('vehicle_no'))
+            if normalized:
+                normalized_numbers.add(normalized)
+    except Exception as exc:
+        logger.warning(f"[VEHICLE_API] Vehicle master fetch failed: {exc}")
+
+    _VEHICLE_MASTER_CACHE = normalized_numbers
+    return _VEHICLE_MASTER_CACHE
+
+
+def _resolve_delivery_reference(invoice):
     """
-    Mandatory check: Other Reference (BASICORDERREF / OTHERREFERENCE) must indicate
-    delivery or customer pickup.
-
-    Accepted values:
-      D / delivery / delivery challan / dispatch  → Delivery type
-      C / customer pickup / pickup / self pickup  → Customer Pickup type
-
-    Returns True only when Other Reference contains one of these values.
-    If the field is empty or has a different value, returns False (invoice skipped).
+    BOL-specific rule:
+    - Trust Other Reference only when it is exactly C or D
+    - Otherwise fall back to vehicle master matching
+    - Vehicle matched   -> D (Delivery)
+    - Vehicle not found -> C (Customer Pickup)
     """
     raw = invoice.get('raw_voucher', {}) or {}
-    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip()
+    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip().lower()
+    if other_ref in {'c', 'd'}:
+        return other_ref, 'other_reference'
 
-    if not other_ref:
-        return False
+    vehicle_no = _extract_vehicle_no(invoice)
+    vehicle_norm = _normalize_vehicle_no(vehicle_no)
+    if vehicle_norm and vehicle_norm in _fetch_vehicle_master_numbers():
+        return 'd', 'vehicle_master'
+    return 'c', 'vehicle_master'
 
-    other_ref_lower = other_ref.lower()
-    other_ref_norm = ' '.join(other_ref_lower.split())
-    other_ref_compact = other_ref_norm.replace(' ', '')
 
-    # D = Delivery, C = Customer Pickup (exact single-char match)
-    if other_ref_norm == 'd' or other_ref_norm == 'c':
-        return True
-
-    # Delivery keywords
-    if any(kw in other_ref_norm for kw in ('delivery', 'dispatch')):
-        return True
-    if 'deliverychallan' in other_ref_compact:
-        return True
-
-    # Customer Pickup keywords
-    if any(kw in other_ref_norm for kw in ('customer pickup', 'pickup', 'self pickup')):
-        return True
-    if 'customerpickup' in other_ref_compact:
-        return True
-
-    return False
+def _has_delivery_info(invoice):
+    """
+    BOL-specific check:
+    - trust Other Reference only for exact C/D
+    - otherwise classify from vehicle master match
+    """
+    delivery_ref, _source = _resolve_delivery_reference(invoice)
+    return delivery_ref in {'c', 'd'}
 
 
 def _is_instant_invoice(invoice):
@@ -379,6 +431,13 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             overall_stats['skipped_date'] += 1
             continue
 
+        delivery_ref, delivery_source = _resolve_delivery_reference(invoice)
+        raw_voucher = invoice.get('raw_voucher', {}) or {}
+        if isinstance(raw_voucher, dict):
+            raw_voucher['BASICORDERREF'] = delivery_ref
+            raw_voucher['OTHERREFERENCE'] = delivery_ref
+            invoice['raw_voucher'] = raw_voucher
+
         if not _has_delivery_info(invoice):
             raw = invoice.get('raw_voucher', {}) or {}
             vtype = str(raw.get('VOUCHERTYPENAME') or raw.get('VOUCHERTYPE') or '').strip()
@@ -390,6 +449,13 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             )
             overall_stats['skipped_no_delivery'] += 1
             continue
+        else:
+            vehicle_no = _extract_vehicle_no(invoice)
+            logger.info(
+                f"[DELIVERY_CLASSIFIED] #{voucher_no} | date={voucher_date} | "
+                f"customer='{customer_name}' | ref='{delivery_ref}' | "
+                f"source='{delivery_source}' | vehicle='{vehicle_no}'"
+            )
 
         normalized_customer = _normalize_name_key(customer_name)
         ledger_cache_key = f"{company_name}::{normalized_customer}"
