@@ -1900,8 +1900,21 @@ class CatalyticsSyncer:
         if not voucher_payload.get('FILLINGSTATION') and filling_station:
             voucher_payload['FILLINGSTATION'] = filling_station
 
+        vehicle_no = str(
+            voucher_payload.get('BASICMOTORVEHICLENO')
+            or voucher_payload.get('VEHICLE_NO')
+            or voucher_payload.get('MOTORVEHICLENO')
+            or voucher_payload.get('GOODSVEHICLENUMBER')
+            or ''
+        ).strip()
+        if vehicle_no == '-':
+            voucher_payload['BASICORDERREF'] = 'd'
+            voucher_payload['OTHERREFERENCE'] = 'd'
+            voucher_payload['VEHICLE_NO'] = '-'
+            voucher_payload['BASICMOTORVEHICLENO'] = '-'
+
         # Map Other Reference -> Terms of Delivery for challan type detection
-        other_ref = str(voucher_payload.get('BASICORDERREF') or '').strip().lower()
+        other_ref = str(voucher_payload.get('BASICORDERREF') or voucher_payload.get('OTHERREFERENCE') or '').strip().lower()
         if 'customer pickup' in other_ref or 'pickup' in other_ref or other_ref == 'c':
             voucher_payload.setdefault('TERMSOFDELIVERY', 'Customer Pickup')
 
@@ -2025,8 +2038,21 @@ class CatalyticsSyncer:
         if filling_station_id:
             voucher['FILLINGSTATIONID'] = str(filling_station_id)
 
+        vehicle_no = str(
+            voucher.get('BASICMOTORVEHICLENO')
+            or voucher.get('VEHICLE_NO')
+            or voucher.get('MOTORVEHICLENO')
+            or voucher.get('GOODSVEHICLENUMBER')
+            or ''
+        ).strip()
+        if vehicle_no == '-':
+            voucher['BASICORDERREF'] = 'd'
+            voucher['OTHERREFERENCE'] = 'd'
+            voucher['VEHICLE_NO'] = '-'
+            voucher['BASICMOTORVEHICLENO'] = '-'
+
         # Map Other Reference → challan type
-        other_ref = str(voucher.get('BASICORDERREF') or '').strip().lower()
+        other_ref = str(voucher.get('BASICORDERREF') or voucher.get('OTHERREFERENCE') or '').strip().lower()
         if 'customer pickup' in other_ref or 'pickup' in other_ref or other_ref == 'c':
             voucher.setdefault('TERMSOFDELIVERY', 'Customer Pickup')
 
