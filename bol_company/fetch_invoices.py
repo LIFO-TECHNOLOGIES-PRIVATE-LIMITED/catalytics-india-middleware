@@ -184,11 +184,10 @@ def _extract_vehicle_no(invoice):
 
 def _fetch_vehicle_master_numbers():
     global _VEHICLE_MASTER_CACHE
-    if _VEHICLE_MASTER_CACHE is not None:
+    if _VEHICLE_MASTER_CACHE:
         return _VEHICLE_MASTER_CACHE
 
     base = config.CATALYTICS_API_BASE.rstrip('/')
-    url = f"{base}/api/master/vehicle"
     headers = {
         'Content-Type': 'application/json',
         'Entity-Id': str(config.ENTITY_ID),
@@ -197,30 +196,45 @@ def _fetch_vehicle_master_numbers():
         headers['Authorization'] = f'Bearer {config.CATALYTICS_API_KEY}'
 
     normalized_numbers = set()
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params={'limit_start': 0, 'limit_end': 100000},
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json() or {}
-        for vehicle in payload.get('data') or []:
-            normalized = _normalize_vehicle_no((vehicle or {}).get('vehicle_no'))
-            if normalized:
-                normalized_numbers.add(normalized)
-    except Exception as exc:
-        logger.warning(f"[VEHICLE_API] Vehicle master fetch failed: {exc}")
+    candidate_bases = [base]
+    if base.endswith('/api'):
+        candidate_bases.append(base[:-4])
+    else:
+        candidate_bases.append(f"{base}/api")
 
-    _VEHICLE_MASTER_CACHE = normalized_numbers
-    return _VEHICLE_MASTER_CACHE
+    tried_urls = []
+    for candidate_base in candidate_bases:
+        url = f"{candidate_base.rstrip('/')}/master/vehicle"
+        tried_urls.append(url)
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                params={'limit_start': 0, 'limit_end': 100000},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json() or {}
+            for vehicle in payload.get('data') or []:
+                normalized = _normalize_vehicle_no((vehicle or {}).get('vehicle_no'))
+                if normalized:
+                    normalized_numbers.add(normalized)
+            if normalized_numbers:
+                logger.info(f"[VEHICLE_API] Loaded {len(normalized_numbers)} vehicle numbers from {url}")
+                _VEHICLE_MASTER_CACHE = normalized_numbers
+                return _VEHICLE_MASTER_CACHE
+        except Exception as exc:
+            logger.warning(f"[VEHICLE_API] Vehicle master fetch failed from {url}: {exc}")
+
+    logger.warning(f"[VEHICLE_API] No vehicle numbers loaded. Tried: {', '.join(tried_urls)}")
+    return set()
 
 
 def _resolve_delivery_reference(invoice):
     """
     BOL-specific rule:
     - Trust Other Reference only when it is exactly C or D
+    - If vehicle number is sent as "-" treat it as D (Delivery)
     - Otherwise fall back to vehicle master matching
     - Vehicle matched   -> D (Delivery)
     - Vehicle not found -> C (Customer Pickup)
@@ -231,6 +245,9 @@ def _resolve_delivery_reference(invoice):
         return other_ref, 'other_reference'
 
     vehicle_no = _extract_vehicle_no(invoice)
+    if str(vehicle_no or '').strip() == '-':
+        return 'd', 'vehicle_placeholder'
+
     vehicle_norm = _normalize_vehicle_no(vehicle_no)
     if vehicle_norm and vehicle_norm in _fetch_vehicle_master_numbers():
         return 'd', 'vehicle_master'
@@ -436,6 +453,9 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
         if isinstance(raw_voucher, dict):
             raw_voucher['BASICORDERREF'] = delivery_ref
             raw_voucher['OTHERREFERENCE'] = delivery_ref
+            if delivery_source == 'vehicle_placeholder':
+                raw_voucher['VEHICLE_NO'] = '-'
+                raw_voucher['BASICMOTORVEHICLENO'] = '-'
             invoice['raw_voucher'] = raw_voucher
 
         if not _has_delivery_info(invoice):
@@ -624,10 +644,12 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
 
 def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     """Fetch invoices from all active Tally companies in monthly batches."""
+    global _VEHICLE_MASTER_CACHE
     try:
         config.reload_from_env()
     except AttributeError:
         pass
+    _VEHICLE_MASTER_CACHE = None
 
     # If no dates provided, use Day Book logic (Yesterday to Tomorrow) as requested
     if not from_date and not to_date:
