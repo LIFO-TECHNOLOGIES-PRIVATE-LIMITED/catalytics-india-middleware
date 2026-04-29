@@ -1609,6 +1609,21 @@ class CatalyticsSyncer:
         except Exception:
             return {}
 
+    def _invoice_is_cancelled(self, invoice):
+        """Return True when the stored voucher is marked cancelled/deleted in Tally."""
+        data = self._safe_json_load(invoice.get('data_json'))
+        cancel_fields = (
+            'ISCANCELLED',
+            'VCHSTATUSISCANCELLED',
+            'ISDELETED',
+            'VCHSTATUSISDELETED',
+        )
+        for field in cancel_fields:
+            value = str(data.get(field) or '').strip().lower()
+            if value in ('yes', 'true', '1'):
+                return True
+        return False
+
 
     def _normalize_tally_date(self, value):
         # Normalize Tally date to YYYY-MM-DD if possible.
@@ -2028,10 +2043,44 @@ class CatalyticsSyncer:
         ledger_data = voucher.pop('LEDGERDATA', None)
         if isinstance(ledger_data, dict) and customer_name:
             ledgers_map[customer_name] = ledger_data
+        elif customer_name:
+            customer_row = self._get_customer_row_by_name(customer_name)
+            if customer_row and self._row_get(customer_row, 'is_synced'):
+                rebuilt_ledger, ledger_error = self._prepare_ledger(customer_row)
+                if rebuilt_ledger:
+                    ledgers_map[customer_name] = rebuilt_ledger
+                elif ledger_error:
+                    logger.warning(
+                        f"Invoice #{voucher_no}: could not rebuild ledger for "
+                        f"'{customer_name}': {ledger_error}"
+                    )
 
         stock_items = voucher.pop('STOCKITEMS', None)
         if isinstance(stock_items, dict):
             stock_items_map = stock_items
+        if not stock_items_map:
+            inventory_items = voucher.get('INVENTORY') or []
+            for item in inventory_items:
+                if not isinstance(item, dict):
+                    continue
+                item_name = (
+                    item.get('STOCKITEMNAME')
+                    or item.get('ITEMNAME')
+                    or ''
+                ).strip()
+                if not item_name or item_name in stock_items_map:
+                    continue
+                product_row = self._get_product_row_by_name(item_name)
+                if not product_row or self._row_get(product_row, 'is_synced') != 1:
+                    continue
+                stock_item, stock_error = self._prepare_stock_item(product_row)
+                if stock_item:
+                    stock_items_map[item_name] = stock_item
+                elif stock_error:
+                    logger.warning(
+                        f"Invoice #{voucher_no}: could not rebuild stock item for "
+                        f"'{item_name}': {stock_error}"
+                    )
 
         # Set filling station ID in voucher
         filling_station_id = self._get_filling_station_id(invoice)
@@ -2112,6 +2161,13 @@ class CatalyticsSyncer:
                 company = invoice.get('tally_company', '')
 
                 try:
+                    if self._invoice_is_cancelled(invoice):
+                        self.db.mark_invoices_deleted(company, [voucher_no])
+                        logger.info(
+                            f"[CANCELLED:LOCAL] #{voucher_no} marked deleted locally; skipping sync"
+                        )
+                        continue
+
                     # Parse invoice items for validation and matching
                     items_json = invoice.get('items_json', '[]')
                     try:

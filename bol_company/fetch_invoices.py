@@ -158,6 +158,21 @@ def _invoice_in_date_range(invoice, from_date, to_date):
     return vd >= from_date
 
 
+def _is_cancelled_invoice(invoice):
+    raw = invoice.get('raw_voucher', {}) or {}
+    cancel_fields = (
+        'ISCANCELLED',
+        'VCHSTATUSISCANCELLED',
+        'ISDELETED',
+        'VCHSTATUSISDELETED',
+    )
+    for key in cancel_fields:
+        value = str(raw.get(key) or '').strip().lower()
+        if value in {'yes', 'true', '1'}:
+            return True
+    return False
+
+
 def _normalize_vehicle_no(vehicle_no):
     return re.sub(r'[^A-Za-z0-9]', '', str(vehicle_no or '')).upper()
 
@@ -528,6 +543,16 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             overall_stats['skipped_date'] += 1
             continue
 
+        if _is_cancelled_invoice(invoice):
+            db.mark_invoices_deleted(company_name, [voucher_no])
+            logger.info(
+                f"[SKIP:CANCELLED] #{voucher_no} | date={voucher_date} | "
+                f"customer='{customer_name}' | reason: voucher is cancelled"
+            )
+            overall_stats.setdefault('skipped_cancelled', 0)
+            overall_stats['skipped_cancelled'] += 1
+            continue
+
         delivery_ref, delivery_source = _resolve_delivery_reference(invoice)
         raw_voucher = invoice.get('raw_voucher', {}) or {}
         if isinstance(raw_voucher, dict):
@@ -567,6 +592,7 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 ledger_cache[ledger_cache_key] = None
 
         ledger_data = ledger_cache[ledger_cache_key]
+        deferred_missing_customer = False
         if not ledger_data:
             # Auto-fetch customer from Tally and save to SQLite
             logger.info(
@@ -580,12 +606,14 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 overall_stats.setdefault('auto_fetched_customers', 0)
                 overall_stats['auto_fetched_customers'] += 1
             else:
+                deferred_missing_customer = True
+                ledger_data = {}
                 logger.warning(
-                    f"[SKIP:MISSING_CUSTOMER] #{voucher_no} | date={voucher_date} | "
-                    f"customer='{customer_name}' | reason: not found in SQLite or Tally"
+                    f"[DEFER:MISSING_CUSTOMER] #{voucher_no} | date={voucher_date} | "
+                    f"customer='{customer_name}' | reason: not found in SQLite or Tally; "
+                    f"saving invoice for sync-time recovery"
                 )
                 overall_stats['skipped_missing_customer'] += 1
-                continue
 
         inventory_items = invoice.get('items', [])
         stock_items_map = {}
@@ -607,6 +635,7 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 missing_products.append(item_name)
 
         # Auto-fetch missing products from Tally
+        deferred_missing_products = False
         if missing_products:
             still_missing = []
             for mp_name in missing_products:
@@ -626,13 +655,14 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                     still_missing.append(mp_name)
 
             if still_missing:
+                deferred_missing_products = True
                 logger.warning(
-                    f"[SKIP:MISSING_PRODUCT] #{voucher_no} | date={voucher_date} | "
+                    f"[DEFER:MISSING_PRODUCT] #{voucher_no} | date={voucher_date} | "
                     f"customer='{customer_name}' | missing {len(still_missing)} product(s) "
-                    f"(not found in SQLite or Tally): {still_missing}"
+                    f"(not found in SQLite or Tally): {still_missing}; "
+                    f"saving invoice for sync-time recovery"
                 )
                 overall_stats['skipped_missing_product'] += 1
-                continue
 
         try:
             full_voucher_payload = _build_full_voucher_payload(invoice)
@@ -686,7 +716,7 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 'godown_name': g_name,
                 'location_name': l_name,
                 'filling_station': f_station,
-                'is_instant': 1 if _is_instant_invoice(invoice) else 0
+                'is_instant': 1 if _is_instant_invoice(invoice) else 0,
             }
 
             existing = db.invoice_exists(voucher_no, company_name)
@@ -712,6 +742,18 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                     f"customer='{customer_name}' | no changes"
                 )
                 overall_stats['already_exists'] += 1
+
+            if deferred_missing_customer or deferred_missing_products:
+                deferred_parts = []
+                if deferred_missing_customer:
+                    deferred_parts.append('customer')
+                if deferred_missing_products:
+                    deferred_parts.append('product')
+                logger.info(
+                    f"[DEFERRED_DEPENDENCY] #{voucher_no} | date={voucher_date} | "
+                    f"customer='{customer_name}' | waiting on {', '.join(deferred_parts)} "
+                    f"recovery during sync"
+                )
 
         except Exception as e:
             logger.error(
@@ -799,6 +841,7 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     logger.info(f"Auto-Fetch Cust:     {overall_stats.get('auto_fetched_customers', 0)}")
     logger.info(f"Auto-Fetch Prod:     {overall_stats.get('auto_fetched_products', 0)}")
     logger.info(f"Skipped Date:        {overall_stats['skipped_date']}")
+    logger.info(f"Skipped Cancelled:   {overall_stats.get('skipped_cancelled', 0)}")
     logger.info(f"Skipped No Del:      {overall_stats['skipped_no_delivery']}")
     logger.info(f"Skipped Cust:        {overall_stats['skipped_missing_customer']}")
     logger.info(f"Skipped Prod:        {overall_stats['skipped_missing_product']}")
