@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 from datetime import datetime, timedelta
 import requests
+import psycopg2
 
 from config import config, BASE_DIR
 from db import Database, json_dumps, json_loads, sha256_text
@@ -188,12 +189,13 @@ def _fetch_vehicle_master_numbers():
         return _VEHICLE_MASTER_CACHE
 
     base = config.CATALYTICS_API_BASE.rstrip('/')
-    headers = {
+    # Vehicle master is served from the backend default DB and does not need
+    # the middleware's Entity-Id header. Sending a plain numeric Entity-Id
+    # causes the backend entity middleware to try decrypting it and can raise
+    # a server-side error before the AllowAny view runs.
+    base_headers = {
         'Content-Type': 'application/json',
-        'Entity-Id': str(config.ENTITY_ID),
     }
-    if config.CATALYTICS_API_KEY:
-        headers['Authorization'] = f'Bearer {config.CATALYTICS_API_KEY}'
 
     normalized_numbers = set()
     candidate_bases = [base]
@@ -206,25 +208,98 @@ def _fetch_vehicle_master_numbers():
     for candidate_base in candidate_bases:
         url = f"{candidate_base.rstrip('/')}/master/vehicle"
         tried_urls.append(url)
+        header_attempts = [dict(base_headers)]
+        if config.CATALYTICS_API_KEY:
+            auth_headers = dict(base_headers)
+            auth_headers['Authorization'] = f'Bearer {config.CATALYTICS_API_KEY}'
+            header_attempts.append(auth_headers)
+
+        for headers in header_attempts:
+            try:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params={'limit_start': 0, 'limit_end': 100000},
+                    timeout=30,
+                )
+                response.raise_for_status()
+                payload = response.json() or {}
+                for vehicle in payload.get('data') or []:
+                    normalized = _normalize_vehicle_no((vehicle or {}).get('vehicle_no'))
+                    if normalized:
+                        normalized_numbers.add(normalized)
+                if normalized_numbers:
+                    auth_mode = 'authenticated' if 'Authorization' in headers else 'anonymous'
+                    logger.info(
+                        f"[VEHICLE_API] Loaded {len(normalized_numbers)} vehicle numbers "
+                        f"from {url} via {auth_mode} access"
+                    )
+                    _VEHICLE_MASTER_CACHE = normalized_numbers
+                    return _VEHICLE_MASTER_CACHE
+            except Exception as exc:
+                auth_mode = 'authenticated' if 'Authorization' in headers else 'anonymous'
+                logger.warning(
+                    f"[VEHICLE_API] Vehicle master fetch failed from {url} "
+                    f"via {auth_mode} access: {exc}"
+                )
+
+    # HTTP lookup is fragile in this backend because the vehicle endpoint can
+    # behave differently for anonymous vs authenticated requests. Fall back to
+    # the same PostgreSQL database the middleware already uses for other fixes.
+    try:
+        conn = psycopg2.connect(
+            host=config.POSTGRES_HOST,
+            port=config.POSTGRES_PORT,
+            database=config.POSTGRES_DB,
+            user=config.POSTGRES_USER,
+            password=config.POSTGRES_PASSWORD,
+        )
         try:
-            response = requests.get(
-                url,
-                headers=headers,
-                params={'limit_start': 0, 'limit_end': 100000},
-                timeout=30,
-            )
-            response.raise_for_status()
-            payload = response.json() or {}
-            for vehicle in payload.get('data') or []:
-                normalized = _normalize_vehicle_no((vehicle or {}).get('vehicle_no'))
-                if normalized:
-                    normalized_numbers.add(normalized)
-            if normalized_numbers:
-                logger.info(f"[VEHICLE_API] Loaded {len(normalized_numbers)} vehicle numbers from {url}")
-                _VEHICLE_MASTER_CACHE = normalized_numbers
-                return _VEHICLE_MASTER_CACHE
-        except Exception as exc:
-            logger.warning(f"[VEHICLE_API] Vehicle master fetch failed from {url}: {exc}")
+            with conn.cursor() as cursor:
+                query_attempts = [
+                    (
+                        """
+                        SELECT vehicle_no
+                        FROM "master.vehicle"
+                        WHERE COALESCE(status, 0) <> 3
+                        """,
+                        '"master.vehicle"',
+                    ),
+                    (
+                        """
+                        SELECT vehicle_no
+                        FROM master.vehicle
+                        WHERE COALESCE(status, 0) <> 3
+                        """,
+                        'master.vehicle',
+                    ),
+                ]
+                for query, source_name in query_attempts:
+                    try:
+                        cursor.execute(query)
+                        for (vehicle_no,) in cursor.fetchall():
+                            normalized = _normalize_vehicle_no(vehicle_no)
+                            if normalized:
+                                normalized_numbers.add(normalized)
+                        if normalized_numbers:
+                            logger.info(
+                                f"[VEHICLE_DB] Loaded {len(normalized_numbers)} vehicle numbers "
+                                f"from PostgreSQL table {source_name}"
+                            )
+                            break
+                    except Exception as query_exc:
+                        conn.rollback()
+                        logger.warning(
+                            f"[VEHICLE_DB] Vehicle master query failed for {source_name}: {query_exc}"
+                        )
+        finally:
+            conn.close()
+
+        if normalized_numbers:
+            _VEHICLE_MASTER_CACHE = normalized_numbers
+            return _VEHICLE_MASTER_CACHE
+    except Exception as exc:
+        logger.warning(f"[VEHICLE_DB] Vehicle master fetch failed from PostgreSQL: {exc}")
 
     logger.warning(f"[VEHICLE_API] No vehicle numbers loaded. Tried: {', '.join(tried_urls)}")
     return set()
@@ -249,9 +324,14 @@ def _resolve_delivery_reference(invoice):
         return 'd', 'vehicle_placeholder'
 
     vehicle_norm = _normalize_vehicle_no(vehicle_no)
-    if vehicle_norm and vehicle_norm in _fetch_vehicle_master_numbers():
+    vehicle_master_numbers = _fetch_vehicle_master_numbers()
+    if vehicle_norm and vehicle_norm in vehicle_master_numbers:
         return 'd', 'vehicle_master'
-    return 'c', 'vehicle_master'
+    if vehicle_norm:
+        if vehicle_master_numbers:
+            return 'c', 'vehicle_not_in_master'
+        return 'c', 'vehicle_lookup_unavailable'
+    return 'c', 'no_vehicle'
 
 
 def _has_delivery_info(invoice):
