@@ -4,7 +4,7 @@ import re
 import time
 import threading
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 import requests
 import xml.etree.ElementTree as ET

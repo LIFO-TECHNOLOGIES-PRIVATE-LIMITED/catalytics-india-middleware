@@ -340,7 +340,8 @@ def _ensure_liquid_product(
         )
 
         # --- 3. Sync to Catalytics server ---
-        endpoint = api_base_url.rstrip('/') + '/tally-product_name-payload/'
+        _base = api_base_url.rstrip('/')
+        endpoint = (_base + '/tally-product_name-payload/') if _base.endswith('/import') else (_base + '/import/tally-product_name-payload/')
         payload = {
             'entity_id': entity_id,
             'stock_item_name': canonical_name,
@@ -566,7 +567,8 @@ def _ensure_product(
         )
 
         # Sync to Catalytics server
-        endpoint = api_base_url.rstrip('/') + '/tally-product_name-payload/'
+        _base = api_base_url.rstrip('/')
+        endpoint = (_base + '/tally-product_name-payload/') if _base.endswith('/import') else (_base + '/import/tally-product_name-payload/')
         payload = {
             'entity_id': entity_id,
             'stock_item_name': canonical_name,
@@ -668,7 +670,8 @@ def _sync_customer_now(
     """Try immediate customer sync; returns (ok, response_json, error_msg)."""
     if not api_base_url:
         return False, None, "CATALYTICS_API_BASE_URL not set"
-    endpoint = api_base_url.rstrip('/') + '/tally-customer-payload/'
+    _base = api_base_url.rstrip('/')
+    endpoint = (_base + '/tally-customer-payload/') if _base.endswith('/import') else (_base + '/import/tally-customer-payload/')
     payload = {"entity_id": entity_id, "ledger": ledger}
     if company_name:
         payload["company_name"] = company_name
@@ -1488,6 +1491,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
 

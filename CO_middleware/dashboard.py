@@ -1483,7 +1483,8 @@ def _sync_one_customer(customer_id: int) -> dict:
 
         api_base = cfg.get_env('CATALYTICS_API_BASE_URL', '')
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
-        endpoint = api_base.rstrip('/') + '/tally-customer-payload/'
+        _base = api_base.rstrip('/')
+        endpoint = (_base + '/tally-customer-payload/') if _base.endswith('/import') else (_base + '/import/tally-customer-payload/')
         # Payload endpoints use AllowAny permission â€” no auth header needed
         headers = {'Content-Type': 'application/json'}
 
@@ -1619,7 +1620,8 @@ def _sync_one_product(product_id: int) -> dict:
 
         api_base = cfg.get_env('CATALYTICS_API_BASE_URL', '')
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
-        endpoint = api_base.rstrip('/') + '/tally-product_name-payload/'
+        _base = api_base.rstrip('/')
+        endpoint = (_base + '/tally-product_name-payload/') if _base.endswith('/import') else (_base + '/import/tally-product_name-payload/')
         # Payload endpoints use AllowAny permission â€” no auth header needed
         headers = {'Content-Type': 'application/json'}
 
@@ -1851,7 +1853,14 @@ def _refetch_one_invoice(invoice_id: int) -> dict:
 def _sync_one_invoice(invoice_id: int) -> dict:
     """Immediately sync a single invoice/DC to Catalytics. Returns result dict."""
     import json as _json
-    from sync_catalytics import _build_payload_for_note, _update_sync_status
+    from sync_catalytics import (
+        _build_payload_for_note,
+        _update_sync_status,
+        _fetch_unsynced_instant_dcs,
+        _find_matching_instant_dc,
+        _mark_instant_dc_synced_on_portal,
+        _lookup_dc_id_by_no,
+    )
 
     tally_db_path = cfg.get_env('TALLY_DB_PATH')
     if not tally_db_path:
@@ -1869,6 +1878,7 @@ def _sync_one_invoice(invoice_id: int) -> dict:
         dc_no = note.get('dc_no') or str(invoice_id)
 
         api_base = cfg.get_env('CATALYTICS_API_BASE_URL', '')
+        api_key = cfg.get_env('CATALYTICS_API_KEY')
         entity_id = cfg.get_env_int('CATALYTICS_ENTITY_ID')
         company_row = conn.execute(
             "SELECT name, tally_name FROM companies WHERE id = ?",
@@ -1879,7 +1889,8 @@ def _sync_one_invoice(invoice_id: int) -> dict:
             company = (company_row['tally_name'] or company_row['name'] or '').strip()
         if not company:
             company = cfg.get_env('TALLY_COMPANY', '').strip()
-        endpoint = api_base.rstrip('/') + '/tally-delivery-challan-payload/'
+        _base = api_base.rstrip('/')
+        endpoint = (_base + '/tally-delivery-challan-payload/') if _base.endswith('/import') else (_base + '/import/tally-delivery-challan-payload/')
         # Payload endpoints use AllowAny permission â€” no auth header needed
         headers = {'Content-Type': 'application/json'}
 
@@ -1890,6 +1901,41 @@ def _sync_one_invoice(invoice_id: int) -> dict:
             company_name=company,
             allow_tally_fetch=False,
         )
+        voucher = payload.get('voucher') or {}
+        items = voucher.get('INVENTORY') or []
+
+        matched_dc_id = None
+        try:
+            instant_dcs = _fetch_unsynced_instant_dcs(api_base, entity_id, api_key)
+            matched_dc = _find_matching_instant_dc(note, voucher, items, instant_dcs)
+            if matched_dc and matched_dc.get('id'):
+                matched_dc_id = matched_dc.get('id')
+                voucher['MATCHED_DC_ID'] = matched_dc_id
+                logger.info("Resync matched instant DC for dc_no=%s -> id=%s", dc_no, matched_dc_id)
+            elif dc_no:
+                logger.info("Resync no instant match for dc_no=%s; trying dc_no lookup fallback", dc_no)
+                existing_dc_id = _lookup_dc_id_by_no(
+                    api_base,
+                    entity_id,
+                    dc_no,
+                    api_key,
+                    expected_date=note.get('voucher_date') or voucher.get('DATE'),
+                    expected_customer=note.get('party_ledger_name') or voucher.get('PARTYLEDGERNAME') or voucher.get('PARTYNAME'),
+                )
+                if existing_dc_id:
+                    matched_dc_id = existing_dc_id
+                    voucher['MATCHED_DC_ID'] = existing_dc_id
+                    logger.info("Resync matched existing portal DC by dc_no=%s -> id=%s", dc_no, existing_dc_id)
+                else:
+                    logger.info("Resync no existing portal DC found for dc_no=%s", dc_no)
+        except Exception:
+            # Keep single-resync workflow resilient even if instant matching errors.
+            pass
+
+        if matched_dc_id:
+            logger.info("Resync using MATCHED_DC_ID=%s for dc_no=%s", matched_dc_id, dc_no)
+        else:
+            logger.info("Resync MATCHED_DC_ID not set for dc_no=%s", dc_no)
 
         resp = requests.post(endpoint, json=payload, headers=headers, timeout=30)
         success = resp.status_code in (200, 201)
@@ -1914,6 +1960,18 @@ def _sync_one_invoice(invoice_id: int) -> dict:
             response_json=resp_data,
             error_text=error_text,
         )
+
+        if success and matched_dc_id:
+            try:
+                tally_voucher_no = str(voucher.get('VOUCHERNUMBER') or dc_no).strip()
+                _mark_instant_dc_synced_on_portal(
+                    api_base,
+                    matched_dc_id,
+                    tally_voucher_no=tally_voucher_no,
+                    api_key=api_key,
+                )
+            except Exception:
+                pass
         conn.commit()
 
         if success:
@@ -2874,11 +2932,5 @@ if __name__ == '__main__':
     maybe_start_automation()
     maybe_open_dashboard_browser()
     app.run(host=config.WEB_UI_HOST, port=config.WEB_UI_PORT, debug=dashboard_debug, use_reloader=False)
-
-
-
-
-
-
 
 

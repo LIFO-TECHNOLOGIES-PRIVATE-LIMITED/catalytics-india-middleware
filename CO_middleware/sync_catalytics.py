@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 import os
 import sys
@@ -79,6 +80,7 @@ class SyncConfig:
     limit: int
     max_attempts: int
     allow_tally_fetch: bool
+    enable_instant_dc_matching: bool
     dry_run: bool
     log_level: str
     log_json: bool
@@ -153,6 +155,32 @@ def _load_stock_items(conn, company_id: int, inventory_items: List[Dict[str, Any
 
 
 _FILL_STATION_LIST_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+_INSTANT_DC_MATCH_DISABLED_UNTIL_TS: float = 0.0
+
+
+def _forced_dc_id_for_no(dc_no: Optional[str]) -> Optional[int]:
+    """
+    Optional hard override from env for problematic duplicate cases.
+    Format:
+      FORCE_MATCHED_DC_MAP=4:176,ABC-12:991
+    """
+    key = str(dc_no or "").strip()
+    if not key:
+        return None
+    raw = (os.getenv("FORCE_MATCHED_DC_MAP") or "").strip()
+    if not raw:
+        return None
+    for token in raw.split(","):
+        part = token.strip()
+        if not part or ":" not in part:
+            continue
+        left, right = part.split(":", 1)
+        if left.strip() == key:
+            try:
+                return int(right.strip())
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def _normalize_station_key(value: Any) -> str:
@@ -240,36 +268,46 @@ def _get_entity_fill_stations(api_base_url: str, entity_id: Optional[int]) -> Li
     if not api_base_url or not entity_id:
         return []
 
-    cache_key = str(entity_id)
-    if cache_key in _FILL_STATION_LIST_CACHE:
-        return _FILL_STATION_LIST_CACHE[cache_key]
+    root_base = _server_base_url(api_base_url)
+    for base in [root_base]:
+        cache_key = f"{entity_id}|{base}"
+        if cache_key in _FILL_STATION_LIST_CACHE:
+            return _FILL_STATION_LIST_CACHE[cache_key]
 
-    url = _server_base_url(api_base_url) + "/master/gas_filling_station"
-    try:
-        resp = requests.get(
-            url,
-            params={"entity_id": entity_id, "limit_end": 500},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            logger.warning(
-                "Could not fetch filling stations for entity %s: HTTP %s",
-                entity_id,
-                resp.status_code,
+        url = base + "/master/gas_filling_station"
+        try:
+            resp = requests.get(
+                url,
+                params={"entity_id": entity_id, "limit_end": 500},
+                timeout=15,
             )
-            _FILL_STATION_LIST_CACHE[cache_key] = []
-            return []
+            if resp.status_code != 200:
+                if resp.status_code == 404:
+                    logger.debug(
+                        "Fill-station endpoint not found for entity %s on %s",
+                        entity_id,
+                        base,
+                    )
+                else:
+                    logger.warning(
+                        "Could not fetch filling stations for entity %s on %s: HTTP %s",
+                        entity_id,
+                        base,
+                        resp.status_code,
+                    )
+                _FILL_STATION_LIST_CACHE[cache_key] = []
+                continue
 
-        payload = resp.json()
-        stations = payload if isinstance(payload, list) else payload.get("data") or []
-        if not isinstance(stations, list):
-            stations = []
-        _FILL_STATION_LIST_CACHE[cache_key] = stations
-        return stations
-    except Exception as exc:
-        logger.warning("Could not fetch filling stations for entity %s: %s", entity_id, exc)
-        _FILL_STATION_LIST_CACHE[cache_key] = []
-        return []
+            payload = resp.json()
+            stations = payload if isinstance(payload, list) else payload.get("data") or []
+            if not isinstance(stations, list):
+                stations = []
+            _FILL_STATION_LIST_CACHE[cache_key] = stations
+            return stations
+        except Exception as exc:
+            logger.warning("Could not fetch filling stations for entity %s on %s: %s", entity_id, base, exc)
+            _FILL_STATION_LIST_CACHE[cache_key] = []
+    return []
 
 
 def _match_backend_fill_station(
@@ -929,49 +967,106 @@ def _parse_instant_dc_results(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _fetch_unsynced_instant_dcs(api_base_url: str, entity_id: Optional[int]) -> List[Dict[str, Any]]:
+def _build_optional_auth_headers(api_key: Optional[str]) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _fetch_unsynced_instant_dcs(
+    api_base_url: str,
+    entity_id: Optional[int],
+    api_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    global _INSTANT_DC_MATCH_DISABLED_UNTIL_TS
+    now_ts = time.time()
+    if _INSTANT_DC_MATCH_DISABLED_UNTIL_TS > now_ts:
+        remaining = int(_INSTANT_DC_MATCH_DISABLED_UNTIL_TS - now_ts)
+        logger.info(
+            "Instant DC matching temporarily disabled due to previous backend 500 (cooldown %ss)",
+            max(1, remaining),
+        )
+        return []
+
     logger.info("Fetching unsynced Instant DCs from portal for matching")
-    try:
-        params: Dict[str, Any] = {}
-        if entity_id:
-            params["entity_id"] = entity_id
+    params: Dict[str, Any] = {}
+    if entity_id:
+        params["entity_id"] = entity_id
+    headers = _build_optional_auth_headers(api_key)
 
-        url = _server_base_url(api_base_url) + "/transaction/delivery_challan/instant/unsynced"
-        response = requests.get(url, params=params, timeout=20)
-        if response.status_code != 200:
-            logger.warning("Unsynced Instant DC fetch failed: HTTP %s", response.status_code)
-            return []
-
-        basic_results = _parse_instant_dc_results(response.json())
-        if not basic_results:
-            return []
-
-        needs_detail_fetch = bool(basic_results and not basic_results[0].get("dc_date"))
-        if not needs_detail_fetch:
-            return basic_results
-
-        logger.info("Instant DC list missing dc_date; fetching per-DC details")
-        full_results: List[Dict[str, Any]] = []
-        for basic in basic_results:
-            dc_id = basic.get("id")
-            if not dc_id:
-                full_results.append(basic)
+    last_error = None
+    for base in [_server_base_url(api_base_url)]:
+        path = "/transaction/delivery_challan/instant/unsynced"
+        try:
+            url = base + path
+            response = requests.get(url, params=params, headers=headers, timeout=20)
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                if response.status_code >= 500:
+                    _INSTANT_DC_MATCH_DISABLED_UNTIL_TS = time.time() + 900  # 15 minutes
+                    logger.warning(
+                        "Instant DC endpoint returned HTTP %s; disabling Instant DC matching for 15 minutes",
+                        response.status_code,
+                    )
+                    try:
+                        logger.warning("Unsynced Instant DC fetch response: %s", response.text[:800])
+                    except Exception:
+                        pass
+                    return []
+                if response.status_code == 404:
+                    logger.debug("Instant DC endpoint not found on %s%s", base, path)
+                else:
+                    logger.warning(
+                        "Unsynced Instant DC fetch failed on %s%s: HTTP %s",
+                        base,
+                        path,
+                        response.status_code,
+                    )
+                try:
+                    if response.status_code != 404:
+                        logger.warning("Unsynced Instant DC fetch response: %s", response.text[:800])
+                except Exception:
+                    pass
                 continue
 
-            try:
-                detail_url = _server_base_url(api_base_url) + f"/transaction/delivery_challan/{dc_id}"
-                detail_resp = requests.get(detail_url, timeout=20)
-                if detail_resp.status_code == 200:
-                    parsed_detail = _parse_instant_dc_results(detail_resp.json())
-                    full_results.append(parsed_detail[0] if parsed_detail else basic)
-                else:
+            basic_results = _parse_instant_dc_results(response.json())
+            if not basic_results:
+                return []
+
+            needs_detail_fetch = bool(basic_results and not basic_results[0].get("dc_date"))
+            if not needs_detail_fetch:
+                return basic_results
+
+            logger.info("Instant DC list missing dc_date; fetching per-DC details")
+            full_results: List[Dict[str, Any]] = []
+            for basic in basic_results:
+                dc_id = basic.get("id")
+                if not dc_id:
                     full_results.append(basic)
-            except Exception:
-                full_results.append(basic)
-        return full_results
-    except Exception as exc:
-        logger.warning("Failed to fetch unsynced Instant DCs: %s", exc)
-        return []
+                    continue
+
+                detail_path = f"/transaction/delivery_challan/{dc_id}"
+                detail_found = False
+                try:
+                    detail_url = base + detail_path
+                    detail_resp = requests.get(detail_url, headers=headers, timeout=20)
+                    if detail_resp.status_code == 200:
+                        parsed_detail = _parse_instant_dc_results(detail_resp.json())
+                        full_results.append(parsed_detail[0] if parsed_detail else basic)
+                        detail_found = True
+                except Exception:
+                    pass
+                if not detail_found:
+                    full_results.append(basic)
+            return full_results
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning("Unsynced Instant DC fetch error on %s%s: %s", base, path, exc)
+
+    if last_error:
+        logger.warning("Failed to fetch unsynced Instant DCs after trying all bases: %s", last_error)
+    return []
 
 
 def _find_matching_instant_dc(
@@ -1051,6 +1146,7 @@ def _mark_instant_dc_synced_on_portal(
     api_base_url: str,
     dc_pk: Any,
     tally_voucher_no: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> bool:
     """Mark matched instant DC as synced on the portal."""
     dc_id = str(dc_pk or "").strip()
@@ -1060,17 +1156,27 @@ def _mark_instant_dc_synced_on_portal(
     payload: Dict[str, Any] = {}
     if tally_voucher_no:
         payload["tally_voucher_no"] = str(tally_voucher_no).strip()
+    headers = _build_optional_auth_headers(api_key)
 
-    try:
-        url = _server_base_url(api_base_url) + f"/transaction/delivery_challan/instant/{dc_id}/mark-synced"
-        resp = requests.post(url, json=payload, timeout=20)
-        if resp.status_code == 200:
-            return True
-        logger.warning("Instant DC mark-synced failed for id=%s: HTTP %s", dc_id, resp.status_code)
-        return False
-    except Exception as exc:
-        logger.warning("Instant DC mark-synced error for id=%s: %s", dc_id, exc)
-        return False
+    endpoint_paths = [f"/transaction/delivery_challan/instant/{dc_id}/mark-synced"]
+
+    for base in [_server_base_url(api_base_url)]:
+        for path in endpoint_paths:
+            try:
+                url = base + path
+                resp = requests.post(url, json=payload, headers=headers, timeout=20)
+                if resp.status_code == 200:
+                    return True
+                logger.warning(
+                    "Instant DC mark-synced failed for id=%s on %s%s: HTTP %s",
+                    dc_id, base, path, resp.status_code
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Instant DC mark-synced error for id=%s on %s%s: %s",
+                    dc_id, base, path, exc
+                )
+    return False
 
 
 def _update_sync_status(
@@ -1117,35 +1223,126 @@ def _update_sync_status(
 _TALLY_DEFAULT_GODOWNS_SET = {'main location', 'main godown', 'main', 'not applicable', 'n/a'}
 
 
+def _api_base_candidates(api_base_url: str) -> List[str]:
+    """Return candidate API bases supporting both '/import' and root forms."""
+    base = (api_base_url or "").rstrip("/")
+    if not base:
+        return []
+
+    candidates: List[str] = [base]
+    if base.endswith("/import"):
+        candidates.append(base[: -len("/import")])
+    else:
+        candidates.append(base + "/import")
+
+    # Deduplicate while preserving order
+    seen = set()
+    ordered: List[str] = []
+    for item in candidates:
+        norm = item.rstrip("/")
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        ordered.append(norm)
+    return ordered
+
+
 def _server_base_url(api_base_url: str) -> str:
     """Strip /import suffix to get the server root URL."""
     return api_base_url.rstrip("/").rsplit("/import", 1)[0]
 
 
-def _lookup_dc_id_by_no(api_base_url: str, entity_id: Optional[int], dc_no: str) -> Optional[int]:
+def _import_base_url(api_base_url: str) -> str:
+    """Return base URL guaranteed to end with /import."""
+    base = (api_base_url or "").rstrip("/")
+    if not base:
+        return ""
+    return base if base.endswith("/import") else (base + "/import")
+
+
+def _lookup_dc_id_by_no(
+    api_base_url: str,
+    entity_id: Optional[int],
+    dc_no: str,
+    api_key: Optional[str] = None,
+    expected_date: Optional[str] = None,
+    expected_customer: Optional[str] = None,
+) -> Optional[int]:
     """GET /transaction/delivery_challan?dc_no=... to find the DC's server ID."""
     if not dc_no:
         return None
-    try:
-        params: Dict[str, Any] = {"dc_no": dc_no}
-        if entity_id:
-            params["entity_id"] = entity_id
-        url = _server_base_url(api_base_url) + "/transaction/delivery_challan"
-        resp = requests.get(url, params=params, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            items = data if isinstance(data, list) else data.get("data") or data.get("results") or []
-            if isinstance(items, list) and items:
-                dc_id = items[0].get("id")
-                if dc_id:
-                    return int(dc_id)
-            logger.debug("DC id lookup: no results for dc_no=%s (response: %s)", dc_no, str(data)[:200])
-    except Exception as exc:
-        logger.debug("DC id lookup failed for dc_no=%s: %s", dc_no, exc)
+    forced = _forced_dc_id_for_no(dc_no)
+    if forced:
+        logger.info("Using forced MATCHED_DC_ID for dc_no=%s -> id=%s", dc_no, forced)
+        return forced
+    params: Dict[str, Any] = {"dc_no": dc_no}
+    if entity_id:
+        params["entity_id"] = entity_id
+    headers = _build_optional_auth_headers(api_key)
+    for base in [_server_base_url(api_base_url)]:
+        try:
+            url = base + "/transaction/delivery_challan"
+            resp = requests.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data if isinstance(data, list) else data.get("data") or data.get("results") or []
+                if isinstance(items, list) and items:
+                    # Prefer exact dc_no entries first.
+                    exact = []
+                    dc_no_norm = str(dc_no).strip()
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        if str(it.get("dc_no") or "").strip() == dc_no_norm:
+                            exact.append(it)
+                    candidates = exact or [it for it in items if isinstance(it, dict)]
+
+                    expected_date_norm = _normalize_date_yyyymmdd(expected_date or "")
+                    expected_customer_norm = _normalize_name_key(expected_customer or "")
+
+                    # Rank candidates:
+                    # 1) exact customer+date match
+                    # 2) exact customer match
+                    # 3) is_instant_dc=True and dc_synced=False
+                    # 4) is_instant_dc=True
+                    # 5) latest/highest id fallback
+                    best = None
+                    best_rank = (-1, -1, -1)
+                    for it in candidates:
+                        try:
+                            _id = int(it.get("id"))
+                        except (TypeError, ValueError):
+                            continue
+                        is_instant = bool(it.get("is_instant_dc") is True)
+                        not_synced = bool(it.get("dc_synced") is False)
+                        item_customer = _normalize_name_key(
+                            (it.get("customer_name") or ((it.get("customer") or {}).get("name") if isinstance(it.get("customer"), dict) else "")) or ""
+                        )
+                        item_date = _normalize_date_yyyymmdd(it.get("dc_date") or it.get("date") or "")
+
+                        customer_date_match = int(
+                            bool(expected_customer_norm and expected_date_norm and item_customer == expected_customer_norm and item_date == expected_date_norm)
+                        )
+                        customer_match = int(bool(expected_customer_norm and item_customer == expected_customer_norm))
+                        instant_rank = 2 if (is_instant and not_synced) else (1 if is_instant else 0)
+                        rank = (customer_date_match, customer_match + instant_rank, _id)
+                        if rank > best_rank:
+                            best_rank = rank
+                            best = _id
+                    if best is not None:
+                        return best
+                logger.debug("DC id lookup: no results for dc_no=%s (response: %s)", dc_no, str(data)[:200])
+        except Exception as exc:
+            logger.debug("DC id lookup failed for dc_no=%s on %s: %s", dc_no, base, exc)
     return None
 
 
-def _update_dc_fill_station(api_base_url: str, dc_id: int, fill_station_id: str) -> bool:
+def _update_dc_fill_station(
+    api_base_url: str,
+    dc_id: int,
+    fill_station_id: str,
+    api_key: Optional[str] = None,
+) -> bool:
     """Update fill_station on a DC via PATCH, PUT, or POST (tries in order)."""
     if not dc_id or not fill_station_id:
         return False
@@ -1153,27 +1350,30 @@ def _update_dc_fill_station(api_base_url: str, dc_id: int, fill_station_id: str)
         fs_int = int(fill_station_id)
     except (ValueError, TypeError):
         return False
-    try:
-        url = _server_base_url(api_base_url) + f"/transaction/delivery_challan/{dc_id}"
-        payload = {"id": dc_id, "fill_station": fs_int}
-        headers = {"Content-Type": "application/json"}
-
-        # Try PATCH first (partial update), then PUT, then POST
-        for method in (requests.patch, requests.put, requests.post):
-            resp = method(url, json=payload, headers=headers, timeout=15)
-            if resp.status_code in (200, 201):
-                logger.info("Fill station updated: DC server_id=%s fill_station=%s (via %s)", dc_id, fs_int, method.__name__.upper())
-                return True
-            if resp.status_code == 405:
-                # Method not allowed — try next
-                continue
-            logger.warning("Fill station update %s HTTP %s for DC server_id=%s: %s",
-                           method.__name__.upper(), resp.status_code, dc_id, resp.text[:300])
-            return False
-
-        logger.warning("Fill station update: all HTTP methods failed for DC server_id=%s", dc_id)
-    except Exception as exc:
-        logger.warning("Fill station update failed for DC server_id=%s: %s", dc_id, exc)
+    payload = {"id": dc_id, "fill_station": fs_int}
+    headers = {"Content-Type": "application/json"}
+    headers.update(_build_optional_auth_headers(api_key))
+    for base in [_server_base_url(api_base_url)]:
+        try:
+            url = base + f"/transaction/delivery_challan/{dc_id}"
+            # Try PATCH first (partial update), then PUT, then POST
+            for method in (requests.patch, requests.put, requests.post):
+                resp = method(url, json=payload, headers=headers, timeout=15)
+                if resp.status_code in (200, 201):
+                    logger.info(
+                        "Fill station updated: DC server_id=%s fill_station=%s (via %s %s)",
+                        dc_id, fs_int, method.__name__.upper(), base
+                    )
+                    return True
+                if resp.status_code == 405:
+                    continue
+                logger.warning(
+                    "Fill station update %s HTTP %s for DC server_id=%s on %s: %s",
+                    method.__name__.upper(), resp.status_code, dc_id, base, resp.text[:300]
+                )
+        except Exception as exc:
+            logger.warning("Fill station update failed for DC server_id=%s on %s: %s", dc_id, base, exc)
+    logger.warning("Fill station update: all API base candidates failed for DC server_id=%s", dc_id)
     return False
 
 
@@ -1195,6 +1395,7 @@ def build_config(args: argparse.Namespace) -> SyncConfig:
         limit=args.limit or cfg.get_env_int("SYNC_LIMIT", 200) or 200,
         max_attempts=args.max_attempts or cfg.get_env_int("SYNC_MAX_ATTEMPTS", 5) or 5,
         allow_tally_fetch=bool(args.allow_tally_fetch) or cfg.get_env_bool("SYNC_ALLOW_TALLY_FETCH", False),
+        enable_instant_dc_matching=cfg.get_env_bool("ENABLE_INSTANT_DC_MATCHING", True),
         dry_run=bool(args.dry_run) or cfg.get_env_bool("SYNC_DRY_RUN", False),
         log_level=args.log_level or cfg.get_env("LOG_LEVEL", "INFO"),
         log_json=bool(args.log_json) or cfg.get_env_bool("LOG_JSON", False),
@@ -1227,8 +1428,12 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("No unsynced delivery notes found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    instant_dcs = _fetch_unsynced_instant_dcs(config.api_base_url, config.entity_id)
-    logger.info("Retrieved %d unsynced Instant DCs for matching", len(instant_dcs))
+    instant_dcs: List[Dict[str, Any]] = []
+    if config.enable_instant_dc_matching:
+        instant_dcs = _fetch_unsynced_instant_dcs(config.api_base_url, config.entity_id, config.api_key)
+        logger.info("Retrieved %d unsynced Instant DCs for matching", len(instant_dcs))
+    else:
+        logger.info("Instant DC matching disabled (ENABLE_INSTANT_DC_MATCHING=false)")
 
     # Build liquid product name map once for this sync run
     liquid_master_map, liquid_variant_map = _build_liquid_name_maps(config.master_db_path)
@@ -1239,7 +1444,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             len(liquid_variant_map),
         )
 
-    endpoint = config.api_base_url.rstrip("/") + "/tally-delivery-challan-payload/"
+    endpoint = _import_base_url(config.api_base_url) + "/tally-delivery-challan-payload/"
     # Payload endpoints use AllowAny permission â€" no auth header needed
     headers = {"Content-Type": "application/json"}
 
@@ -1286,6 +1491,29 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             logger.info("Matched Instant DC for %s -> portal DC %s (id=%s)",
                         dc_no or "?", matched_dc.get("dc_no"), matched_dc_id)
             instant_dcs = [dc for dc in instant_dcs if dc.get("id") != matched_dc_id]
+        elif dc_no:
+            logger.info("No instant match for dc_no=%s; trying dc_no lookup fallback", dc_no)
+            # Fallback: if instant-list endpoint is unavailable, attempt direct dc_no lookup
+            # so payload can update existing DC instead of creating duplicate.
+            existing_dc_id = _lookup_dc_id_by_no(
+                config.api_base_url,
+                config.entity_id,
+                dc_no,
+                config.api_key,
+                expected_date=note.get("voucher_date") or voucher.get("DATE"),
+                expected_customer=note.get("party_ledger_name") or voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME"),
+            )
+            if existing_dc_id:
+                matched_dc_id = existing_dc_id
+                voucher["MATCHED_DC_ID"] = existing_dc_id
+                logger.info("Matched existing portal DC by dc_no=%s (id=%s)", dc_no, existing_dc_id)
+            else:
+                logger.info("No existing portal DC found by dc_no=%s; payload may create new DC", dc_no)
+
+        if matched_dc_id:
+            logger.info("Using MATCHED_DC_ID=%s for dc_no=%s", matched_dc_id, dc_no or "?")
+        else:
+            logger.info("MATCHED_DC_ID not set for dc_no=%s", dc_no or "?")
 
         logger.info(
             "Syncing DC #%s | party=%s | date=%s | filling_station=%s | po=%s | items=%d | terms=%s",
@@ -1394,6 +1622,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                         config.api_base_url,
                         matched_dc_id,
                         tally_voucher_no=tally_voucher_no,
+                        api_key=config.api_key,
                     )
                     if mark_ok:
                         logger.info("Marked Instant DC as synced on portal (id=%s)", matched_dc_id)
@@ -1405,9 +1634,19 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 if default_fs_id:
                     # Use server ID from response if available, otherwise look it up
                     if not _dc_server_id:
-                        _dc_server_id = _lookup_dc_id_by_no(config.api_base_url, config.entity_id, resolved_dc_no or dc_no)
+                        _dc_server_id = _lookup_dc_id_by_no(
+                            config.api_base_url,
+                            config.entity_id,
+                            resolved_dc_no or dc_no,
+                            config.api_key,
+                        )
                     if _dc_server_id:
-                        fs_ok = _update_dc_fill_station(config.api_base_url, _dc_server_id, default_fs_id)
+                        fs_ok = _update_dc_fill_station(
+                            config.api_base_url,
+                            _dc_server_id,
+                            default_fs_id,
+                            config.api_key,
+                        )
                         if not fs_ok:
                             logger.warning("Fill station update failed for DC #%s (server_id=%s, fill_station=%s)", resolved_dc_no or dc_no, _dc_server_id, default_fs_id)
                     else:
@@ -1464,6 +1703,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
