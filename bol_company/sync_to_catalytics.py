@@ -101,12 +101,7 @@ class CatalyticsSyncer:
     @staticmethod
     def _endpoint_allows_anonymous(endpoint):
         path = '/' + endpoint.lstrip('/')
-        return path.startswith('/import/') or path in {
-            '/transaction/delivery_challan/instant/unsynced',
-        } or (
-            path.startswith('/transaction/delivery_challan/instant/')
-            and path.endswith('/mark-synced')
-        )
+        return path.startswith('/import/')
 
     def _api_request(self, method, endpoint, **kwargs):
         """Make API request to Catalytics"""
@@ -475,7 +470,11 @@ class CatalyticsSyncer:
         """
         logger.info("Fetching unsynced Instant DCs from Catalytics for matching...")
         try:
-            response = self._api_request('GET', '/transaction/delivery_challan/instant/unsynced')
+            response = self._api_request(
+                'GET',
+                '/transaction/delivery_challan/instant/unsynced',
+                params={'entity_id': self.entity_id},
+            )
             if response.status_code != 200:
                 logger.error(f"Failed to fetch unsynced Instant DCs: HTTP {response.status_code}")
                 return []
@@ -483,6 +482,25 @@ class CatalyticsSyncer:
             data = response.json()
             basic_results = data.get('results', [])
             logger.info(f"Received {len(basic_results)} unsynced Instant DCs from portal")
+
+            # Some backend deployments incorrectly treat entity_id as fill_station.
+            # If the filtered request returns nothing, retry once without that filter
+            # so exact customer/date/product/quantity matching can still work.
+            if not basic_results:
+                logger.info("No instant DCs returned for entity-filtered fetch, retrying without entity filter")
+                fallback_response = self._api_request(
+                    'GET',
+                    '/transaction/delivery_challan/instant/unsynced',
+                )
+                if fallback_response.status_code == 200:
+                    fallback_data = fallback_response.json()
+                    fallback_results = fallback_data.get('results', [])
+                    logger.info(f"Fallback fetch returned {len(fallback_results)} unsynced Instant DCs")
+                    basic_results = fallback_results
+                else:
+                    logger.warning(
+                        f"Fallback instant DC fetch failed: HTTP {fallback_response.status_code}"
+                    )
 
             # Check if the enhanced list already includes dc_date (new backend)
             needs_detail_fetch = bool(basic_results and not basic_results[0].get('dc_date'))
