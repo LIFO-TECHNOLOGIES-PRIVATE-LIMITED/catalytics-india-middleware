@@ -20,7 +20,6 @@ if ROOT_DIR not in sys.path:
 
 import db
 import config as cfg
-from fetch_tally import build_config as build_fetch_config, run_once as fetch_once
 from fetch_invoices import build_config as build_fetch_invoice_config, run_once as fetch_invoice_once
 from sync_catalytics import build_config as build_sync_config, run_once as sync_once
 from fetch_customers import build_config as build_fetch_customers_config, run_once as fetch_customers_once
@@ -182,19 +181,10 @@ def _log_file_path() -> str:
 
 def _run_fetch():
     args = _env_namespace()
-    with STATE.lock:
-        source_doc = STATE.source_doc
-
-    if source_doc == "sales_invoice":
-        fetch_config = build_fetch_invoice_config(args)
-        if not fetch_config.log_file:
-            fetch_config.log_file = _log_file_path()
-        stats = fetch_invoice_once(fetch_config)
-    else:
-        fetch_config = build_fetch_config(args)
-        if not fetch_config.log_file:
-            fetch_config.log_file = _log_file_path()
-        stats = fetch_once(fetch_config)
+    fetch_config = build_fetch_invoice_config(args)
+    if not fetch_config.log_file:
+        fetch_config.log_file = _log_file_path()
+    stats = fetch_invoice_once(fetch_config)
     return stats
 
 

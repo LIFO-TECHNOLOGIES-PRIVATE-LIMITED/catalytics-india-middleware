@@ -1701,7 +1701,7 @@ def _sync_one_product(product_id: int) -> dict:
 
 def _refetch_one_invoice(invoice_id: int) -> dict:
     """Refresh a single invoice/DC from Tally and mark it pending sync."""
-    from fetch_tally import _default_date_range, _extract_tally_guid, _normalize_dc_no
+    from fetch_invoices import _default_date_range, _extract_tally_guid, _normalize_dc_no
     import tally_api
 
     tally_db_path = cfg.get_env('TALLY_DB_PATH')

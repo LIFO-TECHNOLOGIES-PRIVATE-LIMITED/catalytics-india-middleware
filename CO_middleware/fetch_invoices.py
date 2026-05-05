@@ -980,19 +980,18 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
         voucher_date = voucher.get("DATE") or ""
         party_name = voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME") or ""
+        # Only process DCs that have OTHERREFERENCE set.
+        # PONUMBER / REFERENCE / VOUCHERREFERENCE are NOT accepted as substitutes.
         reference = (
             voucher.get("OTHERREFERENCE")
-            or voucher.get("PONUMBER")
-            or voucher.get("REFERENCE")
-            or voucher.get("VOUCHERREFERENCE")
+            or voucher.get("BASICORDERREF")
             or ""
         ).strip()
 
-        # Restrict to vouchers that carry a usable other/reference value.
         if not reference:
             skipped += 1
             skipped_ref_filter += 1
-            logger.info("Skipping DC %s (%s): empty OTHERREFERENCE/REFERENCE", dc_no, party_name or "?")
+            logger.info("Skipping DC %s (%s): OTHERREFERENCE is empty", dc_no, party_name or "?")
             continue
 
         # --- Liquid product pre-creation (BEFORE any validation so it always runs) ---
