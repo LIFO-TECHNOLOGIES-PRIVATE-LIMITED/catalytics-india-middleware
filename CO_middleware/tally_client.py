@@ -3,7 +3,8 @@ import os
 import re
 import time
 import threading
-from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+from typing import Any, List, Dict, Optional
 
 import requests
 import xml.etree.ElementTree as ET
@@ -1417,11 +1418,27 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
     Returns:
         List of delivery note vouchers from daybook only
     """
+    # Hard clamp Day Book DC fetch to a 3-day window: yesterday, today, tomorrow.
+    # This prevents old daybook data from being fetched even when callers pass a wider range.
+    today = datetime.now()
+    allowed_from_date = (today - timedelta(days=1)).strftime("%Y%m%d")
+    allowed_to_date = (today + timedelta(days=1)).strftime("%Y%m%d")
+    original_from_date = from_date
+    original_to_date = to_date
+    from_date = allowed_from_date
+    to_date = allowed_to_date
+
     logger.info("=" * 80)
     logger.info("DAY BOOK FETCH STARTED")
     logger.info("=" * 80)
     logger.info("Company: %s", company_name)
-    logger.info("Date Range: %s to %s", from_date, to_date)
+    logger.info(
+        "Date Range requested=%s to %s | enforced=%s to %s (3-day window only)",
+        original_from_date,
+        original_to_date,
+        from_date,
+        to_date,
+    )
     logger.info("=" * 80)
 
     daybook_xml = f"""
@@ -1487,8 +1504,33 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
         print("[FUNCTION] Filtering for delivery vouchers only (excluding vouchers)...")
         delivery_vouchers = [v for v in all_vouchers if _is_delivery(v)]
 
+        # Strict date-window filter: only keep DCs in yesterday/today/tomorrow.
+        # Tally Day Book may occasionally return vouchers outside requested dates.
+        def _voucher_in_allowed_window(voucher: Dict[str, Any]) -> bool:
+            raw_date = str(voucher.get("DATE") or "").strip()
+            digits = "".join(ch for ch in raw_date if ch.isdigit())
+            if len(digits) != 8:
+                logger.debug(
+                    "[FUNCTION] Skipping voucher with non-YYYYMMDD DATE='%s' (dc_no=%s)",
+                    raw_date,
+                    voucher.get("VOUCHERNUMBER", "?"),
+                )
+                return False
+            return from_date <= digits <= to_date
+
+        pre_date_count = len(delivery_vouchers)
+        delivery_vouchers = [v for v in delivery_vouchers if _voucher_in_allowed_window(v)]
+        dropped_count = pre_date_count - len(delivery_vouchers)
+        if dropped_count > 0:
+            logger.warning(
+                "[FUNCTION] Dropped %d delivery vouchers outside enforced window %s..%s",
+                dropped_count,
+                from_date,
+                to_date,
+            )
+
         logger.info(
-            "[FUNCTION] Day Book Summary: Date Range %s to %s — %d total vouchers, %d delivery notes (daybook only) for company '%s'",
+            "[FUNCTION] Day Book Summary: Enforced Date Range %s to %s — %d total vouchers, %d delivery notes (daybook only) for company '%s'",
             from_date, to_date, len(all_vouchers), len(delivery_vouchers), company_name,
         )
         print(f"[FUNCTION] Day Book Summary: {len(all_vouchers)} total vouchers, {len(delivery_vouchers)} delivery notes (daybook only)")

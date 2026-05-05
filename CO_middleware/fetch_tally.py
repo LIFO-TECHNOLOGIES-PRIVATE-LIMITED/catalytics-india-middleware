@@ -82,9 +82,8 @@ def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
     # Tally Day Book only returns data for the currently open date.
     # By covering yesterday+today+tomorrow, whichever date is open in
     # Tally will match and its DCs will be fetched.
-    # days_back > 1 expands the past side further.
-    effective_days_back = max(days_back, DEFAULT_DC_PAST_DAYS) if days_back is not None else DEFAULT_DC_PAST_DAYS
-    from_dt = now - timedelta(days=effective_days_back)
+    # Keep this fixed at 3 days only; do not expand into older daybooks.
+    from_dt = now - timedelta(days=DEFAULT_DC_PAST_DAYS)
     to_dt = now + timedelta(days=DEFAULT_DC_FUTURE_DAYS)
     return from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")
 
@@ -107,6 +106,17 @@ def _build_payload_hash(
     return db.sha256_text(db.json_dumps(payload))
 
 
+def _is_instant_voucher(voucher: Dict[str, Any]) -> bool:
+    """Return True if the DC appears to be an Instant DC based on Tally fields."""
+    vtype = str(voucher.get("VOUCHERTYPENAME") or voucher.get("VOUCHERTYPE") or "").strip().lower()
+    if "instant" in vtype:
+        return True
+    other_ref = str(voucher.get("BASICORDERREF") or voucher.get("OTHERREFERENCE") or "").strip().lower()
+    if "instant" in other_ref:
+        return True
+    return False
+
+
 def _normalize_name_key(value: str) -> str:
     return str(value or "").replace(" ", "").strip().lower()
 
@@ -121,7 +131,8 @@ def _sync_customer_now(
     """Try immediate customer sync; returns (ok, response_json, error_msg)."""
     if not api_base_url:
         return False, None, "CATALYTICS_API_BASE_URL not set"
-    endpoint = api_base_url.rstrip('/') + '/tally-customer-payload/'
+    _base = api_base_url.rstrip('/')
+    endpoint = (_base + '/tally-customer-payload/') if _base.endswith('/import') else (_base + '/import/tally-customer-payload/')
     payload = {"entity_id": entity_id, "ledger": ledger}
     if company_name:
         payload["company_name"] = company_name
@@ -171,13 +182,14 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
     conn = db.connect(config.db_path)
     db.init_db(conn)
 
-    if config.from_date and config.to_date:
-        from_date = config.from_date
-        to_date = config.to_date
-    else:
-        from_date, to_date = _default_date_range(config.days_back)
+    # Always use the fixed 3-day window: yesterday / today / tomorrow.
+    # Tally Day Book only returns data for the currently open date, so this
+    # window ensures whichever date is open in Tally will be covered.
+    # config.from_date / config.to_date overrides are intentionally ignored
+    # to prevent accidental historical DC fetches.
+    from_date, to_date = _default_date_range()
 
-    logger.info("Using date range %s to %s", from_date, to_date)
+    logger.info("Using fixed 3-day window: %s to %s (yesterday / today / tomorrow)", from_date, to_date)
     companies = tally_api.get_companies(config.tally_url)
     available = [c.get("name") for c in companies]
     company_match = None
@@ -215,17 +227,12 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             skipped += 1
             continue
 
-        # Restrict to vouchers that carry a usable other/reference value.
-        ref_value = (
-            voucher.get("OTHERREFERENCE")
-            or voucher.get("PONUMBER")
-            or voucher.get("REFERENCE")
-            or voucher.get("VOUCHERREFERENCE")
-            or ""
-        ).strip()
+        # Only process DCs that have OTHERREFERENCE set.
+        # PONUMBER / REFERENCE / VOUCHERREFERENCE are NOT accepted as substitutes.
+        ref_value = (voucher.get("OTHERREFERENCE") or voucher.get("BASICORDERREF") or "").strip()
         if not ref_value:
             skipped += 1
-            logger.info("Skipping DC %s: empty OTHERREFERENCE/REFERENCE", dc_no)
+            logger.info("Skipping DC %s: OTHERREFERENCE is empty", dc_no)
             continue
 
         existing_json = None
@@ -404,6 +411,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
                         exc,
                     )
 
+        is_instant = _is_instant_voucher(voucher)
         dn_id = db.upsert_delivery_note(
             conn,
             company_id=company_id,
@@ -413,6 +421,7 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             tally_guid=tally_guid,
             reference=reference,
             data=voucher,
+            is_instant=is_instant,
         )
 
         inventory_items = voucher.get("INVENTORY") or []

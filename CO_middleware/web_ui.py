@@ -1187,7 +1187,8 @@ def _retry_dc(note_id: int) -> Dict[str, Any]:
             allow_tally_fetch=sync_config.allow_tally_fetch,
         )
 
-        endpoint = sync_config.api_base_url.rstrip("/") + "/import/tally-delivery-challan-payload/"
+        _base = sync_config.api_base_url.rstrip("/")
+        endpoint = (_base + "/tally-delivery-challan-payload/") if _base.endswith("/import") else (_base + "/import/tally-delivery-challan-payload/")
         headers = {}
         if sync_config.api_key:
             headers["X-API-Key"] = sync_config.api_key
@@ -1241,7 +1242,8 @@ def _retry_customer(ledger_id: int) -> Dict[str, Any]:
         )
         payload_hash = db.sha256_text(db.json_dumps(payload))
 
-        endpoint = sync_config.api_base_url.rstrip("/") + "/import/tally-customer-payload/"
+        _base = sync_config.api_base_url.rstrip("/")
+        endpoint = (_base + "/tally-customer-payload/") if _base.endswith("/import") else (_base + "/import/tally-customer-payload/")
         headers = {}
         if sync_config.api_key:
             headers["X-API-Key"] = sync_config.api_key
@@ -1310,7 +1312,8 @@ def _retry_product(stock_item_id: int) -> Dict[str, Any]:
         )
         payload_hash = db.sha256_text(db.json_dumps(payload))
 
-        endpoint = sync_config.api_base_url.rstrip("/") + "/import/tally-product-payload/"
+        _base = sync_config.api_base_url.rstrip("/")
+        endpoint = (_base + "/tally-product-payload/") if _base.endswith("/import") else (_base + "/import/tally-product-payload/")
         headers = {}
         if sync_config.api_key:
             headers["X-API-Key"] = sync_config.api_key

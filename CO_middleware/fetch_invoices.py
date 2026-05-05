@@ -132,9 +132,8 @@ def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
     # Tally Day Book only returns data for the currently open date.
     # By covering yesterday+today+tomorrow, whichever date is open in
     # Tally will match and its DCs will be fetched.
-    # days_back > 1 expands the past side further.
-    effective_days_back = max(days_back, DEFAULT_DC_PAST_DAYS) if days_back is not None else DEFAULT_DC_PAST_DAYS
-    from_dt = now - timedelta(days=effective_days_back)
+    # Keep this fixed at 3 days only; do not expand into older daybooks.
+    from_dt = now - timedelta(days=DEFAULT_DC_PAST_DAYS)
     to_dt = now + timedelta(days=DEFAULT_DC_FUTURE_DAYS)
     return from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")
 
@@ -341,7 +340,8 @@ def _ensure_liquid_product(
         )
 
         # --- 3. Sync to Catalytics server ---
-        endpoint = api_base_url.rstrip('/') + '/tally-product_name-payload/'
+        _base = api_base_url.rstrip('/')
+        endpoint = (_base + '/tally-product_name-payload/') if _base.endswith('/import') else (_base + '/import/tally-product_name-payload/')
         payload = {
             'entity_id': entity_id,
             'stock_item_name': canonical_name,
@@ -567,7 +567,8 @@ def _ensure_product(
         )
 
         # Sync to Catalytics server
-        endpoint = api_base_url.rstrip('/') + '/tally-product_name-payload/'
+        _base = api_base_url.rstrip('/')
+        endpoint = (_base + '/tally-product_name-payload/') if _base.endswith('/import') else (_base + '/import/tally-product_name-payload/')
         payload = {
             'entity_id': entity_id,
             'stock_item_name': canonical_name,
@@ -669,7 +670,8 @@ def _sync_customer_now(
     """Try immediate customer sync; returns (ok, response_json, error_msg)."""
     if not api_base_url:
         return False, None, "CATALYTICS_API_BASE_URL not set"
-    endpoint = api_base_url.rstrip('/') + '/tally-customer-payload/'
+    _base = api_base_url.rstrip('/')
+    endpoint = (_base + '/tally-customer-payload/') if _base.endswith('/import') else (_base + '/import/tally-customer-payload/')
     payload = {"entity_id": entity_id, "ledger": ledger}
     if company_name:
         payload["company_name"] = company_name
@@ -1489,7 +1491,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
 
 

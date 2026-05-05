@@ -51,6 +51,7 @@ class TestDBHelpers(unittest.TestCase):
             dc_no="DC-1",
             voucher_date="20240101",
             party_ledger_name="LedgerA",
+            tally_guid=None,
             reference="PO-1",
             data={"VOUCHERNUMBER": "DC-1"},
         )
