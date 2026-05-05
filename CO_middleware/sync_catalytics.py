@@ -686,6 +686,21 @@ def _enrich_voucher(
     elif not voucher.get("TERMSOFDELIVERY"):
         voucher["TERMSOFDELIVERY"] = "Delivery"
 
+    # VEHICLENO — unified vehicle number for portal sync
+    # Tally stores it in BASICSHIPPEDBY (→ DISPATCHEDTHROUGH) or GOODSVEHICLENUMBER (→ MOTORVEHICLENO)
+    vehicle_no = (
+        str(voucher.get("VEHICLENO") or "").strip() or
+        str(voucher.get("DISPATCHEDTHROUGH") or "").strip() or
+        str(voucher.get("MOTORVEHICLENO") or "").strip() or
+        str(voucher.get("BASICSHIPPEDBY") or "").strip() or
+        str(voucher.get("GOODSVEHICLENUMBER") or "").strip()
+    )
+    if vehicle_no:
+        voucher["VEHICLENO"] = vehicle_no
+        logger.info("Vehicle number set: %r for DC %s", vehicle_no, note.get("dc_no"))
+    else:
+        logger.info("No vehicle number found for DC %s (BASICSHIPPEDBY/DISPATCHEDTHROUGH/MOTORVEHICLENO all empty)", note.get("dc_no"))
+
     # INVENTORY â€" ensure items are attached
     if not voucher.get("INVENTORY"):
         voucher["INVENTORY"] = items
