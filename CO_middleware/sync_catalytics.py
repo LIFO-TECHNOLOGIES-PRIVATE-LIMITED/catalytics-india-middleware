@@ -102,7 +102,8 @@ def _fetch_unsynced(
     params.append(limit)
     rows = conn.execute(
         f"""
-        SELECT dn.*, ss.is_synced, ss.attempts, ss.payload_hash
+        SELECT dn.*, ss.is_synced, ss.attempts, ss.payload_hash,
+               dn.is_instant, dn.matched_dc_id
         FROM delivery_notes dn
         LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
         WHERE COALESCE(ss.is_synced, 0) = 0
@@ -701,6 +702,18 @@ def _normalize_name_key(value: Any) -> str:
     return str(value or "").replace(" ", "").strip().lower()
 
 
+def _customer_exists_in_db(conn, party_name: str) -> bool:
+    """Check if a customer exists in the local SQLite customers table before syncing."""
+    if not party_name:
+        return True  # No party name — don't block the sync
+    normalized = _normalize_name_key(party_name)
+    row = conn.execute(
+        "SELECT id FROM customers WHERE lower(replace(name, ' ', '')) = ?",
+        (normalized,),
+    ).fetchone()
+    return row is not None
+
+
 def _build_liquid_name_maps(master_db_path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
     Build liquid canonical lookup maps from local products table:
@@ -991,8 +1004,7 @@ def _fetch_unsynced_instant_dcs(
 
     logger.info("Fetching unsynced Instant DCs from portal for matching")
     params: Dict[str, Any] = {}
-    if entity_id:
-        params["entity_id"] = entity_id
+    # entity_id is NOT a query param — backend filters by auth/session context
     headers = _build_optional_auth_headers(api_key)
 
     last_error = None
@@ -1094,6 +1106,7 @@ def _find_matching_instant_dc(
 
     invoice_products = _build_item_qty_map(items, is_portal_item=False)
     if not invoice_products:
+        logger.info("Instant DC match: Tally voucher has no parseable products; skipping match")
         return None
 
     try:
@@ -1101,26 +1114,38 @@ def _find_matching_instant_dc(
     except Exception:
         return None
 
+    logger.info(
+        "Instant DC match: Tally dc_no=? date=%s customer=%r products=%s",
+        invoice_date, customer_name_norm, list(invoice_products.keys()),
+    )
+
+    # Step 1: collect all DCs that pass date + customer filter
+    candidates: List[Dict[str, Any]] = []
     for dc in instant_dcs:
         dc_id = dc.get("id")
         if not dc_id:
             continue
         if dc.get("is_instant_dc") is False:
+            logger.info("  DC id=%s skipped: is_instant_dc=False", dc_id)
             continue
         if dc.get("dc_synced") is True:
+            logger.info("  DC id=%s skipped: dc_synced=True", dc_id)
             continue
 
         dc_date_norm = _normalize_date_yyyymmdd(dc.get("dc_date") or dc.get("date"))
         if not dc_date_norm:
+            logger.info("  DC id=%s skipped: no dc_date", dc_id)
             continue
 
         try:
             dc_dt = datetime.strptime(dc_date_norm, "%Y%m%d")
             delta = (invoice_dt - dc_dt).days
             if delta < 0 or delta > 7:
+                logger.info("  DC id=%s skipped: date delta=%d (dc=%s tally=%s)", dc_id, delta, dc_date_norm, invoice_date)
                 continue
         except Exception:
             if dc_date_norm != invoice_date:
+                logger.info("  DC id=%s skipped: date mismatch (%s vs %s)", dc_id, dc_date_norm, invoice_date)
                 continue
 
         customer_obj = dc.get("customer")
@@ -1129,17 +1154,80 @@ def _find_matching_instant_dc(
         else:
             dc_customer_norm = _normalize_name_key(dc.get("customer_name"))
         if dc_customer_norm != customer_name_norm:
+            logger.info("  DC id=%s skipped: customer mismatch (portal=%r tally=%r)", dc_id, dc_customer_norm, customer_name_norm)
             continue
 
+        logger.info("  DC id=%s passed date+customer filter (dc_date=%s customer=%r)", dc_id, dc_date_norm, dc_customer_norm)
+        candidates.append(dc)
+
+    if not candidates:
+        return None
+
+    # Step 2: try to narrow down by product name + quantity match
+    def _score_dc(dc: Dict[str, Any]) -> int:
+        """Return match score: 2=full qty match, 1=name-only match, 0=no product data."""
         dc_items = dc.get("order_details") or dc.get("items") or []
         dc_products = _build_item_qty_map(dc_items, is_portal_item=True)
-        if len(dc_products) != len(invoice_products):
-            continue
 
-        if all(abs(dc_products.get(name, -10**9) - qty) < 1e-6 for name, qty in invoice_products.items()):
-            return dc
+        if dc_products:
+            # Full product+quantity check
+            if len(dc_products) != len(invoice_products):
+                return -1  # product count mismatch — eliminate
+            for tally_key, expected_qty in invoice_products.items():
+                got_qty = dc_products.get(tally_key)
+                if got_qty is None:
+                    candidates_qty = [
+                        qty for pk, qty in dc_products.items()
+                        if pk.startswith(tally_key) or tally_key.startswith(pk)
+                    ]
+                    got_qty = candidates_qty[0] if len(candidates_qty) == 1 else None
+                if got_qty is None or abs(got_qty - expected_qty) >= 1e-6:
+                    return -1  # qty mismatch — eliminate
+            return 2  # full match
 
-    return None
+        if dc_items:
+            # Items exist but no quantity field — try name-only match
+            dc_names: set = set()
+            for it in dc_items:
+                if isinstance(it, dict):
+                    pobj = it.get("product")
+                    name = (isinstance(pobj, dict) and pobj.get("name")) or it.get("product_name") or it.get("name") or ""
+                elif isinstance(it, str):
+                    name = it
+                else:
+                    name = ""
+                if name:
+                    dc_names.add(_normalize_name_key(str(name)))
+            tally_names = set(invoice_products.keys())
+            has_overlap = bool(dc_names & tally_names) or any(
+                any(pk.startswith(tk) or tk.startswith(pk) for pk in dc_names)
+                for tk in tally_names
+            )
+            if has_overlap:
+                return 1  # name-only match
+            return -1  # names don't match either — eliminate
+
+        # No items at all — can't verify products, treat as weak match
+        return 0
+
+    scored = [(dc, _score_dc(dc)) for dc in candidates]
+    logger.info(
+        "  Candidate scores: %s",
+        [(dc.get("id"), score) for dc, score in scored],
+    )
+
+    # Eliminate any DC with score -1 (definite mismatch)
+    viable = [(dc, score) for dc, score in scored if score >= 0]
+    if not viable:
+        # All candidates were eliminated by product check — fall back to all candidates
+        logger.info("  All candidates eliminated by product check; falling back to best date+customer match")
+        viable = [(dc, 0) for dc in candidates]
+
+    # Pick the highest-scoring candidate; ties broken by id (prefer higher/latest)
+    viable.sort(key=lambda x: (x[1], x[0].get("id") or 0), reverse=True)
+    best_dc, best_score = viable[0]
+    logger.info("  Selected DC id=%s with score=%d", best_dc.get("id"), best_score)
+    return best_dc
 
 
 def _mark_instant_dc_synced_on_portal(
@@ -1276,8 +1364,7 @@ def _lookup_dc_id_by_no(
         logger.info("Using forced MATCHED_DC_ID for dc_no=%s -> id=%s", dc_no, forced)
         return forced
     params: Dict[str, Any] = {"dc_no": dc_no}
-    if entity_id:
-        params["entity_id"] = entity_id
+    # entity_id is NOT a query param on DeliveryChallan model — sending it causes Django FieldError 500
     headers = _build_optional_auth_headers(api_key)
     for base in [_server_base_url(api_base_url)]:
         try:
@@ -1454,7 +1541,8 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
 
     for note in notes:
         dc_no = _norm_dc_no(note.get("dc_no"))
-        matched_dc_id: Optional[int] = None
+        # Restore previously persisted matched_dc_id if sync failed on a prior attempt
+        matched_dc_id: Optional[int] = note.get("matched_dc_id") or None
         try:
             payload, payload_hash = _build_payload_for_note(
                 conn,
@@ -1484,14 +1572,42 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         items = voucher.get("INVENTORY") or []
         tally_voucher_no = str(voucher.get("VOUCHERNUMBER") or dc_no).strip()
 
-        matched_dc = _find_matching_instant_dc(note, voucher, items, instant_dcs)
-        if matched_dc and matched_dc.get("id"):
-            matched_dc_id = matched_dc.get("id")
+        # Pre-sync customer validation (like BOL middleware)
+        party_name = note.get("party_ledger_name") or voucher.get("PARTYLEDGERNAME") or ""
+        if not _customer_exists_in_db(conn, party_name):
+            logger.warning(
+                "[SKIP:MISSING_CUSTOMER] DC #%s | customer='%s' not in local SQLite — skipping sync",
+                dc_no or "?", party_name,
+            )
+            _update_sync_status(
+                conn,
+                delivery_note_id=note["id"],
+                success=False,
+                payload_hash=payload_hash,
+                response_json=None,
+                error_text=f"customer_not_found: '{party_name}' not in local DB",
+            )
+            conn.commit()
+            total_fail += 1
+            continue
+
+        if matched_dc_id:
+            # Previously persisted match from a failed prior attempt — reuse it
             voucher["MATCHED_DC_ID"] = matched_dc_id
-            logger.info("Matched Instant DC for %s -> portal DC %s (id=%s)",
-                        dc_no or "?", matched_dc.get("dc_no"), matched_dc_id)
+            logger.info("Reusing persisted MATCHED_DC_ID=%s for dc_no=%s", matched_dc_id, dc_no or "?")
             instant_dcs = [dc for dc in instant_dcs if dc.get("id") != matched_dc_id]
-        elif dc_no:
+        else:
+            matched_dc = _find_matching_instant_dc(note, voucher, items, instant_dcs)
+            if matched_dc and matched_dc.get("id"):
+                matched_dc_id = matched_dc.get("id")
+                voucher["MATCHED_DC_ID"] = matched_dc_id
+                logger.info("Matched Instant DC for %s -> portal DC %s (id=%s)",
+                            dc_no or "?", matched_dc.get("dc_no"), matched_dc_id)
+                # Persist matched DC ID immediately so it survives a failed sync (like BOL middleware)
+                db.update_delivery_note_matched_dc(conn, delivery_note_id=note["id"], matched_dc_id=matched_dc_id)
+                instant_dcs = [dc for dc in instant_dcs if dc.get("id") != matched_dc_id]
+
+        if not matched_dc_id and dc_no:
             logger.info("No instant match for dc_no=%s; trying dc_no lookup fallback", dc_no)
             # Fallback: if instant-list endpoint is unavailable, attempt direct dc_no lookup
             # so payload can update existing DC instead of creating duplicate.
@@ -1516,7 +1632,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             logger.info("MATCHED_DC_ID not set for dc_no=%s", dc_no or "?")
 
         logger.info(
-            "Syncing DC #%s | party=%s | date=%s | filling_station=%s | po=%s | items=%d | terms=%s",
+            "Syncing DC #%s | party=%s | date=%s | filling_station=%s | po=%s | items=%d | terms=%s | instant=%s",
             dc_no or "?",
             voucher.get("PARTYLEDGERNAME") or "?",
             voucher.get("DATE") or "?",
@@ -1524,6 +1640,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             voucher.get("PARTYORDERNO") or "[EMPTY]",
             len(voucher.get("INVENTORY") or []),
             voucher.get("TERMSOFDELIVERY") or "[EMPTY]",
+            bool(note.get("is_instant")),
         )
 
         # Send single voucher per request â€" matching Arasan's sync_invoices_to_dc pattern

@@ -1904,38 +1904,56 @@ def _sync_one_invoice(invoice_id: int) -> dict:
         voucher = payload.get('voucher') or {}
         items = voucher.get('INVENTORY') or []
 
-        matched_dc_id = None
-        try:
-            instant_dcs = _fetch_unsynced_instant_dcs(api_base, entity_id, api_key)
-            matched_dc = _find_matching_instant_dc(note, voucher, items, instant_dcs)
-            if matched_dc and matched_dc.get('id'):
-                matched_dc_id = matched_dc.get('id')
-                voucher['MATCHED_DC_ID'] = matched_dc_id
-                logger.info("Resync matched instant DC for dc_no=%s -> id=%s", dc_no, matched_dc_id)
-            elif dc_no:
-                logger.info("Resync no instant match for dc_no=%s; trying dc_no lookup fallback", dc_no)
-                existing_dc_id = _lookup_dc_id_by_no(
-                    api_base,
-                    entity_id,
-                    dc_no,
-                    api_key,
-                    expected_date=note.get('voucher_date') or voucher.get('DATE'),
-                    expected_customer=note.get('party_ledger_name') or voucher.get('PARTYLEDGERNAME') or voucher.get('PARTYNAME'),
-                )
-                if existing_dc_id:
-                    matched_dc_id = existing_dc_id
-                    voucher['MATCHED_DC_ID'] = existing_dc_id
-                    logger.info("Resync matched existing portal DC by dc_no=%s -> id=%s", dc_no, existing_dc_id)
-                else:
-                    logger.info("Resync no existing portal DC found for dc_no=%s", dc_no)
-        except Exception:
-            # Keep single-resync workflow resilient even if instant matching errors.
-            pass
+        # Restore previously persisted matched_dc_id (survives a prior failed sync attempt)
+        matched_dc_id = note.get('matched_dc_id') or None
 
         if matched_dc_id:
-            logger.info("Resync using MATCHED_DC_ID=%s for dc_no=%s", matched_dc_id, dc_no)
+            voucher['MATCHED_DC_ID'] = matched_dc_id
+            logger.info("Resync using persisted MATCHED_DC_ID=%s for dc_no=%s", matched_dc_id, dc_no)
         else:
-            logger.info("Resync MATCHED_DC_ID not set for dc_no=%s", dc_no)
+            try:
+                instant_dcs = _fetch_unsynced_instant_dcs(api_base, entity_id, api_key)
+                logger.info("Resync fetched %d unsynced instant DCs from portal", len(instant_dcs))
+                for _idc in instant_dcs:
+                    logger.info(
+                        "  Portal instant DC: id=%s dc_no=%s customer=%s date=%s products=%s",
+                        _idc.get('id'), _idc.get('dc_no'),
+                        (_idc.get('customer') or {}).get('name') if isinstance(_idc.get('customer'), dict) else _idc.get('customer_name'),
+                        _idc.get('dc_date') or _idc.get('date'),
+                        [i.get('product_name') or (i.get('product') or {}).get('name') for i in (_idc.get('order_details') or _idc.get('items') or [])],
+                    )
+                matched_dc = _find_matching_instant_dc(note, voucher, items, instant_dcs)
+                if matched_dc and matched_dc.get('id'):
+                    matched_dc_id = matched_dc.get('id')
+                    voucher['MATCHED_DC_ID'] = matched_dc_id
+                    # Persist immediately so it survives any future retry
+                    db.update_delivery_note_matched_dc(conn, delivery_note_id=invoice_id, matched_dc_id=matched_dc_id)
+                    conn.commit()
+                    logger.info("Resync matched instant DC for dc_no=%s -> portal id=%s dc_no=%s",
+                                dc_no, matched_dc_id, matched_dc.get('dc_no'))
+                elif dc_no:
+                    logger.info("Resync no instant match for dc_no=%s; trying dc_no lookup fallback", dc_no)
+                    existing_dc_id = _lookup_dc_id_by_no(
+                        api_base,
+                        entity_id,
+                        dc_no,
+                        api_key,
+                        expected_date=note.get('voucher_date') or voucher.get('DATE'),
+                        expected_customer=note.get('party_ledger_name') or voucher.get('PARTYLEDGERNAME') or voucher.get('PARTYNAME'),
+                    )
+                    if existing_dc_id:
+                        matched_dc_id = existing_dc_id
+                        voucher['MATCHED_DC_ID'] = existing_dc_id
+                        logger.info("Resync matched existing portal DC by dc_no=%s -> id=%s", dc_no, existing_dc_id)
+                    else:
+                        logger.info("Resync no existing portal DC found for dc_no=%s", dc_no)
+            except Exception as _exc:
+                logger.warning("Resync instant DC matching error for dc_no=%s: %s", dc_no, _exc)
+
+        if matched_dc_id:
+            logger.info("Resync MATCHED_DC_ID=%s set for dc_no=%s", matched_dc_id, dc_no)
+        else:
+            logger.info("Resync MATCHED_DC_ID not set for dc_no=%s — will create new DC", dc_no)
 
         resp = requests.post(endpoint, json=payload, headers=headers, timeout=30)
         success = resp.status_code in (200, 201)

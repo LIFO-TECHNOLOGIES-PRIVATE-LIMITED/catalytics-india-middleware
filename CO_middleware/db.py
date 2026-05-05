@@ -146,6 +146,10 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         existing_dn = {row[1] for row in conn.execute("PRAGMA table_info(delivery_notes)").fetchall()}
         if "tally_guid" not in existing_dn:
             conn.execute("ALTER TABLE delivery_notes ADD COLUMN tally_guid TEXT")
+        if "is_instant" not in existing_dn:
+            conn.execute("ALTER TABLE delivery_notes ADD COLUMN is_instant INTEGER DEFAULT 0")
+        if "matched_dc_id" not in existing_dn:
+            conn.execute("ALTER TABLE delivery_notes ADD COLUMN matched_dc_id INTEGER")
     except Exception:
         pass
 
@@ -393,29 +397,48 @@ def upsert_delivery_note(
     tally_guid: Optional[str],
     reference: Optional[str],
     data: Dict[str, Any],
+    is_instant: bool = False,
 ) -> int:
     ts = now_ts()
     data_json = json_dumps(data)
     conn.execute(
         """
         INSERT INTO delivery_notes
-            (company_id, dc_no, voucher_date, party_ledger_name, tally_guid, reference, data_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (company_id, dc_no, voucher_date, party_ledger_name, tally_guid, reference, data_json, is_instant, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(company_id, dc_no) DO UPDATE SET
             voucher_date = excluded.voucher_date,
             party_ledger_name = excluded.party_ledger_name,
             tally_guid = excluded.tally_guid,
             reference = excluded.reference,
             data_json = excluded.data_json,
+            is_instant = excluded.is_instant,
             updated_at = excluded.updated_at
         """,
-        (company_id, dc_no, voucher_date, party_ledger_name, tally_guid, reference, data_json, ts, ts),
+        (company_id, dc_no, voucher_date, party_ledger_name, tally_guid, reference, data_json, 1 if is_instant else 0, ts, ts),
     )
     row = conn.execute(
         "SELECT id FROM delivery_notes WHERE company_id = ? AND dc_no = ?",
         (company_id, dc_no),
     ).fetchone()
     return int(row["id"]) if row else 0
+
+
+def update_delivery_note_matched_dc(
+    conn: sqlite3.Connection,
+    *,
+    delivery_note_id: int,
+    matched_dc_id: int,
+) -> None:
+    """Immediately persist the matched portal DC ID so it survives a failed sync attempt."""
+    try:
+        conn.execute(
+            "UPDATE delivery_notes SET matched_dc_id = ? WHERE id = ?",
+            (matched_dc_id, delivery_note_id),
+        )
+        conn.commit()
+    except Exception:
+        pass
 
 
 def replace_delivery_note_items(
