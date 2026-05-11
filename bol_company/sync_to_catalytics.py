@@ -13,7 +13,6 @@ from config import config, BASE_DIR
 from db import Database
 from verify_sync import SyncVerifier
 import tally_client
-from fetch_products import parse_stock_item_name
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,7 +86,6 @@ class CatalyticsSyncer:
         self.verify_enabled = config.VERIFY_AFTER_SYNC
         self.tally_url = config.TALLY_URL
         self._filling_station_cache = {}  # name -> id cache
-        self._product_groups_cache = None
 
     @staticmethod
     def _row_get(row, key, default=None):
@@ -560,137 +558,6 @@ class CatalyticsSyncer:
         """Normalize a name for fuzzy comparison: lowercase, collapse whitespace."""
         return ' '.join(str(value or '').lower().split())
 
-    @staticmethod
-    def _coerce_int(value):
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    def _fetch_product_groups(self, force_refresh=False):
-        """Fetch active product groups from Catalytics and cache them for the sync pass."""
-        if self._product_groups_cache is not None and not force_refresh:
-            return self._product_groups_cache
-
-        endpoints = (
-            '/master/product_group?status=1',
-            '/master/product_group',
-        )
-        for endpoint in endpoints:
-            try:
-                response = self._api_request('GET', endpoint)
-                if response.status_code != 200:
-                    continue
-                payload = response.json() or {}
-                groups = payload.get('data') or []
-                if isinstance(groups, list):
-                    self._product_groups_cache = groups
-                    return groups
-            except Exception as exc:
-                logger.warning("Could not fetch product groups from %s: %s", endpoint, exc)
-
-        self._product_groups_cache = []
-        return self._product_groups_cache
-
-    def _build_invoice_product_group_resolver(self, invoice_product_ids):
-        """
-        Mirror backend group resolution:
-        if any invoice product belongs to a product group, treat all members of that
-        group as equivalent to the invoice product ID present on this invoice.
-        """
-        ordered_set = {pid for pid in (self._coerce_int(v) for v in invoice_product_ids) if pid is not None}
-        if not ordered_set:
-            return {}
-
-        resolver = {}
-        for group in self._fetch_product_groups():
-            members = []
-            for member in group.get('products') or []:
-                member_id = None
-                if isinstance(member, dict):
-                    member_id = member.get('id') or member.get('product_id')
-                else:
-                    member_id = member
-                member_id = self._coerce_int(member_id)
-                if member_id is not None:
-                    members.append(member_id)
-
-            matched = ordered_set.intersection(members)
-            if not matched:
-                continue
-
-            target = next(iter(matched))
-            for member_id in members:
-                if member_id not in ordered_set or member_id == target:
-                    resolver[member_id] = target
-
-        return resolver
-
-    def _get_invoice_product_catalytics_id(self, item):
-        """Resolve an invoice item's local product row to its synced Catalytics product ID."""
-        product_name = (item.get('item_name') or '').strip()
-        if not product_name:
-            return None
-
-        product_row = self._get_product_row_by_name(product_name)
-        if not product_row:
-            return None
-        return self._coerce_int(self._row_get(product_row, 'catalytics_id'))
-
-    def _canonical_product_key(self, item, product_obj=None):
-        """
-        Build a grouped product identity key for invoice/DC matching.
-        Preference order:
-        1. Explicit grouped fields already present on the item/product payload
-        2. Parsed fields derived from the raw item/product name
-        3. Normalized raw name as final fallback
-        """
-        item = item or {}
-        product_obj = product_obj if isinstance(product_obj, dict) else {}
-
-        def get_first_non_empty(*values):
-            for value in values:
-                if value is not None and str(value).strip():
-                    return str(value).strip()
-            return ''
-
-        product_master_name = get_first_non_empty(
-            item.get('product_master_name'),
-            product_obj.get('product_master_name'),
-        )
-        variant_name = get_first_non_empty(
-            item.get('variant_name'),
-            product_obj.get('variant_name'),
-        )
-        product_type_code = get_first_non_empty(
-            item.get('product_type_code'),
-            product_obj.get('product_type_code'),
-            product_obj.get('type_code'),
-        )
-
-        raw_name = get_first_non_empty(
-            item.get('item_name'),
-            item.get('product_name'),
-            product_obj.get('stock_item_name'),
-            product_obj.get('name'),
-        )
-
-        if not (product_master_name and variant_name and product_type_code) and raw_name:
-            parsed = parse_stock_item_name(raw_name)
-            if parsed:
-                product_master_name = product_master_name or parsed.get('product_master_name', '')
-                variant_name = variant_name or parsed.get('variant_name', '')
-                product_type_code = product_type_code or parsed.get('product_type_code', '')
-
-        if product_master_name and variant_name and product_type_code:
-            return (
-                self._normalize_name(product_master_name),
-                self._normalize_name(variant_name),
-                self._normalize_name(product_type_code),
-            )
-
-        return self._normalize_name(raw_name)
-
     def _find_matching_instant_dc(self, invoice, items, instant_dcs):
         """
         Match a Tally invoice with an unsynced Instant DC from the portal.
@@ -703,31 +570,13 @@ class CatalyticsSyncer:
         customer_name_norm = self._normalize_name(invoice.get('customer_name'))
         invoice_date = str(invoice.get('voucher_date') or '').replace('-', '').strip()
 
-        invoice_product_ids = []
+        # Build product map for invoice: {normalized_product_name: total_qty}
         invoice_products = {}
         for it in items:
-            product_id = self._get_invoice_product_catalytics_id(it)
-            if product_id is not None:
-                invoice_product_ids.append(product_id)
-            name = self._canonical_product_key(it)
+            name = self._normalize_name(it.get('item_name'))
             qty = float(it.get('quantity') or 0)
             if name and qty > 0:
                 invoice_products[name] = invoice_products.get(name, 0) + qty
-
-        product_group_resolver = self._build_invoice_product_group_resolver(invoice_product_ids)
-
-        if product_group_resolver:
-            invoice_products = {}
-            for it in items:
-                product_id = self._get_invoice_product_catalytics_id(it)
-                key = None
-                if product_id is not None:
-                    key = product_group_resolver.get(product_id, product_id)
-                if key is None:
-                    key = self._canonical_product_key(it)
-                qty = float(it.get('quantity') or 0)
-                if key and qty > 0:
-                    invoice_products[key] = invoice_products.get(key, 0) + qty
 
         if not invoice_products:
             logger.info("  No invoice products to match — skipping instant DC matching")
@@ -793,18 +642,15 @@ class CatalyticsSyncer:
                 logger.info(f"  [DC {dc_id}] Customer mismatch: DC='{dc_customer}', Inv='{customer_name_norm}'")
                 continue
 
-            # 4. Build DC product map from order_details / items using grouped identity
+            # 4. Build DC product map from order_details / items
             dc_items = dc.get('order_details') or dc.get('items') or []
             dc_products = {}
             for it in dc_items:
                 product_obj = it.get('product')
-                name = None
                 if isinstance(product_obj, dict):
-                    product_id = self._coerce_int(product_obj.get('id'))
-                    if product_id is not None:
-                        name = product_group_resolver.get(product_id, product_id)
-                if name is None:
-                    name = self._canonical_product_key(it, product_obj)
+                    name = self._normalize_name(product_obj.get('name'))
+                else:
+                    name = self._normalize_name(it.get('product_name'))
                 qty = float(it.get('quantity') or 0)
                 if name and qty > 0:
                     dc_products[name] = dc_products.get(name, 0) + qty
@@ -2600,14 +2446,6 @@ class CatalyticsSyncer:
 
                 if not customer_name or customer_name == 'UNKNOWN':
                     error_msg = f"Customer name is empty or UNKNOWN for invoice #{voucher_no}"
-                    logger.error(f"[VALIDATION FAILED] {error_msg}")
-                    self.db.mark_invoice_sync_failed(invoice_id, error_msg)
-                    stats['failed'] += 1
-                    continue
-
-                recovered, recover_error = self._ensure_invoice_dependencies_synced(invoice, items)
-                if not recovered:
-                    error_msg = f"Dependency recovery failed for invoice #{voucher_no}: {recover_error}"
                     logger.error(f"[VALIDATION FAILED] {error_msg}")
                     self.db.mark_invoice_sync_failed(invoice_id, error_msg)
                     stats['failed'] += 1
