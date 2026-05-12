@@ -6,8 +6,11 @@ Fetch invoices from multiple Tally companies with enhanced change detection.
 - Filters by config start date (from-date onward) and delivery information
 """
 import logging
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
+import requests
+import psycopg2
 
 from config import config, BASE_DIR
 from db import Database, json_dumps, json_loads, sha256_text
@@ -28,6 +31,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+_VEHICLE_MASTER_CACHE = None
 
 def _attach_invoice_fetch_file_handler():
     """Log invoice fetch operations to a dedicated file."""
@@ -154,45 +158,164 @@ def _invoice_in_date_range(invoice, from_date, to_date):
     return vd >= from_date
 
 
-def _has_delivery_info(invoice):
+def _normalize_vehicle_no(vehicle_no):
+    """Remove spaces/special chars and uppercase for comparison."""
+    return re.sub(r'[^A-Za-z0-9]', '', str(vehicle_no or '')).upper()
+
+
+def _extract_vehicle_no(invoice):
+    """Extract vehicle number from raw voucher fields."""
+    raw = invoice.get('raw_voucher', {}) or {}
+    for key in (
+        'DISPATCHEDTHROUGH',
+        'BASICSHIPPEDBY',
+        'MOTORVEHICLENO',
+        'BASICMOTORVEHICLENO',
+        'GOODSVEHICLENUMBER',
+        'VEHICLENO',
+        'VEHICLE_NO',
+        'VEHICLE_NUMBER',
+        'vehicle_no',
+        'vehicle_number',
+        'vehicle',
+    ):
+        value = raw.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ''
+
+
+def _fetch_vehicle_master_numbers():
+    """Fetch all vehicle numbers from backend (API then PostgreSQL fallback). Cached per process."""
+    global _VEHICLE_MASTER_CACHE
+    if _VEHICLE_MASTER_CACHE is not None:
+        return _VEHICLE_MASTER_CACHE
+
+    base = config.CATALYTICS_API_BASE.rstrip('/')
+    base_headers = {'Content-Type': 'application/json'}
+    normalized_numbers = set()
+
+    # Try API endpoints
+    candidate_bases = [base]
+    if base.endswith('/api'):
+        candidate_bases.append(base[:-4])
+    else:
+        candidate_bases.append(f"{base}/api")
+
+    tried_urls = []
+    for candidate_base in candidate_bases:
+        url = f"{candidate_base.rstrip('/')}/master/vehicle"
+        tried_urls.append(url)
+        header_attempts = [dict(base_headers)]
+        if config.CATALYTICS_API_KEY:
+            auth_headers = dict(base_headers)
+            auth_headers['Authorization'] = f'Bearer {config.CATALYTICS_API_KEY}'
+            header_attempts.append(auth_headers)
+
+        for headers in header_attempts:
+            try:
+                response = requests.get(
+                    url, headers=headers,
+                    params={'limit_start': 0, 'limit_end': 100000}, timeout=30,
+                )
+                response.raise_for_status()
+                payload = response.json() or {}
+                for vehicle in payload.get('data') or []:
+                    normalized = _normalize_vehicle_no((vehicle or {}).get('vehicle_no'))
+                    if normalized:
+                        normalized_numbers.add(normalized)
+                if normalized_numbers:
+                    auth_mode = 'authenticated' if 'Authorization' in headers else 'anonymous'
+                    logger.info(
+                        f"[VEHICLE_API] Loaded {len(normalized_numbers)} vehicle numbers "
+                        f"from {url} via {auth_mode} access"
+                    )
+                    _VEHICLE_MASTER_CACHE = normalized_numbers
+                    return _VEHICLE_MASTER_CACHE
+            except Exception as exc:
+                auth_mode = 'authenticated' if 'Authorization' in headers else 'anonymous'
+                logger.warning(f"[VEHICLE_API] Fetch failed from {url} via {auth_mode}: {exc}")
+
+    # Fallback: query PostgreSQL directly
+    try:
+        conn = psycopg2.connect(
+            host=config.POSTGRES_HOST, port=config.POSTGRES_PORT,
+            database=config.POSTGRES_DB, user=config.POSTGRES_USER,
+            password=config.POSTGRES_PASSWORD,
+        )
+        try:
+            with conn.cursor() as cursor:
+                for query, source_name in [
+                    ('SELECT vehicle_no FROM "master.vehicle" WHERE COALESCE(status, 0) <> 3', '"master.vehicle"'),
+                    ('SELECT vehicle_no FROM master.vehicle WHERE COALESCE(status, 0) <> 3', 'master.vehicle'),
+                ]:
+                    try:
+                        cursor.execute(query)
+                        for (vehicle_no,) in cursor.fetchall():
+                            normalized = _normalize_vehicle_no(vehicle_no)
+                            if normalized:
+                                normalized_numbers.add(normalized)
+                        if normalized_numbers:
+                            logger.info(f"[VEHICLE_DB] Loaded {len(normalized_numbers)} vehicle numbers from {source_name}")
+                            break
+                    except Exception as query_exc:
+                        conn.rollback()
+                        logger.warning(f"[VEHICLE_DB] Query failed for {source_name}: {query_exc}")
+        finally:
+            conn.close()
+
+        if normalized_numbers:
+            _VEHICLE_MASTER_CACHE = normalized_numbers
+            return _VEHICLE_MASTER_CACHE
+    except Exception as exc:
+        logger.warning(f"[VEHICLE_DB] PostgreSQL fetch failed: {exc}")
+
+    logger.warning(f"[VEHICLE_API] No vehicle numbers loaded. Tried: {', '.join(tried_urls)}")
+    _VEHICLE_MASTER_CACHE = set()
+    return _VEHICLE_MASTER_CACHE
+
+
+def _resolve_delivery_reference(invoice):
     """
-    Mandatory check: Other Reference (BASICORDERREF / OTHERREFERENCE) must indicate
-    delivery or customer pickup.
-
-    Accepted values:
-      D / delivery / delivery challan / dispatch  → Delivery type
-      C / customer pickup / pickup / self pickup  → Customer Pickup type
-
-    Returns True only when Other Reference contains one of these values.
-    If the field is empty or has a different value, returns False (invoice skipped).
+    BOL-specific rule to determine challan type:
+    1. Trust Other Reference only when it is exactly "C" or "D"
+    2. If vehicle number is "-" → treat as "D" (Delivery placeholder)
+    3. If vehicle number is a real value → check against Vehicle Master:
+       - Vehicle FOUND in master     → "D" (From Delivery)
+       - Vehicle NOT FOUND in master → "C" (Customer Pickup)
+    4. Both Other Reference AND Vehicle empty → None (SKIP, not a DC)
+    Returns (ref_char_or_None, source_label).
     """
     raw = invoice.get('raw_voucher', {}) or {}
-    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip()
+    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip().lower()
+    if other_ref in {'c', 'd'}:
+        return other_ref, 'other_reference'
 
-    if not other_ref:
-        return False
+    vehicle_no = _extract_vehicle_no(invoice)
+    if vehicle_no == '-':
+        return 'd', 'vehicle_placeholder'
 
-    other_ref_lower = other_ref.lower()
-    other_ref_norm = ' '.join(other_ref_lower.split())
-    other_ref_compact = other_ref_norm.replace(' ', '')
+    vehicle_norm = _normalize_vehicle_no(vehicle_no)
+    if not vehicle_norm:
+        # Both Other Reference and Vehicle are empty → not a delivery invoice
+        return None, 'no_delivery_info'
 
-    # D = Delivery, C = Customer Pickup (exact single-char match)
-    if other_ref_norm == 'd' or other_ref_norm == 'c':
-        return True
+    vehicle_master_numbers = _fetch_vehicle_master_numbers()
+    if vehicle_norm in vehicle_master_numbers:
+        return 'd', 'vehicle_master'
+    if vehicle_master_numbers:
+        return 'c', 'vehicle_not_in_master'
+    return 'c', 'vehicle_lookup_unavailable'
 
-    # Delivery keywords
-    if any(kw in other_ref_norm for kw in ('delivery', 'dispatch')):
-        return True
-    if 'deliverychallan' in other_ref_compact:
-        return True
 
-    # Customer Pickup keywords
-    if any(kw in other_ref_norm for kw in ('customer pickup', 'pickup', 'self pickup')):
-        return True
-    if 'customerpickup' in other_ref_compact:
-        return True
-
-    return False
+def _has_delivery_info(invoice):
+    """
+    BOL-specific: returns True only if invoice has delivery info.
+    Requires either Other Reference (C/D) or a vehicle number (even "-").
+    Returns False if both are empty → invoice is skipped.
+    """
+    delivery_ref, _source = _resolve_delivery_reference(invoice)
+    return delivery_ref is not None
 
 
 def _is_instant_invoice(invoice):
@@ -379,10 +502,33 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             overall_stats['skipped_date'] += 1
             continue
 
+        # Check cancelled invoices
+        raw_voucher = invoice.get('raw_voucher', {}) or {}
+        is_cancelled = False
+        for cancel_key in ('ISCANCELLED', 'VCHSTATUSISCANCELLED', 'ISDELETED', 'VCHSTATUSISDELETED'):
+            if str(raw_voucher.get(cancel_key) or '').strip().lower() in {'yes', 'true', '1'}:
+                is_cancelled = True
+                break
+        if is_cancelled:
+            db.mark_invoices_deleted(company_name, [voucher_no])
+            logger.info(
+                f"[SKIP:CANCELLED] #{voucher_no} | date={voucher_date} | "
+                f"customer='{customer_name}' | reason: voucher is cancelled"
+            )
+            overall_stats.setdefault('skipped_cancelled', 0)
+            overall_stats['skipped_cancelled'] += 1
+            continue
+
+        # Resolve delivery reference using vehicle master matching
+        delivery_ref, delivery_source = _resolve_delivery_reference(invoice)
+        if isinstance(raw_voucher, dict):
+            raw_voucher['BASICORDERREF'] = delivery_ref
+            raw_voucher['OTHERREFERENCE'] = delivery_ref
+            invoice['raw_voucher'] = raw_voucher
+
         if not _has_delivery_info(invoice):
-            raw = invoice.get('raw_voucher', {}) or {}
-            vtype = str(raw.get('VOUCHERTYPENAME') or raw.get('VOUCHERTYPE') or '').strip()
-            other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip()
+            vtype = str(raw_voucher.get('VOUCHERTYPENAME') or raw_voucher.get('VOUCHERTYPE') or '').strip()
+            other_ref = str(raw_voucher.get('BASICORDERREF') or raw_voucher.get('OTHERREFERENCE') or '').strip()
             logger.info(
                 f"[SKIP:NO_DELIVERY] #{voucher_no} | date={voucher_date} | "
                 f"customer='{customer_name}' | voucher_type='{vtype}' | "
@@ -390,6 +536,13 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             )
             overall_stats['skipped_no_delivery'] += 1
             continue
+        else:
+            vehicle_no = _extract_vehicle_no(invoice)
+            logger.info(
+                f"[DELIVERY_CLASSIFIED] #{voucher_no} | date={voucher_date} | "
+                f"customer='{customer_name}' | ref='{delivery_ref}' | "
+                f"source='{delivery_source}' | vehicle='{vehicle_no}'"
+            )
 
         normalized_customer = _normalize_name_key(customer_name)
         ledger_cache_key = f"{company_name}::{normalized_customer}"
@@ -402,22 +555,59 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
 
         ledger_data = ledger_cache[ledger_cache_key]
         if not ledger_data:
-            # Auto-fetch customer from Tally and save to SQLite
-            logger.info(
-                f"[AUTO-FETCH:CUSTOMER] #{voucher_no} | customer='{customer_name}' "
-                f"not in SQLite — fetching from Tally..."
-            )
-            fetched = _auto_fetch_customer(db, tally, company_name, customer_name)
-            if fetched:
-                ledger_cache[ledger_cache_key] = fetched
-                ledger_data = fetched
+            # Extract customer data from the invoice voucher itself (no extra Tally call)
+            raw = invoice.get('raw_voucher', {}) or {}
+            _cust_gstin = (raw.get('PARTYGSTIN') or raw.get('CONSIGNEEGSTIN') or '').strip().lstrip(':')
+            _cust_pan = (raw.get('BUYERPINNUMBER') or raw.get('INCOMETAXNUMBER') or '').strip()
+            _cust_state = (raw.get('STATENAME') or raw.get('CONSIGNEESTATENAME') or '').strip()
+            _cust_pincode = (raw.get('PARTYPINCODE') or raw.get('CONSIGNEEPINCODE') or '').strip()
+            _cust_phone = ''
+            _cust_email = ''
+            _cust_address = ''
+            _addr_lines = raw.get('ADDRESSES') or []
+            if isinstance(_addr_lines, list):
+                _addr_parts = []
+                for _aline in _addr_lines:
+                    _astr = str(_aline).strip()
+                    if _astr.lower().startswith('phone:') or _astr.lower().startswith('mobile:'):
+                        _cust_phone = _astr.split(':', 1)[1].strip()
+                    elif _astr.lower().startswith('email:'):
+                        _cust_email = _astr.split(':', 1)[1].strip()
+                    else:
+                        _addr_parts.append(_astr)
+                _cust_address = ', '.join(_addr_parts)
+
+            _cust_data = {
+                'tally_guid': '',
+                'name': customer_name,
+                'tally_company': company_name,
+                'gstin': _cust_gstin,
+                'pan': _cust_pan,
+                'address': _cust_address,
+                'state': _cust_state,
+                'city': '',
+                'pincode': _cust_pincode,
+                'phone': _cust_phone,
+                'email': _cust_email,
+                'data_json': json_dumps({
+                    'NAME': customer_name, 'PARTYGSTIN': _cust_gstin,
+                    'INCOMETAXNUMBER': _cust_pan, 'STATE': _cust_state,
+                    'PINCODE': _cust_pincode, 'MOBILE': _cust_phone,
+                    'EMAIL': _cust_email, '_source': 'dc_voucher',
+                }),
+            }
+            try:
+                db.insert_customer(_cust_data)
+                ledger_data = json_loads(_cust_data['data_json'])
+                ledger_cache[ledger_cache_key] = ledger_data
                 overall_stats.setdefault('auto_fetched_customers', 0)
                 overall_stats['auto_fetched_customers'] += 1
-            else:
-                logger.warning(
-                    f"[SKIP:MISSING_CUSTOMER] #{voucher_no} | date={voucher_date} | "
-                    f"customer='{customer_name}' | reason: not found in SQLite or Tally"
+                logger.info(
+                    f"[DC-DRIVEN:CUSTOMER] #{voucher_no} | '{customer_name}' "
+                    f"created from voucher data (GSTIN: {_cust_gstin or 'N/A'})"
                 )
+            except Exception as exc:
+                logger.error(f"[DC-DRIVEN] Failed to create customer '{customer_name}': {exc}")
                 overall_stats['skipped_missing_customer'] += 1
                 continue
 
@@ -440,33 +630,74 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             else:
                 missing_products.append(item_name)
 
-        # Auto-fetch missing products from Tally
+        # Create missing products from invoice voucher data (no extra Tally call)
         if missing_products:
-            still_missing = []
+            raw = invoice.get('raw_voucher', {}) or {}
             for mp_name in missing_products:
-                logger.info(
-                    f"[AUTO-FETCH:PRODUCT] #{voucher_no} | product='{mp_name}' "
-                    f"not in SQLite — fetching from Tally..."
-                )
-                fetched = _auto_fetch_product(db, tally, company_name, mp_name)
-                if fetched:
+                # Find the inventory line for this product to get HSN/rate
+                _hsn = ''
+                _rate = 0.0
+                for _inv_item in (raw.get('INVENTORY') or []):
+                    if ((_inv_item.get('STOCKITEMNAME') or _inv_item.get('ITEMNAME') or '').strip() == mp_name):
+                        _hsn = (_inv_item.get('GSTHSNNAME') or '').strip()
+                        try:
+                            _rate_str = (_inv_item.get('RATE') or '').strip()
+                            if '/' in _rate_str:
+                                _rate_str = _rate_str.split('/')[0].strip()
+                            _rate = float(_rate_str.split()[0]) if _rate_str else 0.0
+                        except (ValueError, IndexError):
+                            _rate = 0.0
+                        break
+
+                parsed = parse_stock_item_name(mp_name)
+                if not parsed:
+                    parsed = {
+                        'product_master_name': mp_name,
+                        'unit_name': canonical_unit_name('cubic'),
+                        'variant_name': '7',
+                        'product_type_code': 'CYL',
+                        'product_type_name': 'CYLINDER',
+                        'canonical_name': f'{mp_name} (CYL)',
+                    }
+
+                _prod_data = {
+                    'tally_guid': '',
+                    'name': mp_name,
+                    'name_canonical': parsed['canonical_name'],
+                    'tally_company': company_name,
+                    'hsn_code': _hsn,
+                    'unit': parsed.get('unit_name', ''),
+                    'rate': _rate,
+                    'description': '',
+                    'data_json': json_dumps({
+                        'NAME': mp_name, 'HSNCODE': _hsn,
+                        '_source': 'dc_voucher', '_dc_no': voucher_no,
+                    }),
+                    'product_master_name': parsed['product_master_name'],
+                    'variant_name': parsed['variant_name'],
+                    'unit_name': parsed['unit_name'],
+                    'product_type_code': parsed['product_type_code'],
+                    'product_type_name': parsed['product_type_name'],
+                    'gst_applicable': '',
+                    'gst_rate': 0.0,
+                    'igst_rate': 0.0,
+                    'cgst_rate': 0.0,
+                    'sgst_rate': 0.0,
+                }
+                try:
+                    db.insert_product(_prod_data)
                     normalized_mp = _normalize_name_key(mp_name)
                     cache_key = f"{company_name}::{normalized_mp}"
-                    stock_cache[cache_key] = fetched
-                    stock_items_map[mp_name] = fetched
+                    stock_cache[cache_key] = json_loads(_prod_data['data_json'])
+                    stock_items_map[mp_name] = stock_cache[cache_key]
                     overall_stats.setdefault('auto_fetched_products', 0)
                     overall_stats['auto_fetched_products'] += 1
-                else:
-                    still_missing.append(mp_name)
-
-            if still_missing:
-                logger.warning(
-                    f"[SKIP:MISSING_PRODUCT] #{voucher_no} | date={voucher_date} | "
-                    f"customer='{customer_name}' | missing {len(still_missing)} product(s) "
-                    f"(not found in SQLite or Tally): {still_missing}"
-                )
-                overall_stats['skipped_missing_product'] += 1
-                continue
+                    logger.info(
+                        f"[DC-DRIVEN:PRODUCT] #{voucher_no} | '{mp_name}' "
+                        f"created from voucher data (HSN: {_hsn or 'N/A'})"
+                    )
+                except Exception as exc:
+                    logger.error(f"[DC-DRIVEN] Failed to create product '{mp_name}': {exc}")
 
         try:
             full_voucher_payload = _build_full_voucher_payload(invoice)
@@ -557,25 +788,18 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
 
 
 def fetch_invoices_from_all_companies(from_date=None, to_date=None):
-    """Fetch invoices from all active Tally companies in monthly batches."""
+    """Fetch invoices from all active Tally companies. Always uses yesterday-tomorrow window."""
     try:
         config.reload_from_env()
     except AttributeError:
         pass
 
-    # If no dates provided, use Day Book logic (Yesterday to Tomorrow) as requested
-    if not from_date and not to_date:
-        today_dt = datetime.now()
-        from_date = (today_dt - timedelta(days=1)).strftime('%Y%m%d')
-        to_date = (today_dt + timedelta(days=1)).strftime('%Y%m%d')
-        logger.info(f"Using Day Book fetch logic (Reference: {today_dt.strftime('%Y%m%d')})")
-        logger.info(f" -> From Date: {from_date} (Yesterday)")
-        logger.info(f" -> To Date:   {to_date} (Tomorrow)")
-    else:
-        if not from_date:
-            from_date = config.INVOICE_FETCH_START_DATE or datetime.now().strftime('%Y%m%d')
-        if not to_date:
-            to_date = '20991231'
+    today_dt = datetime.now()
+    from_date = (today_dt - timedelta(days=1)).strftime('%Y%m%d')
+    to_date = (today_dt + timedelta(days=1)).strftime('%Y%m%d')
+    logger.info(f"Day Book fetch (Reference: {today_dt.strftime('%Y%m%d')})")
+    logger.info(f" -> From Date: {from_date} (Yesterday)")
+    logger.info(f" -> To Date:   {to_date} (Tomorrow)")
 
     db = Database(config.SQLITE_DB_PATH)
     tally = TallyClient(config.TALLY_URL)
