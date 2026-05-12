@@ -378,7 +378,9 @@ class CatalyticsSyncer:
     @staticmethod
     def _build_variant_name(base_name, size):
         base = ' '.join(str(base_name or '').replace('=', ' ').split())
-        return f"{base} {int(size)}cum (CYL)"
+        base_l = base.lower()
+        unit = 'kg' if 'co2' in base_l else 'cum'
+        return f"{base} {int(size)}{unit} (CYL)"
 
     def _expand_inventory_by_description(self, inventory):
         """
