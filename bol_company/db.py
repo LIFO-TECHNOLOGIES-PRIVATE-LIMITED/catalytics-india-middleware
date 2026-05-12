@@ -467,30 +467,47 @@ class Database:
         ))
 
     def update_customer(self, customer_id, customer_data):
-        """Update existing customer by id with fresh data and mark for re-sync."""
-        self.execute("""
-            UPDATE customers
-            SET name = ?, tally_company = ?,
-                gstin = ?, pan = ?,
-                address = ?, state = ?, city = ?, pincode = ?,
-                phone = ?, email = ?, data_json = ?,
-                is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
-                last_updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (
-            customer_data.get('name'),
-            customer_data.get('tally_company'),
-            customer_data.get('gstin'),
-            customer_data.get('pan'),
-            customer_data.get('address'),
-            customer_data.get('state'),
-            customer_data.get('city'),
-            customer_data.get('pincode'),
-            customer_data.get('phone'),
-            customer_data.get('email'),
-            customer_data.get('data_json'),
-            customer_id,
-        ))
+        """Update existing customer. Only resets is_synced=0 if data actually changed."""
+        row = self.query("SELECT name, gstin, pan, address, phone, email FROM customers WHERE id = ?", (customer_id,))
+        existing = dict(row) if row else None
+        data_changed = not existing or any([
+            (existing.get('name') or '') != (customer_data.get('name') or ''),
+            (existing.get('gstin') or '') != (customer_data.get('gstin') or ''),
+            (existing.get('pan') or '') != (customer_data.get('pan') or ''),
+            (existing.get('address') or '') != (customer_data.get('address') or ''),
+            (existing.get('phone') or '') != (customer_data.get('phone') or ''),
+            (existing.get('email') or '') != (customer_data.get('email') or ''),
+        ])
+
+        if data_changed:
+            self.execute("""
+                UPDATE customers
+                SET name = ?, tally_company = ?,
+                    gstin = ?, pan = ?,
+                    address = ?, state = ?, city = ?, pincode = ?,
+                    phone = ?, email = ?, data_json = ?,
+                    is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
+                    last_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (
+                customer_data.get('name'),
+                customer_data.get('tally_company'),
+                customer_data.get('gstin'),
+                customer_data.get('pan'),
+                customer_data.get('address'),
+                customer_data.get('state'),
+                customer_data.get('city'),
+                customer_data.get('pincode'),
+                customer_data.get('phone'),
+                customer_data.get('email'),
+                customer_data.get('data_json'),
+                customer_id,
+            ))
+        else:
+            # Data unchanged — just update timestamp, keep is_synced as-is
+            self.execute("""
+                UPDATE customers SET last_updated_at = CURRENT_TIMESTAMP WHERE id = ?
+            """, (customer_id,))
 
     def get_unsynced_customers(self):
         """Get all customers that haven't been synced."""
@@ -569,7 +586,22 @@ class Database:
         ))
 
     def update_product(self, product_id, product_data):
-        """Update existing product by id with fresh data and mark for re-sync."""
+        """Update existing product. Only resets is_synced=0 if data actually changed."""
+        row = self.query("SELECT name, hsn_code, gst_rate, igst_rate, cgst_rate, sgst_rate FROM products WHERE id = ?", (product_id,))
+        existing = dict(row) if row else None
+        data_changed = not existing or any([
+            (existing.get('name') or '') != (product_data.get('name') or ''),
+            (existing.get('hsn_code') or '') != (product_data.get('hsn_code') or ''),
+            float(existing.get('gst_rate') or 0) != float(product_data.get('gst_rate') or 0),
+            float(existing.get('igst_rate') or 0) != float(product_data.get('igst_rate') or 0),
+            float(existing.get('cgst_rate') or 0) != float(product_data.get('cgst_rate') or 0),
+            float(existing.get('sgst_rate') or 0) != float(product_data.get('sgst_rate') or 0),
+        ])
+
+        if not data_changed:
+            self.execute("UPDATE products SET last_updated_at = CURRENT_TIMESTAMP WHERE id = ?", (product_id,))
+            return
+
         self.execute("""
             UPDATE products
             SET name = ?, name_canonical = ?, tally_company = ?,

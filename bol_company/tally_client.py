@@ -1537,9 +1537,40 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
     from xml.sax.saxutils import escape as xml_escape
     safe_company = xml_escape(company_name)
     
-    # Use standard Data Book report export which is highly optimized in Tally Prime
-    # for large date ranges and high-volume databases like BOL's.
+    # Use Day Book report with VOUCHERTYPENAME filter for reliable date filtering.
+    # Without VOUCHERTYPENAME, Tally may ignore SVFROMDATE/SVTODATE for Sales
+    # invoices in old financial year companies.
     xml = f"""
+<ENVELOPE>
+  <HEADER>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+  </HEADER>
+  <BODY>
+    <EXPORTDATA>
+      <REQUESTDESC>
+        <STATICVARIABLES>
+          <SVCURRENTCOMPANY>{safe_company}</SVCURRENTCOMPANY>
+          <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+          <SVFROMDATE>{from_date}</SVFROMDATE>
+          <SVTODATE>{to_date}</SVTODATE>
+          <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+        </STATICVARIABLES>
+        <REPORTNAME>Day Book</REPORTNAME>
+      </REQUESTDESC>
+    </EXPORTDATA>
+  </BODY>
+</ENVELOPE>
+"""
+    try:
+        # Long timeout (5m) for massive XML exports from BOL Tally
+        resp = send_request(xml, url, timeout=300)
+        raw_vouchers = parse_delivery_notes(resp)
+        logger.info("[get_sales_invoices] Company='%s' got %d vouchers (VOUCHERTYPENAME=Sales)", company_name, len(raw_vouchers))
+
+        # Fallback: if Sales type filter returned 0, retry without type filter
+        if not raw_vouchers:
+            logger.info("[get_sales_invoices] No vouchers with VOUCHERTYPENAME=Sales — retrying without type filter")
+            fallback_xml = f"""
 <ENVELOPE>
   <HEADER>
     <TALLYREQUEST>Export Data</TALLYREQUEST>
@@ -1559,12 +1590,10 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
   </BODY>
 </ENVELOPE>
 """
-    try:
-        # Long timeout (5m) for massive XML exports from BOL Tally
-        resp = send_request(xml, url, timeout=300)
-        raw_vouchers = parse_delivery_notes(resp)
-        logger.info("[get_sales_invoices] Company='%s' got %d total vouchers from Tally report", company_name, len(raw_vouchers))
-        
+            resp = send_request(fallback_xml, url, timeout=300)
+            raw_vouchers = parse_delivery_notes(resp)
+            logger.info("[get_sales_invoices] Fallback got %d total vouchers", len(raw_vouchers))
+
         normalized = []
         for v in raw_vouchers:
             # Filter: only Sales voucher type (and sales under group)

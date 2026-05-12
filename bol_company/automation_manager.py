@@ -43,16 +43,15 @@ class DashboardLogHandler(logging.Handler):
         if self.buffer:
             self.buffer.write(msg + '\n')
 
-# Default intervals (in seconds) - Read from config
+# Default intervals (in seconds)
+import os as _os
+_fetch_sync_interval = max(1, int(_os.getenv('FETCH_SYNC_INTERVAL_SECONDS', '10')))
 DEFAULT_INTERVALS = {
-    'fetch_master': config.FETCH_MASTER_INTERVAL_MINUTES * 60,  # minutes -> seconds
-    'fetch_invoices': config.FETCH_INVOICES_INTERVAL_MINUTES * 60,
-    'sync': config.SYNC_INVOICES_INTERVAL_SECONDS,
-    'sync_master': config.SYNC_MASTER_INTERVAL_MINUTES * 60
+    'fetch_master': 86400,  # daily (controlled by MASTER_SYNC_TIME)
+    'fetch_invoices': _fetch_sync_interval,
+    'sync': _fetch_sync_interval,
+    'sync_master': 86400,  # daily (controlled by MASTER_SYNC_TIME)
 }
-
-# Debug: Log the DEFAULT_INTERVALS on module load
-print(f"[DEBUG] automation_manager.py loaded with DEFAULT_INTERVALS: {DEFAULT_INTERVALS}")
 
 
 class AutomationManager:
@@ -426,16 +425,20 @@ class AutomationManager:
 
     def _invoice_fetch_sync_loop(self):
         """
-        Combined invoice fetch + sync loop — runs every 20 seconds.
-        1. Fetch invoices from Tally Day Book (auto-fetches missing customers/products)
-        2. Sync unsynced invoices to Catalytics (batch)
+        Combined invoice fetch + sync loop (same pattern as CO middleware).
+        1. Fetch invoices from Tally Day Book
+        2. Sync any unsynced customers to Catalytics (auto-created by fetch)
+        3. Sync any unsynced products to Catalytics (auto-created by fetch)
+        4. Sync unsynced invoices/DCs to Catalytics (batch)
+        Runs every FETCH_SYNC_INTERVAL_SECONDS (default 10s).
         """
         from fetch_invoices import fetch_invoices_from_all_companies
         from sync_to_catalytics import CatalyticsSyncer
 
         task = 'sync'
         syncer = CatalyticsSyncer()
-        interval = 20  # Fixed 20 seconds
+        import os
+        interval = max(1, int(os.getenv('FETCH_SYNC_INTERVAL_SECONDS', '10')))
 
         while not self.stop_flags[task].is_set():
             try:
@@ -454,17 +457,40 @@ class AutomationManager:
                     if not self._try_acquire_global('sync'):
                         self.stop_flags[task].wait(timeout=interval)
                         continue
-                    logger.info(f"Running invoice fetch + sync...")
+
+                    self._log_to_dashboard(f"=== AUTO: INVOICE FETCH + SYNC STARTED ===")
 
                     # Step 1: Fetch invoices from Tally Day Book
-                    self._log_to_dashboard(f"=== AUTO: INVOICE FETCH + SYNC STARTED ===")
                     fetch_ok, _ = self._run_with_log_capture(fetch_invoices_from_all_companies)
 
-                    # Step 2: Sync unsynced invoices to Catalytics
+                    # Step 2: Sync any unsynced customers (auto-created by invoice fetch)
+                    cust_synced = 0
+                    try:
+                        cust_result = syncer.sync_customers()
+                        cust_synced = cust_result.get('synced', 0)
+                        if cust_synced > 0:
+                            logger.info(f"Customers synced: ok={cust_synced}, failed={cust_result.get('failed', 0)}")
+                    except Exception as e:
+                        logger.error(f"Customer sync failed: {e}", exc_info=True)
+
+                    # Step 3: Sync any unsynced products (auto-created by invoice fetch)
+                    prod_synced = 0
+                    try:
+                        prod_result = syncer.sync_products()
+                        prod_synced = prod_result.get('synced', 0)
+                        if prod_synced > 0:
+                            logger.info(f"Products synced: ok={prod_synced}, failed={prod_result.get('failed', 0)}")
+                    except Exception as e:
+                        logger.error(f"Product sync failed: {e}", exc_info=True)
+
+                    # Step 4: Sync unsynced invoices/DCs to Catalytics
                     sync_ok, _ = self._run_with_log_capture(syncer.sync_invoices_to_dc)
 
                     if fetch_ok and sync_ok:
-                        self._log_to_dashboard(f"=== AUTO: INVOICE FETCH + SYNC COMPLETED ===")
+                        self._log_to_dashboard(
+                            f"=== AUTO: FETCH+SYNC COMPLETED "
+                            f"(cust={cust_synced} prod={prod_synced}) ==="
+                        )
                     else:
                         self._log_to_dashboard(f"=== AUTO: INVOICE FETCH + SYNC FAILED ===")
 
@@ -473,12 +499,10 @@ class AutomationManager:
                         self.state['last_runs']['fetch_invoices'] = datetime.now().isoformat()
                         self._save_state()
 
-                    logger.info(f"Invoice fetch + sync completed")
                 finally:
                     self._release_global()
                     self._running_tasks[task].release()
 
-                # Wait 20 seconds
                 self.stop_flags[task].wait(timeout=interval)
 
             except Exception as e:

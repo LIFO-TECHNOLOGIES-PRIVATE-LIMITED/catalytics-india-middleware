@@ -288,10 +288,114 @@ class CatalyticsSyncer:
         except Exception as e:
             logger.error(f"Error marking Instant DC {dc_pk} as synced: {e}")
 
+    _product_group_cache = None
+
     @staticmethod
     def _normalize_name(value):
         """Normalize a name for fuzzy comparison: lowercase, collapse whitespace."""
         return ' '.join(str(value or '').lower().split())
+
+    def _fetch_product_groups(self):
+        """Fetch product groups with product names from PostgreSQL. Cached per process."""
+        if CatalyticsSyncer._product_group_cache is not None:
+            return CatalyticsSyncer._product_group_cache
+
+        groups = []
+        try:
+            import psycopg2
+            conn = psycopg2.connect(
+                host=config.POSTGRES_HOST, port=config.POSTGRES_PORT,
+                database=config.POSTGRES_DB, user=config.POSTGRES_USER,
+                password=config.POSTGRES_PASSWORD,
+            )
+            try:
+                with conn.cursor() as cursor:
+                    # Get all active product groups with their product IDs
+                    for table in ['"master.product_group"', 'master.product_group']:
+                        try:
+                            cursor.execute(f'SELECT id, name, products FROM {table} WHERE COALESCE(status, 0) <> 3')
+                            pg_rows = cursor.fetchall()
+                            break
+                        except Exception:
+                            conn.rollback()
+                            continue
+                    else:
+                        pg_rows = []
+
+                    # For each group, resolve product IDs to names
+                    for pg_id, pg_name, product_ids in pg_rows:
+                        if not product_ids:
+                            continue
+                        # product_ids is a JSON list of ints
+                        ids = [int(pid) if isinstance(pid, (int, float)) else int(pid.get('id', pid) if isinstance(pid, dict) else pid) for pid in product_ids]
+                        if not ids:
+                            continue
+                        placeholders = ','.join(['%s'] * len(ids))
+                        for prod_table in ['"master.product"', 'master.product']:
+                            try:
+                                cursor.execute(f'SELECT id, name FROM {prod_table} WHERE id IN ({placeholders})', ids)
+                                product_names = {self._normalize_name(row[1]) for row in cursor.fetchall() if row[1]}
+                                if product_names:
+                                    groups.append(product_names)
+                                    logger.info(f"[PRODUCT_GROUP] '{pg_name}': {len(product_names)} products")
+                                break
+                            except Exception:
+                                conn.rollback()
+                                continue
+            finally:
+                conn.close()
+
+            logger.info(f"[PRODUCT_GROUP] Loaded {len(groups)} product groups from PostgreSQL")
+        except Exception as exc:
+            logger.warning(f"[PRODUCT_GROUP] Failed to load product groups: {exc}")
+
+        CatalyticsSyncer._product_group_cache = groups
+        return groups
+
+    def _products_match_with_groups(self, invoice_products, dc_products):
+        """
+        Check if invoice products match DC products, considering product groups.
+        Products in the same group are treated as equivalent.
+        Returns True if all products match (with group substitution) and quantities match.
+        """
+        # First try exact match (fast path)
+        if set(invoice_products.keys()) == set(dc_products.keys()):
+            if all(dc_products.get(name) == qty for name, qty in invoice_products.items()):
+                return True
+
+        # Load product groups for group-aware matching
+        groups = self._fetch_product_groups()
+        if not groups:
+            return False  # No groups loaded, exact match already failed
+
+        # Build a resolver: normalized_product_name → group_index
+        name_to_group = {}
+        for idx, group_names in enumerate(groups):
+            for name in group_names:
+                name_to_group[name] = idx
+
+        # Resolve invoice products to group IDs (or keep original name if no group)
+        def _resolve(product_name):
+            group_idx = name_to_group.get(product_name)
+            if group_idx is not None:
+                return f"__group_{group_idx}"
+            return product_name
+
+        # Build resolved maps
+        resolved_invoice = {}
+        for name, qty in invoice_products.items():
+            key = _resolve(name)
+            resolved_invoice[key] = resolved_invoice.get(key, 0) + qty
+
+        resolved_dc = {}
+        for name, qty in dc_products.items():
+            key = _resolve(name)
+            resolved_dc[key] = resolved_dc.get(key, 0) + qty
+
+        # Compare resolved maps
+        if set(resolved_invoice.keys()) != set(resolved_dc.keys()):
+            return False
+        return all(resolved_dc.get(key) == qty for key, qty in resolved_invoice.items())
 
     def _find_matching_instant_dc(self, invoice, items, instant_dcs):
         """
@@ -390,25 +494,14 @@ class CatalyticsSyncer:
                 if name and qty > 0:
                     dc_products[name] = dc_products.get(name, 0) + qty
 
-            # 5. Compare product counts
-            if len(dc_products) != len(invoice_products):
+            # 5. Compare products + quantities (with product group support)
+            matched = self._products_match_with_groups(invoice_products, dc_products)
+            if not matched:
                 logger.info(
-                    f"  [DC {dc_id}] Product count mismatch: "
-                    f"DC has {len(dc_products)} {list(dc_products.keys())}, "
-                    f"Inv has {len(invoice_products)} {list(invoice_products.keys())}"
+                    f"  [DC {dc_id}] Product mismatch (even with groups): "
+                    f"DC={dc_products}, Inv={invoice_products}"
                 )
                 continue
-
-            # 6. Compare each product + quantity
-            matched = True
-            for name, qty in invoice_products.items():
-                if dc_products.get(name) != qty:
-                    logger.info(
-                        f"  [DC {dc_id}] Product/Qty mismatch for '{name}': "
-                        f"DC={dc_products.get(name)}, Inv={qty}"
-                    )
-                    matched = False
-                    break
 
             if matched:
                 logger.info(f"  [DC {dc_id}] MATCH FOUND: dc_no={dc.get('dc_no')}")
@@ -1848,10 +1941,6 @@ class CatalyticsSyncer:
             logger.info("No invoices to sync")
             return {'total': 0, 'synced': 0, 'verified': 0, 'failed': 0}
 
-        # Fetch unsynced instant DCs from portal to attempt matching with incoming Tally invoices
-        instant_dcs = self._fetch_unsynced_instant_dcs()
-        logger.info(f"Retrieved {len(instant_dcs)} unsynced Instant DCs from portal for matching")
-
         stats = {
             'total': len(invoices),
             'synced': 0,
@@ -1872,7 +1961,6 @@ class CatalyticsSyncer:
             all_ledgers = {}
             all_stock_items = {}
 
-            # Step 1: Build the batch payload from valid invoices.
             for invoice_row in batch:
                 invoice = dict(invoice_row)
                 invoice_id = invoice['id']
@@ -1880,52 +1968,12 @@ class CatalyticsSyncer:
                 company = invoice.get('tally_company', '')
 
                 try:
-                    import json as json_lib
-                    items = json_lib.loads(items_json) if isinstance(items_json, str) else (items_json or [])
-                except:
+                    items_json = invoice.get('items_json')
+                    items = json.loads(items_json) if isinstance(items_json, str) else (items_json or [])
+                except Exception:
                     items = []
 
-                # INSTANT INVOICE MATCHING LOGIC
-                # 1. Check if we already have a matched DC ID stored in local DB
-                matched_dc_id = invoice.get('catalytics_dc_id')
-                matched_dc = None
-                
-                if not matched_dc_id:
-                    logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
-                    matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
-                    if matched_dc:
-                        matched_dc_id = matched_dc.get('id')
-                        logger.info(f"✓ Found potential match: DC {matched_dc['dc_no']} (ID: {matched_dc_id})")
-                        # Update local info immediately so we don't lose the link
-                        self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
-                        # Update memory dict for the rest of the loop
-                        invoice['catalytics_dc_id'] = matched_dc_id
-                        invoice['dc_no'] = matched_dc['dc_no']
-                        # Remove from batch list to avoid double matching
-                        instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
-                else:
-                    logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
-
-                # Proceed with sync (always building full payload)
-
-                    if not matched_dc_id:
-                        logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
-                        matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
-                        if matched_dc:
-                            matched_dc_id = matched_dc.get('id')
-                            logger.info(f"Found potential match: DC {matched_dc['dc_no']} (ID: {matched_dc_id})")
-                            # Update local info immediately so we don't lose the link
-                            self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
-                            # Update memory dict for the rest of the loop
-                            invoice['catalytics_dc_id'] = matched_dc_id
-                            invoice['dc_no'] = matched_dc['dc_no']
-                            # Remove from batch list to avoid double matching
-                            instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
-                    else:
-                        logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
-
-                    # Proceed with sync (always building full payload)
-
+                try:
                     # Validate customer and products exist before syncing
                     is_valid, validation_error = self._validate_invoice_for_sync(invoice, items)
                     if not is_valid:
@@ -1952,31 +2000,12 @@ class CatalyticsSyncer:
                     if prep_error or not voucher_payload:
                         raise ValueError(prep_error or f"Could not prepare payload for invoice #{voucher_no}")
 
-                    if matched_dc_id:
-                        voucher_payload['MATCHED_DC_ID'] = matched_dc_id
-                        logger.info(f"Adding MATCHED_DC_ID={matched_dc_id} to Tally payload")
-
                     all_ledgers.update(ledgers_map)
                     all_stock_items.update(stock_items_map)
                     batch_vouchers.append(voucher_payload)
                     batch_invoices.append(invoice)
 
-                    per_invoice_payload = {
-                        'entity_id': self.entity_id,
-                        'company_name': company,
-                        'voucher': voucher_payload,
-                        'ledgers': ledgers_map,
-                        'stock_items': stock_items_map,
-                        'allow_tally_fetch': False,
-                        'created_by': config.DEFAULT_ADMIN_USER_ID,
-                    }
-                    try:
-                        self.db.execute(
-                            'UPDATE invoices SET sync_request_json = ? WHERE id = ?',
-                            (json.dumps(per_invoice_payload), invoice_id)
-                        )
-                    except Exception as exc:
-                        logger.error(f"Failed to save sync request for invoice #{voucher_no}: {exc}")
+                    logger.info(f"[PREPARED] Invoice #{voucher_no} ready for sync")
 
                 except Exception as exc:
                     logger.error(f"Error preparing invoice #{voucher_no}: {exc}", exc_info=True)
