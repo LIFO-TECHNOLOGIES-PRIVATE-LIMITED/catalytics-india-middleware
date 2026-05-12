@@ -353,6 +353,99 @@ class CatalyticsSyncer:
         s = str(value or '').replace('=', ' ').strip().lower()
         return ' '.join(s.split())
 
+    @staticmethod
+    def _parse_variant_token(token):
+        """Parse token like '3X30' into (qty, size)."""
+        import re
+        m = re.match(r'^\s*(\d+)\s*[xX]\s*(\d+)\s*$', str(token or ''))
+        if not m:
+            return None
+        return int(m.group(1)), int(m.group(2))
+
+    @staticmethod
+    def _parse_amount(value):
+        """Parse Tally numeric fields safely."""
+        try:
+            s = str(value or '').replace(',', '').strip()
+            if '/' in s:
+                s = s.split('/')[0].strip()
+            if s:
+                s = s.split()[0]
+            return float(s)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _build_variant_name(base_name, size):
+        base = ' '.join(str(base_name or '').replace('=', ' ').split())
+        return f"{base} {int(size)}cum (CYL)"
+
+    def _expand_inventory_by_description(self, inventory):
+        """
+        Expand inventory lines using BASICUSERDESCRIPTION when present.
+        Supports:
+        - '10' -> single variant inferred from ACTUALQTY / count
+        - '3X30,2X30' -> explicit multi-variant split
+        """
+        expanded = []
+        for line in (inventory or []):
+            if not isinstance(line, dict):
+                expanded.append(line)
+                continue
+
+            desc = str(line.get('BASICUSERDESCRIPTION') or '').strip()
+            if not desc:
+                expanded.append(line)
+                continue
+
+            tokens = [t.strip() for t in desc.split(',') if t.strip()]
+            if not tokens:
+                expanded.append(line)
+                continue
+
+            amount = self._parse_amount(line.get('AMOUNT'))
+            rate = self._parse_amount(line.get('RATE'))
+            qty_total = self._parse_amount(line.get('ACTUALQTY'))
+            orig_name = (line.get('STOCKITEMNAME') or line.get('ITEMNAME') or '').strip()
+
+            variants = []
+            if all(self._parse_variant_token(t) is not None for t in tokens):
+                variants = [self._parse_variant_token(t) for t in tokens]
+            elif len(tokens) == 1 and tokens[0].isdigit():
+                count = int(tokens[0])
+                if count > 0 and qty_total > 0:
+                    size_f = qty_total / count
+                    size_i = int(size_f)
+                    if abs(size_f - size_i) < 0.001:
+                        variants = [(count, size_i)]
+            elif tokens and tokens[0].isdigit() and len(tokens) > 1:
+                tail = tokens[1:]
+                if all(self._parse_variant_token(t) is not None for t in tail):
+                    variants = [self._parse_variant_token(t) for t in tail]
+
+            if not variants:
+                expanded.append(line)
+                continue
+
+            total_cyls = sum(q for q, _ in variants)
+            if total_cyls <= 0:
+                expanded.append(line)
+                continue
+
+            rate_per_cyl = (amount / total_cyls) if amount else rate
+            for qty, size in variants:
+                new_line = dict(line)
+                variant_name = self._build_variant_name(orig_name, size)
+                line_amount = round(rate_per_cyl * qty, 2)
+                new_line['STOCKITEMNAME'] = variant_name
+                new_line['ACTUALQTY'] = str(float(qty))
+                new_line['BILLEDQTY'] = str(float(qty))
+                new_line['RATE'] = str(round(rate_per_cyl, 2))
+                new_line['AMOUNT'] = str(line_amount)
+                expanded.append(new_line)
+
+        return expanded
+
     def _find_matching_instant_dc(self, invoice, items, instant_dcs):
         """
         Match a Tally invoice with an unsynced Instant DC from the portal.
@@ -1815,6 +1908,12 @@ class CatalyticsSyncer:
         if invoice.get('delivery_address') and not voucher.get('CONSIGNEE'):
             voucher['CONSIGNEE'] = {'ADDRESS': invoice.get('delivery_address')}
 
+        # Apply sync-time description expansion so payload is resilient even when
+        # fetch-time expansion/normalization was skipped for an old invoice row.
+        voucher_inventory = voucher.get('INVENTORY') or []
+        if isinstance(voucher_inventory, list) and voucher_inventory:
+            voucher['INVENTORY'] = self._expand_inventory_by_description(voucher_inventory)
+
         # Extract ledger and stock data that were embedded during fetch
         ledgers_map = {}
         stock_items_map = {}
@@ -1847,10 +1946,16 @@ class CatalyticsSyncer:
                     or item.get('ITEMNAME')
                     or ''
                 ).strip()
-                if not item_name or item_name in stock_items_map:
+                if not item_name:
                     continue
                 product_row = self._get_product_row_by_name(item_name)
                 if not product_row or self._row_get(product_row, 'is_synced') != 1:
+                    continue
+                canonical_name = (self._row_get(product_row, 'name') or item_name).strip()
+                if canonical_name and canonical_name != item_name:
+                    item['STOCKITEMNAME'] = canonical_name
+                    item_name = canonical_name
+                if item_name in stock_items_map:
                     continue
                 stock_item, stock_error = self._prepare_stock_item(product_row)
                 if stock_item:
