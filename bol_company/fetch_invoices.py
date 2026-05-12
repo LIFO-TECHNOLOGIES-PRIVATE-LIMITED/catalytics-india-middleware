@@ -6,11 +6,8 @@ Fetch invoices from multiple Tally companies with enhanced change detection.
 - Filters by config start date (from-date onward) and delivery information
 """
 import logging
-import re
 from pathlib import Path
 from datetime import datetime, timedelta
-import requests
-import psycopg2
 
 from config import config, BASE_DIR
 from db import Database, json_dumps, json_loads, sha256_text
@@ -31,7 +28,6 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
-_VEHICLE_MASTER_CACHE = None
 
 def _attach_invoice_fetch_file_handler():
     """Log invoice fetch operations to a dedicated file."""
@@ -158,205 +154,45 @@ def _invoice_in_date_range(invoice, from_date, to_date):
     return vd >= from_date
 
 
-def _is_cancelled_invoice(invoice):
-    raw = invoice.get('raw_voucher', {}) or {}
-    cancel_fields = (
-        'ISCANCELLED',
-        'VCHSTATUSISCANCELLED',
-        'ISDELETED',
-        'VCHSTATUSISDELETED',
-    )
-    for key in cancel_fields:
-        value = str(raw.get(key) or '').strip().lower()
-        if value in {'yes', 'true', '1'}:
-            return True
-    return False
-
-
-def _normalize_vehicle_no(vehicle_no):
-    return re.sub(r'[^A-Za-z0-9]', '', str(vehicle_no or '')).upper()
-
-
-def _extract_vehicle_no(invoice):
-    raw = invoice.get('raw_voucher', {}) or {}
-    for key in (
-        'DISPATCHEDTHROUGH',
-        'BASICSHIPPEDBY',
-        'MOTORVEHICLENO',
-        'BASICMOTORVEHICLENO',
-        'GOODSVEHICLENUMBER',
-        'VEHICLENO',
-        'VEHICLE_NO',
-        'VEHICLE_NUMBER',
-        'vehicle_no',
-        'vehicle_number',
-        'vehicle',
-    ):
-        value = raw.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return ''
-
-
-def _fetch_vehicle_master_numbers():
-    global _VEHICLE_MASTER_CACHE
-    if _VEHICLE_MASTER_CACHE:
-        return _VEHICLE_MASTER_CACHE
-
-    base = config.CATALYTICS_API_BASE.rstrip('/')
-    # Vehicle master is served from the backend default DB and does not need
-    # the middleware's Entity-Id header. Sending a plain numeric Entity-Id
-    # causes the backend entity middleware to try decrypting it and can raise
-    # a server-side error before the AllowAny view runs.
-    base_headers = {
-        'Content-Type': 'application/json',
-    }
-
-    normalized_numbers = set()
-    candidate_bases = [base]
-    if base.endswith('/api'):
-        candidate_bases.append(base[:-4])
-    else:
-        candidate_bases.append(f"{base}/api")
-
-    tried_urls = []
-    for candidate_base in candidate_bases:
-        url = f"{candidate_base.rstrip('/')}/master/vehicle"
-        tried_urls.append(url)
-        header_attempts = [dict(base_headers)]
-        if config.CATALYTICS_API_KEY:
-            auth_headers = dict(base_headers)
-            auth_headers['Authorization'] = f'Bearer {config.CATALYTICS_API_KEY}'
-            header_attempts.append(auth_headers)
-
-        for headers in header_attempts:
-            try:
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    params={'limit_start': 0, 'limit_end': 100000},
-                    timeout=30,
-                )
-                response.raise_for_status()
-                payload = response.json() or {}
-                for vehicle in payload.get('data') or []:
-                    normalized = _normalize_vehicle_no((vehicle or {}).get('vehicle_no'))
-                    if normalized:
-                        normalized_numbers.add(normalized)
-                if normalized_numbers:
-                    auth_mode = 'authenticated' if 'Authorization' in headers else 'anonymous'
-                    logger.info(
-                        f"[VEHICLE_API] Loaded {len(normalized_numbers)} vehicle numbers "
-                        f"from {url} via {auth_mode} access"
-                    )
-                    _VEHICLE_MASTER_CACHE = normalized_numbers
-                    return _VEHICLE_MASTER_CACHE
-            except Exception as exc:
-                auth_mode = 'authenticated' if 'Authorization' in headers else 'anonymous'
-                logger.warning(
-                    f"[VEHICLE_API] Vehicle master fetch failed from {url} "
-                    f"via {auth_mode} access: {exc}"
-                )
-
-    # HTTP lookup is fragile in this backend because the vehicle endpoint can
-    # behave differently for anonymous vs authenticated requests. Fall back to
-    # the same PostgreSQL database the middleware already uses for other fixes.
-    try:
-        conn = psycopg2.connect(
-            host=config.POSTGRES_HOST,
-            port=config.POSTGRES_PORT,
-            database=config.POSTGRES_DB,
-            user=config.POSTGRES_USER,
-            password=config.POSTGRES_PASSWORD,
-        )
-        try:
-            with conn.cursor() as cursor:
-                query_attempts = [
-                    (
-                        """
-                        SELECT vehicle_no
-                        FROM "master.vehicle"
-                        WHERE COALESCE(status, 0) <> 3
-                        """,
-                        '"master.vehicle"',
-                    ),
-                    (
-                        """
-                        SELECT vehicle_no
-                        FROM master.vehicle
-                        WHERE COALESCE(status, 0) <> 3
-                        """,
-                        'master.vehicle',
-                    ),
-                ]
-                for query, source_name in query_attempts:
-                    try:
-                        cursor.execute(query)
-                        for (vehicle_no,) in cursor.fetchall():
-                            normalized = _normalize_vehicle_no(vehicle_no)
-                            if normalized:
-                                normalized_numbers.add(normalized)
-                        if normalized_numbers:
-                            logger.info(
-                                f"[VEHICLE_DB] Loaded {len(normalized_numbers)} vehicle numbers "
-                                f"from PostgreSQL table {source_name}"
-                            )
-                            break
-                    except Exception as query_exc:
-                        conn.rollback()
-                        logger.warning(
-                            f"[VEHICLE_DB] Vehicle master query failed for {source_name}: {query_exc}"
-                        )
-        finally:
-            conn.close()
-
-        if normalized_numbers:
-            _VEHICLE_MASTER_CACHE = normalized_numbers
-            return _VEHICLE_MASTER_CACHE
-    except Exception as exc:
-        logger.warning(f"[VEHICLE_DB] Vehicle master fetch failed from PostgreSQL: {exc}")
-
-    logger.warning(f"[VEHICLE_API] No vehicle numbers loaded. Tried: {', '.join(tried_urls)}")
-    return set()
-
-
-def _resolve_delivery_reference(invoice):
-    """
-    BOL-specific rule:
-    - Trust Other Reference only when it is exactly C or D
-    - If vehicle number is sent as "-" treat it as D (Delivery)
-    - Otherwise fall back to vehicle master matching
-    - Vehicle matched   -> D (Delivery)
-    - Vehicle not found -> C (Customer Pickup)
-    """
-    raw = invoice.get('raw_voucher', {}) or {}
-    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip().lower()
-    if other_ref in {'c', 'd'}:
-        return other_ref, 'other_reference'
-
-    vehicle_no = _extract_vehicle_no(invoice)
-    if str(vehicle_no or '').strip() == '-':
-        return 'd', 'vehicle_placeholder'
-
-    vehicle_norm = _normalize_vehicle_no(vehicle_no)
-    vehicle_master_numbers = _fetch_vehicle_master_numbers()
-    if vehicle_norm and vehicle_norm in vehicle_master_numbers:
-        return 'd', 'vehicle_master'
-    if vehicle_norm:
-        if vehicle_master_numbers:
-            return 'c', 'vehicle_not_in_master'
-        return 'c', 'vehicle_lookup_unavailable'
-    return 'c', 'no_vehicle'
-
-
 def _has_delivery_info(invoice):
     """
-    BOL-specific check:
-    - trust Other Reference only for exact C/D
-    - otherwise classify from vehicle master match
+    Mandatory check: Other Reference (BASICORDERREF / OTHERREFERENCE) must indicate
+    delivery or customer pickup.
+
+    Accepted values:
+      D / delivery / delivery challan / dispatch  → Delivery type
+      C / customer pickup / pickup / self pickup  → Customer Pickup type
+
+    Returns True only when Other Reference contains one of these values.
+    If the field is empty or has a different value, returns False (invoice skipped).
     """
-    delivery_ref, _source = _resolve_delivery_reference(invoice)
-    return delivery_ref in {'c', 'd'}
+    raw = invoice.get('raw_voucher', {}) or {}
+    other_ref = str(raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip()
+
+    if not other_ref:
+        return False
+
+    other_ref_lower = other_ref.lower()
+    other_ref_norm = ' '.join(other_ref_lower.split())
+    other_ref_compact = other_ref_norm.replace(' ', '')
+
+    # D = Delivery, C = Customer Pickup (exact single-char match)
+    if other_ref_norm == 'd' or other_ref_norm == 'c':
+        return True
+
+    # Delivery keywords
+    if any(kw in other_ref_norm for kw in ('delivery', 'dispatch')):
+        return True
+    if 'deliverychallan' in other_ref_compact:
+        return True
+
+    # Customer Pickup keywords
+    if any(kw in other_ref_norm for kw in ('customer pickup', 'pickup', 'self pickup')):
+        return True
+    if 'customerpickup' in other_ref_compact:
+        return True
+
+    return False
 
 
 def _is_instant_invoice(invoice):
@@ -543,26 +379,6 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             overall_stats['skipped_date'] += 1
             continue
 
-        if _is_cancelled_invoice(invoice):
-            db.mark_invoices_deleted(company_name, [voucher_no])
-            logger.info(
-                f"[SKIP:CANCELLED] #{voucher_no} | date={voucher_date} | "
-                f"customer='{customer_name}' | reason: voucher is cancelled"
-            )
-            overall_stats.setdefault('skipped_cancelled', 0)
-            overall_stats['skipped_cancelled'] += 1
-            continue
-
-        delivery_ref, delivery_source = _resolve_delivery_reference(invoice)
-        raw_voucher = invoice.get('raw_voucher', {}) or {}
-        if isinstance(raw_voucher, dict):
-            raw_voucher['BASICORDERREF'] = delivery_ref
-            raw_voucher['OTHERREFERENCE'] = delivery_ref
-            if delivery_source == 'vehicle_placeholder':
-                raw_voucher['VEHICLE_NO'] = '-'
-                raw_voucher['BASICMOTORVEHICLENO'] = '-'
-            invoice['raw_voucher'] = raw_voucher
-
         if not _has_delivery_info(invoice):
             raw = invoice.get('raw_voucher', {}) or {}
             vtype = str(raw.get('VOUCHERTYPENAME') or raw.get('VOUCHERTYPE') or '').strip()
@@ -574,13 +390,6 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             )
             overall_stats['skipped_no_delivery'] += 1
             continue
-        else:
-            vehicle_no = _extract_vehicle_no(invoice)
-            logger.info(
-                f"[DELIVERY_CLASSIFIED] #{voucher_no} | date={voucher_date} | "
-                f"customer='{customer_name}' | ref='{delivery_ref}' | "
-                f"source='{delivery_source}' | vehicle='{vehicle_no}'"
-            )
 
         normalized_customer = _normalize_name_key(customer_name)
         ledger_cache_key = f"{company_name}::{normalized_customer}"
@@ -592,7 +401,6 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 ledger_cache[ledger_cache_key] = None
 
         ledger_data = ledger_cache[ledger_cache_key]
-        deferred_missing_customer = False
         if not ledger_data:
             # Auto-fetch customer from Tally and save to SQLite
             logger.info(
@@ -606,14 +414,12 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 overall_stats.setdefault('auto_fetched_customers', 0)
                 overall_stats['auto_fetched_customers'] += 1
             else:
-                deferred_missing_customer = True
-                ledger_data = {}
                 logger.warning(
-                    f"[DEFER:MISSING_CUSTOMER] #{voucher_no} | date={voucher_date} | "
-                    f"customer='{customer_name}' | reason: not found in SQLite or Tally; "
-                    f"saving invoice for sync-time recovery"
+                    f"[SKIP:MISSING_CUSTOMER] #{voucher_no} | date={voucher_date} | "
+                    f"customer='{customer_name}' | reason: not found in SQLite or Tally"
                 )
                 overall_stats['skipped_missing_customer'] += 1
+                continue
 
         inventory_items = invoice.get('items', [])
         stock_items_map = {}
@@ -635,7 +441,6 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 missing_products.append(item_name)
 
         # Auto-fetch missing products from Tally
-        deferred_missing_products = False
         if missing_products:
             still_missing = []
             for mp_name in missing_products:
@@ -655,14 +460,13 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                     still_missing.append(mp_name)
 
             if still_missing:
-                deferred_missing_products = True
                 logger.warning(
-                    f"[DEFER:MISSING_PRODUCT] #{voucher_no} | date={voucher_date} | "
+                    f"[SKIP:MISSING_PRODUCT] #{voucher_no} | date={voucher_date} | "
                     f"customer='{customer_name}' | missing {len(still_missing)} product(s) "
-                    f"(not found in SQLite or Tally): {still_missing}; "
-                    f"saving invoice for sync-time recovery"
+                    f"(not found in SQLite or Tally): {still_missing}"
                 )
                 overall_stats['skipped_missing_product'] += 1
+                continue
 
         try:
             full_voucher_payload = _build_full_voucher_payload(invoice)
@@ -716,7 +520,7 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 'godown_name': g_name,
                 'location_name': l_name,
                 'filling_station': f_station,
-                'is_instant': 1 if _is_instant_invoice(invoice) else 0,
+                'is_instant': 1 if _is_instant_invoice(invoice) else 0
             }
 
             existing = db.invoice_exists(voucher_no, company_name)
@@ -743,18 +547,6 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 )
                 overall_stats['already_exists'] += 1
 
-            if deferred_missing_customer or deferred_missing_products:
-                deferred_parts = []
-                if deferred_missing_customer:
-                    deferred_parts.append('customer')
-                if deferred_missing_products:
-                    deferred_parts.append('product')
-                logger.info(
-                    f"[DEFERRED_DEPENDENCY] #{voucher_no} | date={voucher_date} | "
-                    f"customer='{customer_name}' | waiting on {', '.join(deferred_parts)} "
-                    f"recovery during sync"
-                )
-
         except Exception as e:
             logger.error(
                 f"[ERROR] #{voucher_no} | date={voucher_date} | "
@@ -766,12 +558,10 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
 
 def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     """Fetch invoices from all active Tally companies in monthly batches."""
-    global _VEHICLE_MASTER_CACHE
     try:
         config.reload_from_env()
     except AttributeError:
         pass
-    _VEHICLE_MASTER_CACHE = None
 
     # If no dates provided, use Day Book logic (Yesterday to Tomorrow) as requested
     if not from_date and not to_date:
@@ -841,7 +631,6 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     logger.info(f"Auto-Fetch Cust:     {overall_stats.get('auto_fetched_customers', 0)}")
     logger.info(f"Auto-Fetch Prod:     {overall_stats.get('auto_fetched_products', 0)}")
     logger.info(f"Skipped Date:        {overall_stats['skipped_date']}")
-    logger.info(f"Skipped Cancelled:   {overall_stats.get('skipped_cancelled', 0)}")
     logger.info(f"Skipped No Del:      {overall_stats['skipped_no_delivery']}")
     logger.info(f"Skipped Cust:        {overall_stats['skipped_missing_customer']}")
     logger.info(f"Skipped Prod:        {overall_stats['skipped_missing_product']}")

@@ -129,7 +129,8 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         db.close()
         return {'sent': 0, 'ok': 0, 'failed': 0}
 
-    endpoint = config.api_base_url.rstrip('/') + '/tally-customer-payload/'
+    _base = config.api_base_url.rstrip('/')
+    endpoint = (_base + '/tally-customer-payload/') if _base.endswith('/import') else (_base + '/import/tally-customer-payload/')
     # Payload endpoints use AllowAny permission â€” no auth header needed
     headers = {'Content-Type': 'application/json'}
 
@@ -324,5 +325,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 

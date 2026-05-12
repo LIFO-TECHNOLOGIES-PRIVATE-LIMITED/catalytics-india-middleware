@@ -32,6 +32,7 @@ if ROOT_DIR not in sys.path:
 from config import config, BASE_DIR
 from db import Database
 import tally_api
+from mapping_lookup import get_mapping_lookup
 
 logging.basicConfig(
     level=logging.INFO,
@@ -323,7 +324,29 @@ def fetch_products_from_all_companies():
                     logger.warning("Skipping product with empty name")
                     continue
 
-                parsed = parse_stock_item_name(product_name)
+                # Try mapping.json lookup first (from Discovery Agent)
+                mapping_entry = get_mapping_lookup().classify(
+                    product_name,
+                    tally_guid=(item.get('GUID') or item.get('MASTERID') or '').strip(),
+                )
+                if mapping_entry:
+                    parsed = {
+                        'product_master_name': mapping_entry.get('product_master_name', product_name),
+                        'variant_name': mapping_entry.get('variant_master_name', '') or mapping_entry.get('variant_name', ''),
+                        'unit_name': mapping_entry.get('unit_master_name', 'numbers'),
+                        'product_type_code': mapping_entry.get('product_type_code', ''),
+                        'product_type_name': mapping_entry.get('product_type_name', ''),
+                        'canonical_name': product_name,
+                        'from_mapping': True,
+                    }
+                    logger.info(
+                        f"[MAPPING LOOKUP] '{product_name}' -> "
+                        f"product={parsed['product_master_name']}, "
+                        f"type={parsed['product_type_name']}, "
+                        f"variant={parsed['variant_name']}"
+                    )
+                else:
+                    parsed = parse_stock_item_name(product_name)
 
                 if not parsed:
                     # Check if the name matches any PRODUCT_EXACT_KEYWORDS

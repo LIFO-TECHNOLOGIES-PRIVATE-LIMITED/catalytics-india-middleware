@@ -87,22 +87,6 @@ class CatalyticsSyncer:
         self.tally_url = config.TALLY_URL
         self._filling_station_cache = {}  # name -> id cache
 
-    @staticmethod
-    def _row_get(row, key, default=None):
-        if row is None:
-            return default
-        if hasattr(row, 'get'):
-            return row.get(key, default)
-        try:
-            return row[key]
-        except Exception:
-            return default
-
-    @staticmethod
-    def _endpoint_allows_anonymous(endpoint):
-        path = '/' + endpoint.lstrip('/')
-        return path.startswith('/import/')
-
     def _api_request(self, method, endpoint, **kwargs):
         """Make API request to Catalytics"""
         # Robust URL construction: strip any slashes and join with single slash
@@ -117,7 +101,7 @@ class CatalyticsSyncer:
         # They only check TALLY_MIDDLEWARE_API_KEY if it's configured in Django settings
         # Since it's not configured, we don't send authentication headers
         headers['Content-Type'] = 'application/json'
-        if self.api_key and not self._endpoint_allows_anonymous(endpoint):
+        if self.api_key:
             headers['Authorization'] = f'Bearer {self.api_key}'
 
         try:
@@ -212,14 +196,6 @@ class CatalyticsSyncer:
         )
         if result:
             return True, None
-
-        customer_name_norm = self._normalize_name(customer_name)
-        candidates = self.db.query_all(
-            "SELECT id, name FROM customers WHERE is_synced = 1"
-        ) or []
-        for row in candidates:
-            if self._normalize_name(self._row_get(row, 'name', '')) == customer_name_norm:
-                return True, None
         return False, f"Customer '{customer_name}' not found in Catalytics"
 
     def _products_exist(self, items):
@@ -244,224 +220,6 @@ class CatalyticsSyncer:
             return False, f"Products not found in Catalytics: {', '.join(missing_products)}"
         return True, None
 
-    def _get_customer_row_by_name(self, customer_name):
-        if not customer_name:
-            return None
-        result = self.db.query(
-            "SELECT * FROM customers WHERE name = ? ORDER BY id DESC LIMIT 1",
-            (customer_name,)
-        )
-        if result:
-            return result
-
-        customer_name_norm = self._normalize_name(customer_name)
-        candidates = self.db.query_all(
-            "SELECT * FROM customers ORDER BY id DESC"
-        ) or []
-        for row in candidates:
-            if self._normalize_name(self._row_get(row, 'name', '')) == customer_name_norm:
-                return row
-        return None
-
-    def _get_product_row_by_name(self, product_name):
-        if not product_name:
-            return None
-        return self.db.query(
-            "SELECT * FROM products WHERE name = ? ORDER BY id DESC LIMIT 1",
-            (product_name,)
-        )
-
-    def _auto_fetch_customer_to_sqlite(self, company_name, customer_name):
-        try:
-            ledger = tally_client.get_ledger_by_name(company_name, customer_name, self.tally_url)
-            if not ledger:
-                return None, f"Customer '{customer_name}' not found in Tally"
-
-            guid = str(ledger.get('GUID') or ledger.get('MASTERID') or '').strip()
-            name = (ledger.get('NAME') or customer_name).strip()
-            normalized_name = ' '.join(name.split())
-
-            customer_data = {
-                'tally_guid': guid,
-                'name': normalized_name,
-                'tally_company': company_name,
-                'gstin': (ledger.get('GSTIN') or ledger.get('PARTYGSTIN') or '').lstrip(':'),
-                'pan': ledger.get('INCOMETAXNUMBER') or ledger.get('PANNUMBER') or '',
-                'address': ', '.join(ledger.get('ADDRESSES', [])) if ledger.get('ADDRESSES') else '',
-                'state': ledger.get('STATENAME') or '',
-                'city': '',
-                'pincode': ledger.get('PINCODE') or '',
-                'phone': ledger.get('MOBILE') or ledger.get('LEDGERMOBILE') or '',
-                'email': ledger.get('EMAIL') or ledger.get('LEDGEREMAIL') or '',
-                'data_json': json.dumps({
-                    'guid': guid,
-                    'name': normalized_name,
-                    'parent_group': ledger.get('PARENT') or '',
-                    'gstin': (ledger.get('GSTIN') or ledger.get('PARTYGSTIN') or '').lstrip(':'),
-                    'pan': ledger.get('INCOMETAXNUMBER') or ledger.get('PANNUMBER') or '',
-                    'address': ', '.join(ledger.get('ADDRESSES', [])) if ledger.get('ADDRESSES') else '',
-                    'state': ledger.get('STATENAME') or '',
-                    'city': '',
-                    'pincode': ledger.get('PINCODE') or '',
-                    'phone': ledger.get('MOBILE') or ledger.get('LEDGERMOBILE') or '',
-                    'email': ledger.get('EMAIL') or ledger.get('LEDGEREMAIL') or '',
-                }),
-            }
-
-            existing = self.db.customer_exists_by_guid(guid) if guid else self._get_customer_row_by_name(normalized_name)
-            if existing:
-                self.db.update_customer(existing['id'], customer_data)
-            else:
-                self.db.insert_customer(customer_data)
-
-            return self._get_customer_row_by_name(normalized_name), None
-        except Exception as exc:
-            return None, str(exc)
-
-    def sync_single_product(self, product_row):
-        name = (self._row_get(product_row, 'name') or '').strip()
-        try:
-            stock_item, error = self._prepare_stock_item(product_row)
-            if not stock_item:
-                return {'success': False, 'error': error or f"Could not prepare product '{name}'", 'catalytics_id': None}
-
-            request_payload = {
-                'entity_id': self.entity_id,
-                'stock_items': [stock_item],
-                'created_by': config.DEFAULT_ADMIN_USER_ID,
-            }
-            response = self._api_request(
-                'POST',
-                '/import/tally-product-payload/',
-                json=request_payload
-            )
-            if response.status_code not in [200, 201]:
-                error_msg = f"HTTP {response.status_code}"
-                try:
-                    error_msg += f" - {response.json().get('message', response.text[:200])}"
-                except Exception:
-                    pass
-                return {'success': False, 'error': error_msg, 'catalytics_id': None}
-
-            result = response.json()
-            data = result.get('data', result)
-            results_list = data.get('results', [])
-            first_result = results_list[0] if results_list else {}
-            status = first_result.get('status', 'error')
-            catalytics_id = first_result.get('product_id') or first_result.get('id')
-            if status not in ('created', 'updated'):
-                return {'success': False, 'error': first_result.get('message', 'Product not created or updated'), 'catalytics_id': None}
-
-            self.db.mark_product_synced(self._row_get(product_row, 'id'), catalytics_id, json.dumps(first_result))
-            logger.info(f"✓ Product '{name}' synced (status={status}, ID={catalytics_id})")
-            return {'success': True, 'error': None, 'catalytics_id': catalytics_id}
-        except Exception as exc:
-            logger.error(f"Error syncing product '{name}': {exc}")
-            return {'success': False, 'error': str(exc), 'catalytics_id': None}
-
-    def _auto_fetch_product_to_sqlite(self, company_name, product_name):
-        try:
-            stock = tally_client.get_stock_item_by_name(company_name, product_name, self.tally_url)
-            if not stock:
-                return None, f"Product '{product_name}' not found in Tally"
-
-            guid = str(stock.get('GUID') or stock.get('MASTERID') or '').strip()
-            name = (stock.get('NAME') or product_name).strip()
-            parsed = parse_stock_item_name(name) or {
-                'product_master_name': name,
-                'unit_name': canonical_unit_name('cubic'),
-                'variant_name': '7',
-                'product_type_code': 'CYL',
-                'product_type_name': 'CYLINDER',
-                'canonical_name': f'{name} (CYL)',
-            }
-            simple_data = {
-                'guid': guid,
-                'name': name,
-                'hsn_code': stock.get('HSNCODE') or '',
-                'unit': stock.get('BASEUNITS') or '',
-                'rate': 0.0,
-                'gst_applicable': '',
-                'gst_rate': stock.get('GST_RATE') or 0.0,
-                'igst_rate': stock.get('IGST_RATE') or 0.0,
-                'cgst_rate': stock.get('CGST_RATE') or 0.0,
-                'sgst_rate': stock.get('SGST_RATE') or 0.0,
-                'description': stock.get('PARENT') or '',
-            }
-            product_data = {
-                'tally_guid': guid,
-                'name': name,
-                'name_canonical': parsed['canonical_name'],
-                'tally_company': company_name,
-                'hsn_code': simple_data['hsn_code'],
-                'unit': simple_data['unit'],
-                'rate': simple_data['rate'],
-                'description': simple_data['description'],
-                'data_json': json.dumps(simple_data),
-                'product_master_name': parsed['product_master_name'],
-                'variant_name': parsed['variant_name'],
-                'unit_name': parsed['unit_name'],
-                'product_type_code': parsed['product_type_code'],
-                'product_type_name': parsed['product_type_name'],
-                'gst_applicable': simple_data['gst_applicable'],
-                'gst_rate': simple_data['gst_rate'],
-                'igst_rate': simple_data['igst_rate'],
-                'cgst_rate': simple_data['cgst_rate'],
-                'sgst_rate': simple_data['sgst_rate'],
-            }
-            existing = self.db.product_exists_by_guid(guid) if guid else self._get_product_row_by_name(name)
-            if existing:
-                self.db.update_product(existing['id'], product_data)
-            else:
-                self.db.insert_product(product_data)
-            return self._get_product_row_by_name(name), None
-        except Exception as exc:
-            return None, str(exc)
-
-    def _ensure_invoice_dependencies_synced(self, invoice, items):
-        company = invoice.get('tally_company', '')
-        customer_name = (invoice.get('customer_name') or '').strip()
-
-        customer_ok, _ = self._customer_exists(customer_name)
-        if not customer_ok:
-            customer_row = self._get_customer_row_by_name(customer_name)
-            if not customer_row:
-                logger.info(f"[AUTO-RECOVER:CUSTOMER] Fetching missing customer '{customer_name}' from Tally...")
-                customer_row, error = self._auto_fetch_customer_to_sqlite(company, customer_name)
-                if not customer_row:
-                    return False, error
-            if not self._row_get(customer_row, 'is_synced'):
-                ledger, error = self._prepare_ledger(customer_row)
-                if not ledger:
-                    return False, error
-                sync_result = self.sync_single_customer(customer_row, ledger)
-                if not sync_result.get('success'):
-                    return False, sync_result.get('error')
-
-        for item in items or []:
-            product_name = (item.get('item_name') or '').strip()
-            if not product_name:
-                continue
-            result = self.db.query(
-                "SELECT id, is_synced FROM products WHERE name = ? LIMIT 1",
-                (product_name,)
-            )
-            if result and self._row_get(result, 'is_synced') == 1:
-                continue
-
-            product_row = self._get_product_row_by_name(product_name)
-            if not product_row:
-                logger.info(f"[AUTO-RECOVER:PRODUCT] Fetching missing product '{product_name}' from Tally...")
-                product_row, error = self._auto_fetch_product_to_sqlite(company, product_name)
-                if not product_row:
-                    return False, error
-            if not self._row_get(product_row, 'is_synced'):
-                sync_result = self.sync_single_product(product_row)
-                if not sync_result.get('success'):
-                    return False, sync_result.get('error')
-
-        return True, None
-
     def _fetch_unsynced_instant_dcs(self):
         """
         Fetch unsynced Instant DCs from Catalytics for matching.
@@ -470,11 +228,7 @@ class CatalyticsSyncer:
         """
         logger.info("Fetching unsynced Instant DCs from Catalytics for matching...")
         try:
-            response = self._api_request(
-                'GET',
-                '/transaction/delivery_challan/instant/unsynced',
-                params={'entity_id': self.entity_id},
-            )
+            response = self._api_request('GET', '/transaction/delivery_challan/instant/unsynced')
             if response.status_code != 200:
                 logger.error(f"Failed to fetch unsynced Instant DCs: HTTP {response.status_code}")
                 return []
@@ -482,25 +236,6 @@ class CatalyticsSyncer:
             data = response.json()
             basic_results = data.get('results', [])
             logger.info(f"Received {len(basic_results)} unsynced Instant DCs from portal")
-
-            # Some backend deployments incorrectly treat entity_id as fill_station.
-            # If the filtered request returns nothing, retry once without that filter
-            # so exact customer/date/product/quantity matching can still work.
-            if not basic_results:
-                logger.info("No instant DCs returned for entity-filtered fetch, retrying without entity filter")
-                fallback_response = self._api_request(
-                    'GET',
-                    '/transaction/delivery_challan/instant/unsynced',
-                )
-                if fallback_response.status_code == 200:
-                    fallback_data = fallback_response.json()
-                    fallback_results = fallback_data.get('results', [])
-                    logger.info(f"Fallback fetch returned {len(fallback_results)} unsynced Instant DCs")
-                    basic_results = fallback_results
-                else:
-                    logger.warning(
-                        f"Fallback instant DC fetch failed: HTTP {fallback_response.status_code}"
-                    )
 
             # Check if the enhanced list already includes dc_date (new backend)
             needs_detail_fetch = bool(basic_results and not basic_results[0].get('dc_date'))
@@ -1296,9 +1031,9 @@ class CatalyticsSyncer:
         Returns:
             dict: {'success': bool, 'error': str, 'catalytics_id': int}
         """
-        customer_id = self._row_get(customer_dict, 'id')
-        name = self._row_get(customer_dict, 'name')
-        company = self._row_get(customer_dict, 'tally_company')
+        customer_id = customer_dict.get('id')
+        name = customer_dict.get('name')
+        company = customer_dict.get('tally_company')
         
         try:
             logger.info(f"Syncing single customer '{name}' (company: {company})...")
@@ -1366,12 +1101,6 @@ class CatalyticsSyncer:
                     first_result = results_list[0]
                     if isinstance(first_result, dict):
                         catalytics_id = first_result.get('customer_id')
-
-                if customer_id:
-                    try:
-                        self.db.mark_customer_synced(customer_id, catalytics_id, json.dumps(result))
-                    except Exception as exc:
-                        logger.warning(f"Customer '{name}' synced remotely but failed to update local sync state: {exc}")
                 
                 logger.info(f"✓ Customer '{name}' synced (Created={created}, Updated={updated}, ID={catalytics_id})")
                 
@@ -1626,21 +1355,6 @@ class CatalyticsSyncer:
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
             return {}
-
-    def _invoice_is_cancelled(self, invoice):
-        """Return True when the stored voucher is marked cancelled/deleted in Tally."""
-        data = self._safe_json_load(invoice.get('data_json'))
-        cancel_fields = (
-            'ISCANCELLED',
-            'VCHSTATUSISCANCELLED',
-            'ISDELETED',
-            'VCHSTATUSISDELETED',
-        )
-        for field in cancel_fields:
-            value = str(data.get(field) or '').strip().lower()
-            if value in ('yes', 'true', '1'):
-                return True
-        return False
 
 
     def _normalize_tally_date(self, value):
@@ -1933,19 +1647,6 @@ class CatalyticsSyncer:
         if not voucher_payload.get('FILLINGSTATION') and filling_station:
             voucher_payload['FILLINGSTATION'] = filling_station
 
-        vehicle_no = str(
-            voucher_payload.get('BASICMOTORVEHICLENO')
-            or voucher_payload.get('VEHICLE_NO')
-            or voucher_payload.get('MOTORVEHICLENO')
-            or voucher_payload.get('GOODSVEHICLENUMBER')
-            or ''
-        ).strip()
-        if vehicle_no == '-':
-            voucher_payload['BASICORDERREF'] = 'd'
-            voucher_payload['OTHERREFERENCE'] = 'd'
-            voucher_payload['VEHICLE_NO'] = '-'
-            voucher_payload['BASICMOTORVEHICLENO'] = '-'
-
         # Map Other Reference -> Terms of Delivery for challan type detection
         other_ref = str(voucher_payload.get('BASICORDERREF') or voucher_payload.get('OTHERREFERENCE') or '').strip().lower()
         if 'customer pickup' in other_ref or 'pickup' in other_ref or other_ref == 'c':
@@ -2179,25 +1880,33 @@ class CatalyticsSyncer:
                 company = invoice.get('tally_company', '')
 
                 try:
-                    if self._invoice_is_cancelled(invoice):
-                        self.db.mark_invoices_deleted(company, [voucher_no])
-                        logger.info(
-                            f"[CANCELLED:LOCAL] #{voucher_no} marked deleted locally; skipping sync"
-                        )
-                        continue
+                    import json as json_lib
+                    items = json_lib.loads(items_json) if isinstance(items_json, str) else (items_json or [])
+                except:
+                    items = []
 
-                    # Parse invoice items for validation and matching
-                    items_json = invoice.get('items_json', '[]')
-                    try:
-                        import json as json_lib
-                        items = json_lib.loads(items_json) if isinstance(items_json, str) else (items_json or [])
-                    except Exception:
-                        items = []
+                # INSTANT INVOICE MATCHING LOGIC
+                # 1. Check if we already have a matched DC ID stored in local DB
+                matched_dc_id = invoice.get('catalytics_dc_id')
+                matched_dc = None
+                
+                if not matched_dc_id:
+                    logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
+                    matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
+                    if matched_dc:
+                        matched_dc_id = matched_dc.get('id')
+                        logger.info(f"✓ Found potential match: DC {matched_dc['dc_no']} (ID: {matched_dc_id})")
+                        # Update local info immediately so we don't lose the link
+                        self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
+                        # Update memory dict for the rest of the loop
+                        invoice['catalytics_dc_id'] = matched_dc_id
+                        invoice['dc_no'] = matched_dc['dc_no']
+                        # Remove from batch list to avoid double matching
+                        instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
+                else:
+                    logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
 
-                    # INSTANT INVOICE MATCHING LOGIC
-                    # 1. Check if we already have a matched DC ID stored in local DB
-                    matched_dc_id = invoice.get('catalytics_dc_id')
-                    matched_dc = None
+                # Proceed with sync (always building full payload)
 
                     if not matched_dc_id:
                         logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
