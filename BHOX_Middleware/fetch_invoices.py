@@ -6,6 +6,7 @@ Fetch invoices from multiple Tally companies with enhanced change detection.
 - Filters by config start date (from-date onward) and delivery information
 """
 import logging
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -212,14 +213,80 @@ def _normalize_name_key(value):
 
 
 def _parse_variant_token(token):
-    """Parse '2X7' or '2x7' → (qty, size). Returns None if not a valid QxS token."""
+    """Parse '2X7', '2x7', '2X7.5' → (qty, size). Returns None if not a valid QxS token."""
     parts = token.upper().split('X')
     if len(parts) != 2:
         return None
     try:
-        return int(parts[0]), int(parts[1])
+        qty = int(parts[0])
+        size = float(parts[1].strip())
+        if size <= 0:
+            return None
+        return qty, size
     except ValueError:
         return None
+
+
+# Business rule: 7.5 cum of gas is filled into a 10 cum cylinder — track as 10 cum.
+_CYL_SIZE_REMAP = {7.5: 10.0}
+
+
+def _normalize_cylinder_size(size):
+    """Remap non-standard fill sizes to actual cylinder type.
+    7.5 cum gas fill → 10 cum cylinder (per BHOX business rule)."""
+    s = round(float(size), 2)
+    return float(_CYL_SIZE_REMAP.get(s, s))
+
+
+def _infer_variant_no_description(item):
+    """
+    When no BASICUSERDESCRIPTION is provided, try to infer the cylinder variant
+    by dividing ACTUALQTY (total CUM) by standard fill sizes (7, 7.5, 10).
+    First clean division wins. 7.5 is remapped to 10 cum (business rule).
+    Only applies to cylinder products (not CO2 kg, not liquid tanks).
+    Returns an expanded item list, or None if inference is not possible.
+    """
+    orig_name = (item.get('item_name') or '').strip()
+    base_name = ' '.join(orig_name.replace('=', ' ').split())
+    base_name_l = base_name.lower()
+
+    # Skip non-cylinder product types
+    if 'co2' in base_name_l or 'carbon dioxide' in base_name_l:
+        return None
+    if 'liquid' in base_name_l:
+        return None
+    if 'pallet' in base_name_l or ' plt' in base_name_l:
+        return None
+
+    qty = float(item.get('quantity') or 0)
+    amt = float(item.get('amount') or 0)
+    rate = float(item.get('rate') or 0)
+
+    if qty <= 0:
+        return None
+
+    # Try standard fill sizes in priority order (CUM)
+    for raw_size in (7, 7.5, 10):
+        count = qty / raw_size
+        count_int = round(count)
+        if count_int > 0 and abs(count - count_int) < 0.001:
+            size = _normalize_cylinder_size(raw_size)
+            size_label = int(size) if size == int(size) else size
+            rate_per_cyl = (amt / count_int) if (amt and count_int > 0) else rate
+            logger.debug(
+                f"[INFER-VARIANT] '{orig_name}': qty={qty} / {raw_size} = {count_int} cyl "
+                f"→ '{base_name} {size_label}cum (CYL)'"
+            )
+            return [{
+                'item_name':        f"{base_name} {size_label}cum (CYL)",
+                'quantity':         float(count_int),
+                'rate':             round(rate_per_cyl, 2),
+                'amount':           round(amt, 2),
+                'user_description': '',
+                '_orig_name':       orig_name,
+            }]
+
+    return None
 
 
 def _expand_item_by_description(item):
@@ -237,13 +304,18 @@ def _expand_item_by_description(item):
     3. Breakdown only (no total prefix)  →  '3X30,2X30'
        Same as format 2 but first token is already a QxS pair
 
-    Returns expanded list, or [item] unchanged if format is not valid.
+    If no description: infer variant from ACTUALQTY (total CUM) using standard sizes.
+
+    Returns expanded list, or [item] unchanged if format/inference is not valid.
     """
     user_desc = (item.get('user_description') or '').strip()
     if not user_desc:
-        return [item]
+        # No description — try to infer variant from total quantity (CUM)
+        return _infer_variant_no_description(item) or [item]
 
-    tokens = [t.strip() for t in user_desc.split(',') if t.strip()]
+    # Normalize separators: Tally may store multi-line descriptions with \n or \r\n
+    user_desc_normalized = re.sub(r'[\r\n]+', ',', user_desc)
+    tokens = [t.strip() for t in user_desc_normalized.split(',') if t.strip()]
     if not tokens:
         return [item]
 
@@ -251,6 +323,9 @@ def _expand_item_by_description(item):
     base_name  = ' '.join(orig_name.replace('=', ' ').split())
     orig_qty   = item.get('quantity', 0.0) or 0.0
     orig_amt   = item.get('amount',   0.0) or 0.0
+
+    base_name_l = base_name.lower()
+    variant_unit = 'kg' if ('co2' in base_name_l or 'carbon dioxide' in base_name_l) else 'cum'
 
     def _make_item(variant_name, qty, rate, amt):
         return {
@@ -276,8 +351,11 @@ def _expand_item_by_description(item):
         rate_per_cyl = (orig_amt / total_cyls) if total_cyls > 0 else (item.get('rate', 0.0) or 0.0)
         result = []
         for qty, size in variants:
+            # Apply business remapping (7.5 cum fill → 10 cum cylinder)
+            size = _normalize_cylinder_size(size)
+            size_label = int(size) if size == int(size) else size
             result.append(_make_item(
-                f"{base_name} {size}cum (CYL)",
+                f"{base_name} {size_label}{variant_unit} (CYL)",
                 qty,
                 rate_per_cyl,
                 qty * rate_per_cyl,
@@ -302,12 +380,16 @@ def _expand_item_by_description(item):
             if orig_qty <= 0:
                 return [item]
             size_f = orig_qty / total_count
-            size   = int(size_f)
+            # Accept fractional sizes (e.g. 7.5cum); round to 2 dp to avoid floating-point noise
+            size = round(size_f, 2)
             if abs(size_f - size) > 0.001:          # not a clean division
                 return [item]
-            rate_per_cyl = (orig_amt / total_count) if total_count > 0 else (item.get('rate', 0.0) or 0.0)
+            # Apply business remapping (7.5 cum fill → 10 cum cylinder)
+            size = _normalize_cylinder_size(size)
+            size_label = int(size) if size == int(size) else size
+            rate_per_cyl = (orig_amt / total_count) if (orig_amt and total_count > 0) else (item.get('rate', 0.0) or 0.0)
             return [_make_item(
-                f"{base_name} {size}cum (CYL)",
+                f"{base_name} {size_label}{variant_unit} (CYL)",
                 total_count,
                 rate_per_cyl,
                 orig_amt,
@@ -458,7 +540,41 @@ def _auto_fetch_product(db, tally, company_name, product_name):
     from tally_client import get_stock_item_by_name
 
     try:
-        stock = get_stock_item_by_name(company_name, product_name, tally.url)
+        # Tally usually stores base stock-item names, while invoice lines may contain
+        # expanded middleware variant labels like "XYZ 7cum (CYL)".
+        # Try exact first, then cleaned/base candidates.
+        stock = None
+        candidate_names = []
+        seen_candidates = set()
+
+        def _add_candidate(name):
+            c = ' '.join((name or '').split()).strip()
+            if not c:
+                return
+            key = c.lower()
+            if key in seen_candidates:
+                return
+            seen_candidates.add(key)
+            candidate_names.append(c)
+
+        _add_candidate(product_name)
+        _add_candidate(re.sub(r'\s+\d+\s*cum\s*\(CYL\)\s*$', '', product_name, flags=re.IGNORECASE))
+        _add_candidate(re.sub(r'\s+\d+\s*(?:kg|lit|litre)\s*\((?:CYL|TNK|PLT)\)\s*$', '', product_name, flags=re.IGNORECASE))
+
+        parsed_from_line = parse_stock_item_name(product_name)
+        if parsed_from_line:
+            _add_candidate(parsed_from_line.get('product_master_name'))
+
+        for cand in candidate_names:
+            stock = get_stock_item_by_name(company_name, cand, tally.url)
+            if stock:
+                if cand.lower() != ' '.join((product_name or '').split()).strip().lower():
+                    logger.info(
+                        f"[AUTO-FETCH] Product lookup fallback matched '{cand}' "
+                        f"for invoice item '{product_name}'"
+                    )
+                break
+
         if not stock:
             logger.warning(f"[AUTO-FETCH] Product '{product_name}' not found in Tally")
             return None
@@ -492,6 +608,7 @@ def _auto_fetch_product(db, tally, company_name, product_name):
 
         # Create one row per variant (mirrors fetch_products behaviour)
         first_data_json = None
+        created_product_ids = []
         for size, unit, type_code, type_name in variants:
             variant_label = f"{size}{unit}"
             display_name  = f"{base_name} {variant_label} ({type_code})"
@@ -500,6 +617,7 @@ def _auto_fetch_product(db, tally, company_name, product_name):
             simple_data = dict(common, guid=variant_guid, name=display_name)
             if first_data_json is None:
                 first_data_json = simple_data
+                first_data_json['_db_name'] = display_name
 
             product_data = {
                 'tally_guid':          variant_guid,
@@ -528,11 +646,82 @@ def _auto_fetch_product(db, tally, company_name, product_name):
                 existing = db.product_exists_by_canonical(display_name)
             if existing:
                 db.update_product(existing['id'], product_data)
+                created_product_ids.append(existing['id'])
                 logger.info(f"[AUTO-FETCH] Product '{display_name}' updated (ID: {existing['id']})")
             else:
-                db.insert_product(product_data)
+                new_id = db.insert_product(product_data)
+                if new_id:
+                    created_product_ids.append(new_id)
                 logger.info(f"[AUTO-FETCH] Product '{display_name}' saved to SQLite")
 
+        # Return data for the variant that matches the requested product_name.
+        # e.g. "ACM GAS 10 CUM BHOX 10cum (CYL)" should return the 10cum variant,
+        # not always the first (7cum) variant.
+        target_parsed = parse_stock_item_name(product_name)
+        target_variant = target_parsed.get('extracted_variant') if target_parsed else None
+
+        if target_variant:
+            for size, unit, type_code, _ in variants:
+                if str(size) == str(target_variant):
+                    variant_label = f"{size}{unit}"
+                    target_name = f"{base_name} {variant_label} ({type_code})"
+                    variant_guid = f"{tally_guid}|{type_code}_{size}{unit}" if tally_guid else ''
+                    matched_data = dict(common, guid=variant_guid, name=target_name)
+                    matched_data['_db_name'] = target_name
+                    matched_data['_created_product_ids'] = created_product_ids
+                    return matched_data
+
+            # target_variant not in predefined variants (e.g. "7.5" not in [7, 10]).
+            # Create a custom variant row for this specific non-standard size.
+            if product_type == 'CYLINDER':
+                try:
+                    size_val = float(target_variant)
+                    size_label = int(size_val) if size_val == int(size_val) else size_val
+                    variant_label = f"{size_label}cum"
+                    target_name = f"{base_name} {variant_label} (CYL)"
+                    variant_guid = f"{tally_guid}|CYL_{size_label}cum" if tally_guid else ''
+                    custom_product_data = {
+                        'tally_guid':          variant_guid,
+                        'name':                target_name,
+                        'name_canonical':      target_name,
+                        'tally_company':       company_name,
+                        'hsn_code':            common['hsn_code'],
+                        'unit':                'cum',
+                        'rate':                common['rate'],
+                        'description':         common['description'],
+                        'data_json':           _json.dumps(dict(common, guid=variant_guid, name=target_name)),
+                        'product_master_name': base_name,
+                        'variant_name':        variant_label,
+                        'unit_name':           'cum',
+                        'product_type_code':   'CYL',
+                        'product_type_name':   'CYLINDER',
+                        'gst_applicable':      common['gst_applicable'],
+                        'gst_rate':            common['gst_rate'],
+                        'igst_rate':           common['igst_rate'],
+                        'cgst_rate':           common['cgst_rate'],
+                        'sgst_rate':           common['sgst_rate'],
+                    }
+                    existing = db.product_exists_by_guid(variant_guid) if variant_guid else None
+                    if not existing:
+                        existing = db.product_exists_by_canonical(target_name)
+                    if existing:
+                        db.update_product(existing['id'], custom_product_data)
+                        created_product_ids.append(existing['id'])
+                        logger.info(f"[AUTO-FETCH] Custom variant '{target_name}' updated (ID: {existing['id']})")
+                    else:
+                        new_id = db.insert_product(custom_product_data)
+                        if new_id:
+                            created_product_ids.append(new_id)
+                        logger.info(f"[AUTO-FETCH] Custom variant '{target_name}' saved to SQLite")
+                    matched_data = dict(common, guid=variant_guid, name=target_name)
+                    matched_data['_db_name'] = target_name
+                    matched_data['_created_product_ids'] = created_product_ids
+                    return matched_data
+                except Exception as e:
+                    logger.warning(f"[AUTO-FETCH] Could not create custom variant for size '{target_variant}': {e}")
+
+        if first_data_json is not None:
+            first_data_json['_created_product_ids'] = created_product_ids
         return first_data_json
 
     except Exception as e:
@@ -540,7 +729,7 @@ def _auto_fetch_product(db, tally, company_name, product_name):
         return None
 
 
-def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date, ledger_cache, stock_cache, overall_stats):
+def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date, ledger_cache, stock_cache, overall_stats, syncer=None):
     """Process a batch of invoices and save to database."""
     overall_stats['total_fetched'] += len(invoices)
 
@@ -548,6 +737,8 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
         voucher_no = invoice.get('voucher_no', '')
         customer_name = invoice.get('customer_name', '')
         voucher_date = invoice.get('voucher_date', '')
+        auto_created_customer_id = None
+        auto_created_product_ids = []
 
         if not voucher_no or not customer_name:
             logger.warning(
@@ -599,6 +790,16 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 ledger_data = fetched
                 overall_stats.setdefault('auto_fetched_customers', 0)
                 overall_stats['auto_fetched_customers'] += 1
+                try:
+                    cust_row = db.query(
+                        "SELECT id FROM customers WHERE tally_company = ? AND lower(replace(name, ' ', '')) = ? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (company_name, normalized_customer),
+                    )
+                    if cust_row and cust_row['id']:
+                        auto_created_customer_id = cust_row['id']
+                except Exception:
+                    pass
             else:
                 logger.warning(
                     f"[SKIP:MISSING_CUSTOMER] #{voucher_no} | date={voucher_date} | "
@@ -635,16 +836,36 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
 
         if has_expansion:
             inventory_items = expanded_items
-            # Rebuild raw_voucher INVENTORY to match expanded items
+            # Rebuild raw_voucher INVENTORY to match expanded items.
+            # Use a deque per orig_name so each raw line consumes only its OWN
+            # expanded items — prevents duplication when the same product appears
+            # on multiple Tally lines (e.g. same gas at two different rates).
+            from collections import deque
             orig_to_expanded = {}
             for exp in expanded_items:
-                orig_to_expanded.setdefault(exp.get('_orig_name', exp['item_name']), []).append(exp)
+                key = exp.get('_orig_name', exp['item_name'])
+                if key not in orig_to_expanded:
+                    orig_to_expanded[key] = deque()
+                orig_to_expanded[key].append(exp)
             raw_inv = invoice.get('raw_voucher', {}).get('INVENTORY') or []
             new_raw_inv = []
             for raw_item in raw_inv:
                 orig_name = (raw_item.get('STOCKITEMNAME') or '').strip()
-                if orig_name in orig_to_expanded:
-                    for exp in orig_to_expanded[orig_name]:
+                queue = orig_to_expanded.get(orig_name)
+                if queue:
+                    # Pop only the next expanded item(s) that belong to this raw line.
+                    # FORMAT 1 (plain number like "10", "5") → always 1 item per raw line.
+                    # FORMAT 2/3 (comma description like "3X30,2X30") → N items per raw line,
+                    # all sharing the same user_description with commas.
+                    exp0 = queue.popleft()
+                    batch = [exp0]
+                    desc0 = exp0.get('user_description', '')
+                    # Only keep collecting if this is a multi-split (description has commas).
+                    # Avoids mis-grouping two separate raw lines that both have the same plain description.
+                    if ',' in desc0:
+                        while queue and queue[0].get('user_description', '') == desc0:
+                            batch.append(queue.popleft())
+                    for exp in batch:
                         new_item = dict(raw_item)
                         new_item['STOCKITEMNAME'] = exp['item_name']
                         new_item['ACTUALQTY'] = str(exp['quantity'])
@@ -693,7 +914,10 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
 
         # Auto-fetch missing products from Tally
         if missing_products:
+            missing_products = list(dict.fromkeys(missing_products))
             still_missing = []
+            fetched_any_product = False
+            fetched_product_ids = []
             for mp_name in missing_products:
                 logger.info(
                     f"[AUTO-FETCH:PRODUCT] #{voucher_no} | product='{mp_name}' "
@@ -708,8 +932,143 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                     stock_items_map[db_name] = fetched
                     overall_stats.setdefault('auto_fetched_products', 0)
                     overall_stats['auto_fetched_products'] += 1
+                    fetched_any_product = True
+                    created_ids = fetched.get('_created_product_ids') or []
+                    for pid in created_ids:
+                        if pid:
+                            fetched_product_ids.append(pid)
+                            auto_created_product_ids.append(pid)
                 else:
                     still_missing.append(mp_name)
+
+            if syncer and (auto_created_customer_id or auto_created_product_ids):
+                try:
+                    if auto_created_customer_id:
+                        cust_row = db.query_all(
+                            "SELECT * FROM customers WHERE id = ? LIMIT 1",
+                            (auto_created_customer_id,)
+                        )
+                        if cust_row:
+                            sync_res = syncer.sync_single_customer(dict(cust_row[0]))
+                            if sync_res.get('success'):
+                                db.mark_customer_synced(
+                                    auto_created_customer_id,
+                                    sync_res.get('catalytics_id'),
+                                    json_dumps(sync_res)
+                                )
+                                logger.info(
+                                    f"[AUTO-SYNC:CUSTOMER] #{voucher_no} | customer='{customer_name}' synced to server "
+                                    f"(id={sync_res.get('catalytics_id')})"
+                                )
+                            else:
+                                # User-requested behavior: treat auto-created records as synced locally.
+                                db.mark_customer_synced(auto_created_customer_id, None, json_dumps(sync_res))
+                                logger.warning(
+                                    f"[AUTO-SYNC:CUSTOMER] #{voucher_no} | customer='{customer_name}' sync failed: "
+                                    f"{sync_res.get('error')}"
+                                )
+                                logger.warning(
+                                    f"[AUTO-SYNC:CUSTOMER:DETAIL] #{voucher_no} | entity_id={syncer.entity_id} | "
+                                    f"endpoint='/import/tally-customer-payload/' | response={json_dumps(sync_res)}"
+                                )
+
+                    auto_created_product_ids = list(dict.fromkeys(auto_created_product_ids))
+                    prod_rows = []
+                    if auto_created_product_ids:
+                        placeholders = ",".join(["?"] * len(auto_created_product_ids))
+                        prod_rows = db.query_all(
+                            f"SELECT * FROM products WHERE id IN ({placeholders})",
+                            tuple(auto_created_product_ids)
+                        )
+
+                    batch_items = []
+                    batch_products = []
+                    for prod in prod_rows:
+                        stock_item, err = syncer._prepare_stock_item(prod)
+                        if not stock_item:
+                            logger.warning(
+                                f"[AUTO-SYNC:PRODUCT] #{voucher_no} | skip '{prod.get('name', '')}': {err}"
+                            )
+                            continue
+                        batch_items.append(stock_item)
+                        batch_products.append(prod)
+
+                    if batch_items:
+                        payload = {
+                            'entity_id': syncer.entity_id,
+                            'stock_items': batch_items,
+                            'created_by': config.DEFAULT_ADMIN_USER_ID,
+                        }
+                        resp = syncer._api_request(
+                            'POST',
+                            '/import/tally-product-payload/',
+                            json=payload,
+                            timeout=config.API_TIMEOUT_BATCH_SYNC,
+                        )
+                        if resp.status_code in [200, 201]:
+                            result = resp.json()
+                            data = result.get('data', result)
+                            results_list = data.get('results', [])
+                            synced_cnt = 0
+                            failed_cnt = 0
+                            for i, prod in enumerate(batch_products):
+                                row_res = results_list[i] if i < len(results_list) else {}
+                                status = row_res.get('status', 'error')
+                                if status in ('created', 'updated', 'skipped'):
+                                    catalytics_id = (
+                                        row_res.get('product_id')
+                                        or row_res.get('id')
+                                        or row_res.get('stock_item_id')
+                                    )
+                                    db.mark_product_synced(prod['id'], catalytics_id, json_dumps(row_res))
+                                    synced_cnt += 1
+                                else:
+                                    db.mark_product_synced(prod['id'], None, json_dumps(row_res))
+                                    failed_cnt += 1
+                            logger.info(
+                                f"[AUTO-SYNC:PRODUCT] #{voucher_no} | immediate sync for fetched products "
+                                f"(synced={synced_cnt}, failed={failed_cnt})"
+                            )
+                        else:
+                            resp_text = (resp.text or '').strip()
+                            for prod in batch_products:
+                                db.mark_product_synced(
+                                    prod['id'],
+                                    None,
+                                    json_dumps({'status': 'forced_local_sync', 'http_status': resp.status_code})
+                                )
+                            logger.warning(
+                                f"[AUTO-SYNC:PRODUCT] #{voucher_no} | HTTP {resp.status_code} for immediate product sync"
+                            )
+                            logger.warning(
+                                f"[AUTO-SYNC:PRODUCT:DETAIL] #{voucher_no} | entity_id={syncer.entity_id} | "
+                                f"endpoint='/import/tally-product-payload/' | status={resp.status_code} | "
+                                f"response={resp_text}"
+                            )
+                    else:
+                        logger.info(
+                            f"[AUTO-SYNC:PRODUCT] #{voucher_no} | no prepared fetched products for immediate sync"
+                        )
+                except Exception as sync_err:
+                    if auto_created_customer_id:
+                        db.mark_customer_synced(
+                            auto_created_customer_id,
+                            None,
+                            json_dumps({'status': 'forced_local_sync', 'error': str(sync_err)})
+                        )
+                    for pid in list(dict.fromkeys(auto_created_product_ids)):
+                        db.mark_product_synced(
+                            pid,
+                            None,
+                            json_dumps({'status': 'forced_local_sync', 'error': str(sync_err)})
+                        )
+                    logger.error(
+                        f"[AUTO-SYNC] #{voucher_no} | immediate customer/product sync error: {sync_err}"
+                    )
+                    logger.error(
+                        f"[AUTO-SYNC:DETAIL] #{voucher_no} | entity_id={getattr(syncer, 'entity_id', None)} | "
+                        f"customer_id={auto_created_customer_id} | product_ids={auto_created_product_ids}"
+                    )
 
             if still_missing:
                 logger.warning(
@@ -831,6 +1190,12 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
 
     db = Database(config.SQLITE_DB_PATH)
     tally = TallyClient(config.TALLY_URL)
+    try:
+        from sync_to_catalytics import CatalyticsSyncer
+        syncer = CatalyticsSyncer()
+    except Exception as e:
+        logger.warning(f"Could not initialize SyncEngine for immediate customer/product sync: {e}")
+        syncer = None
     active_companies = config.get_active_companies()
 
     if not active_companies:
@@ -862,13 +1227,16 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                 try:
                     invoices = tally.get_sales_invoices(company_name, from_date=s_date, to_date=e_date)
                     if invoices:
-                        _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date, ledger_cache, stock_cache, overall_stats)
+                        _process_invoice_batch(
+                            db, tally, company_name, invoices, from_date, to_date,
+                            ledger_cache, stock_cache, overall_stats, syncer=syncer
+                        )
                 except Exception as b_err:
                     logger.error(f"Batch failed: {b_err}")
                 
                 curr_start = curr_start + timedelta(days=30)
                 import time
-                time.sleep(2)
+                time.sleep(config.INVOICE_BATCH_SLEEP_SECONDS)
 
         except Exception as e:
             logger.error(f"Company process failed: {e}")

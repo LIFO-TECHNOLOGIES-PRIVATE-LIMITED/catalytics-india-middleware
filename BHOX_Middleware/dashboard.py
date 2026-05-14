@@ -86,7 +86,7 @@ def check_tally_connection():
     try:
         response = requests.get(
             f"{config.TALLY_URL}",
-            timeout=2,
+            timeout=config.TALLY_CHECK_TIMEOUT,
             headers={"Connection": "close"},
         )
         return response.status_code == 200
@@ -98,7 +98,7 @@ def check_tally_connection():
 def check_catalytics_connection():
     """Check if Catalytics backend is accessible"""
     try:
-        response = requests.get(f"{config.CATALYTICS_API_BASE}", timeout=2)
+        response = requests.get(f"{config.CATALYTICS_API_BASE}", timeout=config.CATALYTICS_CHECK_TIMEOUT)
         return response.status_code in [200, 404]  # 404 is OK, means server is up
     except:
         return False
@@ -2372,7 +2372,7 @@ def api_diagnostics():
             else:
                 try:
                     tally_response = requests.get(
-                        config.TALLY_URL, timeout=5,
+                        config.TALLY_URL, timeout=config.TALLY_CHECK_TIMEOUT,
                         headers={"Connection": "close"},
                     )
                     diagnostics['connections']['tally'] = {

@@ -216,6 +216,19 @@ class Config:
         cls.DEFAULT_FILLING_STATION_ID = os.getenv('DEFAULT_FILLING_STATION_ID', '1')
         cls.MASTER_SYNC_TIME = os.getenv('MASTER_SYNC_TIME', cls.MASTER_SYNC_TIME)
         cls.MASTER_SYNC_FAILURE_RETRY_MINUTES = int(os.getenv('MASTER_SYNC_FAILURE_RETRY_MINUTES', str(cls.MASTER_SYNC_FAILURE_RETRY_MINUTES)))
+        cls.INVOICE_FETCH_SYNC_LOOP_SECONDS = int(os.getenv('INVOICE_FETCH_SYNC_LOOP_SECONDS', '20'))
+        cls.AUTOMATION_RESTART_SLEEP_SECONDS = int(os.getenv('AUTOMATION_RESTART_SLEEP_SECONDS', '2'))
+        cls.INVOICE_BATCH_SLEEP_SECONDS = int(os.getenv('INVOICE_BATCH_SLEEP_SECONDS', '2'))
+        cls.LOOP_ERROR_RECOVERY_SECONDS = int(os.getenv('LOOP_ERROR_RECOVERY_SECONDS', '10'))
+        cls.DAILY_MASTER_ERROR_WAIT_SECONDS = int(os.getenv('DAILY_MASTER_ERROR_WAIT_SECONDS', '60'))
+        cls.API_TIMEOUT_INVOICE_SYNC = int(os.getenv('API_TIMEOUT_INVOICE_SYNC', '180'))
+        cls.API_TIMEOUT_BATCH_SYNC = int(os.getenv('API_TIMEOUT_BATCH_SYNC', '120'))
+        cls.API_TIMEOUT_SHORT = int(os.getenv('API_TIMEOUT_SHORT', '10'))
+        cls.TALLY_TIMEOUT_VOUCHER = int(os.getenv('TALLY_TIMEOUT_VOUCHER', '300'))
+        cls.TALLY_TIMEOUT_LEDGER = int(os.getenv('TALLY_TIMEOUT_LEDGER', '30'))
+        cls.TALLY_CHECK_TIMEOUT = int(os.getenv('TALLY_CHECK_TIMEOUT', '5'))
+        cls.CATALYTICS_CHECK_TIMEOUT = int(os.getenv('CATALYTICS_CHECK_TIMEOUT', '2'))
+        cls.POSTGRES_CONNECT_TIMEOUT = int(os.getenv('POSTGRES_CONNECT_TIMEOUT', '10'))
         return cls.INVOICE_FETCH_START_DATE
 
     @classmethod
@@ -242,6 +255,36 @@ class Config:
     # Daily master sync time (HH:MM) — fetch + sync all customers & products once per day
     MASTER_SYNC_TIME = os.getenv('MASTER_SYNC_TIME', '02:00')
     MASTER_SYNC_FAILURE_RETRY_MINUTES = int(os.getenv('MASTER_SYNC_FAILURE_RETRY_MINUTES', '30'))
+
+    # ── Loop / sleep timings ─────────────────────────────────────────────────
+    # How often the combined invoice fetch+sync loop runs (seconds)
+    INVOICE_FETCH_SYNC_LOOP_SECONDS = int(os.getenv('INVOICE_FETCH_SYNC_LOOP_SECONDS', '20'))
+    # Cooldown after automation restart (seconds)
+    AUTOMATION_RESTART_SLEEP_SECONDS = int(os.getenv('AUTOMATION_RESTART_SLEEP_SECONDS', '2'))
+    # Wait between Tally batch requests in invoice fetch (seconds)
+    INVOICE_BATCH_SLEEP_SECONDS = int(os.getenv('INVOICE_BATCH_SLEEP_SECONDS', '2'))
+    # Error-recovery wait in invoice fetch+sync loop (seconds)
+    LOOP_ERROR_RECOVERY_SECONDS = int(os.getenv('LOOP_ERROR_RECOVERY_SECONDS', '10'))
+    # Error-recovery wait in daily master loop (seconds)
+    DAILY_MASTER_ERROR_WAIT_SECONDS = int(os.getenv('DAILY_MASTER_ERROR_WAIT_SECONDS', '60'))
+
+    # ── API request timeouts ─────────────────────────────────────────────────
+    # Catalytics POST timeout for invoice DC sync (seconds)
+    API_TIMEOUT_INVOICE_SYNC = int(os.getenv('API_TIMEOUT_INVOICE_SYNC', '180'))
+    # Catalytics POST timeout for customer/product batch sync (seconds)
+    API_TIMEOUT_BATCH_SYNC = int(os.getenv('API_TIMEOUT_BATCH_SYNC', '120'))
+    # Catalytics GET timeout for filling-station / health lookups (seconds)
+    API_TIMEOUT_SHORT = int(os.getenv('API_TIMEOUT_SHORT', '10'))
+    # Tally voucher (Day Book) fetch timeout (seconds)
+    TALLY_TIMEOUT_VOUCHER = int(os.getenv('TALLY_TIMEOUT_VOUCHER', '300'))
+    # Tally ledger fetch timeout (seconds)
+    TALLY_TIMEOUT_LEDGER = int(os.getenv('TALLY_TIMEOUT_LEDGER', '30'))
+    # Tally connection-check timeout in dashboard (seconds)
+    TALLY_CHECK_TIMEOUT = int(os.getenv('TALLY_CHECK_TIMEOUT', '5'))
+    # Catalytics connection-check timeout in dashboard (seconds)
+    CATALYTICS_CHECK_TIMEOUT = int(os.getenv('CATALYTICS_CHECK_TIMEOUT', '2'))
+    # PostgreSQL connect timeout for direct DB operations (seconds)
+    POSTGRES_CONNECT_TIMEOUT = int(os.getenv('POSTGRES_CONNECT_TIMEOUT', '10'))
 
     # Database — resolved via _normalize_sqlite_db_path (see CO_middleware pattern)
     _sqlite_path, _tally_path = _resolve_database_paths()

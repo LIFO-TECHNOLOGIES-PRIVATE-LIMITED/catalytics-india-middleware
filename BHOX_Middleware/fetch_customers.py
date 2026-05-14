@@ -234,6 +234,20 @@ def _save_ledger_product_variants(db, company_name: str, ledger: dict) -> int:
 def _normalize_customer_name(raw_name):
     return ' '.join((raw_name or '').split())
 
+
+def _customer_changed(existing_row, customer_data):
+    """Return True only when meaningful customer fields changed."""
+    fields = (
+        'name', 'tally_company', 'gstin', 'pan', 'address',
+        'state', 'city', 'pincode', 'phone', 'email', 'data_json'
+    )
+    for f in fields:
+        old_val = existing_row[f] if existing_row and f in existing_row.keys() else None
+        new_val = customer_data.get(f)
+        if (old_val or '') != (new_val or ''):
+            return True
+    return False
+
 def fetch_customers_from_all_companies():
     """
     Fetch ALL customers (all ledger groups) from all active Tally companies.
@@ -292,13 +306,9 @@ def fetch_customers_from_all_companies():
 
                 if _is_non_customer_ledger(customer_name, parent_group):
                     logger.info(
-                        f"[LEDGER PRODUCT] '{customer_name}' (group: '{parent_group}') "
-                        f"— saving as product variants"
+                        f"[NO-SEPARATION] '{customer_name}' (group: '{parent_group}') "
+                        f"— saving in customers table (no product split)"
                     )
-                    overall_stats['skipped_non_customer'] += 1
-                    saved = _save_ledger_product_variants(db, company_name, customer)
-                    overall_stats['ledger_products_saved'] += saved
-                    continue
 
                 customer_data = {
                     'tally_guid': tally_guid,
@@ -319,12 +329,18 @@ def fetch_customers_from_all_companies():
                     existing = db.customer_exists_by_guid(tally_guid) if tally_guid else None
 
                     if existing:
-                        db.update_customer(existing['id'], customer_data)
-                        logger.info(
-                            f"[UPDATED] '{customer_name}' (GUID: {tally_guid}, "
-                            f"SQLite ID: {existing['id']})"
-                        )
-                        overall_stats['updated'] += 1
+                        if _customer_changed(existing, customer_data):
+                            db.update_customer(existing['id'], customer_data)
+                            logger.info(
+                                f"[UPDATED] '{customer_name}' (GUID: {tally_guid}, "
+                                f"SQLite ID: {existing['id']})"
+                            )
+                            overall_stats['updated'] += 1
+                        else:
+                            logger.info(
+                                f"[UNCHANGED] '{customer_name}' (GUID: {tally_guid}, "
+                                f"SQLite ID: {existing['id']})"
+                            )
                     else:
                         db.insert_customer(customer_data)
                         logger.info(

@@ -46,6 +46,22 @@ def _attach_product_fetch_file_handler():
 
 _attach_product_fetch_file_handler()
 
+
+def _product_changed(existing_row, product_data):
+    """Return True only when meaningful product fields changed."""
+    fields = (
+        'tally_guid', 'name', 'name_canonical', 'tally_company', 'hsn_code',
+        'unit', 'rate', 'description', 'data_json', 'product_master_name',
+        'variant_name', 'unit_name', 'product_type_code', 'product_type_name',
+        'gst_applicable', 'gst_rate', 'igst_rate', 'cgst_rate', 'sgst_rate'
+    )
+    for f in fields:
+        old_val = existing_row[f] if existing_row and f in existing_row.keys() else None
+        new_val = product_data.get(f)
+        if str(old_val or '') != str(new_val or ''):
+            return True
+    return False
+
 # ---------------------------------------------------------------------------
 # Variant definitions — mirrors fetch_customers.py ledger-product variants
 # Each entry: (size_str, unit_abbr, type_code, type_name)
@@ -79,7 +95,7 @@ _NAME_JUNK = re.compile(r'@\s*\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?\s*%|=|%')
 
 # For cylinders: strip embedded "7" or "10" (+ optional unit) from the name
 # so we get a clean base — we will then add ALL cylinder variants ourselves.
-_CYL_VARIANT_WITH_UNIT = re.compile(r'\b(10|7)\s*(?:cum|cub|cm|cubic)\b', re.IGNORECASE)
+_CYL_VARIANT_WITH_UNIT = re.compile(r'\b(\d+(?:\.\d+)?)\s*(?:cum|cub|cm|cubic)\b', re.IGNORECASE)
 _CYL_VARIANT_BARE      = re.compile(r'\b(10|7)\b')
 
 
@@ -121,13 +137,22 @@ def parse_stock_item_name(name):
     product_type      = _detect_product_type(clean)
     extracted_variant = None   # variant size found inside the name (cylinders only)
 
-    # For cylinders strip any embedded size so base name is just the gas name
+    # For cylinders strip any embedded size so base name is just the gas name.
+    # Use sub (not search+slice) to remove ALL occurrences — e.g. a Tally name like
+    # "ACM GAS 10 CUM BHOX" expanded to "ACM GAS 10 CUM BHOX 10cum (CYL)" has
+    # the size twice; we must strip both so product_master_name matches the DB.
     if product_type == 'CYLINDER':
         m = _CYL_VARIANT_WITH_UNIT.search(clean) or _CYL_VARIANT_BARE.search(clean)
         if m:
             extracted_variant = m.group(1)          # "7" or "10"
-            clean = (clean[:m.start()] + clean[m.end():]).strip()
+            clean = _CYL_VARIANT_WITH_UNIT.sub('', clean)
+            clean = _CYL_VARIANT_BARE.sub('', clean)
             clean = ' '.join(clean.split())
+
+    # Strip middleware-added type-code suffix "(CYL)", "(PLT)", "(TNK)" so that
+    # product_master_name matches what is stored in the DB (no suffix there).
+    clean = re.sub(r'\s*\(\s*(?:CYL|PLT|TNK)\s*\)\s*$', '', clean, flags=re.IGNORECASE).strip()
+    clean = ' '.join(clean.split())
 
     return {
         'product_master_name': clean,
@@ -262,11 +287,16 @@ def fetch_products_from_all_companies():
                             existing = db.product_exists_by_canonical(display_name)
 
                         if existing:
-                            db.update_product(existing['id'], product_data)
-                            logger.info(
-                                f"  [UPDATED] '{display_name}' (SQLite ID: {existing['id']})"
-                            )
-                            overall_stats['duplicates_skipped'] += 1
+                            if _product_changed(existing, product_data):
+                                db.update_product(existing['id'], product_data)
+                                logger.info(
+                                    f"  [UPDATED] '{display_name}' (SQLite ID: {existing['id']})"
+                                )
+                                overall_stats['duplicates_skipped'] += 1
+                            else:
+                                logger.info(
+                                    f"  [UNCHANGED] '{display_name}' (SQLite ID: {existing['id']})"
+                                )
                         else:
                             db.insert_product(product_data)
                             logger.info(f"  [NEW] '{display_name}'")
