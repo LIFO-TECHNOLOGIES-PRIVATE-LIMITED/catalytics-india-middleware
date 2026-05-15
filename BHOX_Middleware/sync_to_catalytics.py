@@ -578,6 +578,9 @@ class CatalyticsSyncer:
                     if abs(size_f - size) < 0.001:
                         # Apply size remapping (7.5 → 10)
                         variants = [(count, self._normalize_cylinder_size(size))]
+                    else:
+                        # Can't derive size — trust description count as cylinder qty directly
+                        variants = [(count, None)]
             elif tokens and tokens[0].isdigit() and len(tokens) > 1:
                 tail = tokens[1:]
                 if all(self._parse_variant_token(t) is not None for t in tail):
@@ -599,7 +602,8 @@ class CatalyticsSyncer:
             rate_per_cyl = (amount / total_cyls) if amount else rate
             for qty, size in variants:
                 new_line = dict(line)
-                variant_name = self._build_variant_name(orig_name, size)
+                # size=None when description count was trusted directly (can't infer size)
+                variant_name = self._build_variant_name(orig_name, size) if size is not None else orig_name
                 line_amount = round(rate_per_cyl * qty, 2)
                 new_line['STOCKITEMNAME'] = variant_name
                 new_line['ACTUALQTY'] = str(float(qty))
@@ -2186,9 +2190,26 @@ class CatalyticsSyncer:
         if invoice.get('delivery_address') and not voucher.get('CONSIGNEE'):
             voucher['CONSIGNEE'] = {'ADDRESS': invoice.get('delivery_address')}
 
-        # IMPORTANT: Do not do sync-time description expansion.
-        # Fetch layer already normalizes product names and quantities for BHOX.
-        # Re-expansion here has caused invalid names like "1cum/2cum".
+        # Override INVENTORY with the fetch-processed items_json.
+        # data_json INVENTORY holds raw Tally quantities (e.g. 14 CUM).
+        # items_json holds the description-expanded, qty-corrected values (e.g. 3 cylinders).
+        processed_items = self._safe_json_load(invoice.get('items_json')) or []
+        if processed_items:
+            voucher['INVENTORY'] = [
+                {
+                    'STOCKITEMNAME': it.get('item_name', ''),
+                    'ACTUALQTY':     str(it.get('quantity', 0)),
+                    'BILLEDQTY':     str(it.get('quantity', 0)),
+                    'RATE':          str(it.get('rate', 0)),
+                    'AMOUNT':        str(it.get('amount', 0)),
+                }
+                for it in processed_items
+                if it.get('item_name')
+            ]
+            logger.debug(
+                f"Invoice #{voucher_no}: INVENTORY overridden from items_json "
+                f"({len(voucher['INVENTORY'])} item(s))"
+            )
 
         # Extract ledger and stock data that were embedded during fetch
         ledgers_map = {}
@@ -2289,11 +2310,14 @@ class CatalyticsSyncer:
         return voucher, ledgers_map, stock_items_map, None
 
     def sync_invoices_to_dc(self):
-        """Sync invoices as DCs in batches via /import/tally-dc-guid-payload/ (GUID-based).
+        """Sync invoices as DCs in batches via /import/tally-delivery-challan-payload/.
         All data comes from SQLite (enriched during fetch) — no Tally calls at sync time."""
         logger.info("\n" + "="*60)
         logger.info("INVOICE TO DC SYNC (batch mode, GUID-based)")
         logger.info("="*60)
+
+        # Reset invoices stuck due to temporary backend/network errors so they are retried
+        self.db.reset_transient_failed_invoices()
 
         invoices = self.db.get_unsynced_invoices()
         logger.info(f"Found {len(invoices)} unsynced invoices")
@@ -2415,7 +2439,7 @@ class CatalyticsSyncer:
             try:
                 response = self._api_request(
                     'POST',
-                    '/import/tally-dc-guid-payload/',
+                    '/import/tally-delivery-challan-payload/',
                     json=request_payload,
                     timeout=config.API_TIMEOUT_INVOICE_SYNC,
                 )
@@ -2624,7 +2648,7 @@ class CatalyticsSyncer:
 
                 response = self._api_request(
                     'POST',
-                    '/import/tally-dc-name-payload/',
+                    '/import/tally-delivery-challan-payload/',
                     json=request_payload,
                 )
 
@@ -2841,7 +2865,7 @@ class CatalyticsSyncer:
                 }
                 response = self._api_request(
                     'POST',
-                    '/import/tally-dc-name-payload/',
+                    '/import/tally-delivery-challan-payload/',
                     json=request_payload,
                 )
                 if response.status_code in [200, 201]:

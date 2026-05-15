@@ -238,86 +238,27 @@ def _normalize_cylinder_size(size):
     return float(_CYL_SIZE_REMAP.get(s, s))
 
 
-def _infer_variant_no_description(item):
+def _qty_from_description(item):
     """
-    When no BASICUSERDESCRIPTION is provided, try to infer the cylinder variant
-    by dividing ACTUALQTY (total CUM) by standard fill sizes (7, 7.5, 10).
-    First clean division wins. 7.5 is remapped to 10 cum (business rule).
-    Only applies to cylinder products (not CO2 kg, not liquid tanks).
-    Returns an expanded item list, or None if inference is not possible.
-    """
-    orig_name = (item.get('item_name') or '').strip()
-    base_name = ' '.join(orig_name.replace('=', ' ').split())
-    base_name_l = base_name.lower()
+    FUNCTION 1: Get cylinder quantity from BASICUSERDESCRIPTION.
+    Called when the invoice item has a description field.
 
-    # Skip non-cylinder product types
-    if 'co2' in base_name_l or 'carbon dioxide' in base_name_l:
-        return None
-    if 'liquid' in base_name_l:
-        return None
-    if 'pallet' in base_name_l or ' plt' in base_name_l:
-        return None
+    Three formats:
+      FORMAT 1  →  '3'          plain count; size inferred from ACTUALQTY÷count
+      FORMAT 2  →  '5,3X7,2X10' total + QxS breakdown (total ignored, breakdown used)
+      FORMAT 3  →  '3X7,2X10'   QxS breakdown only
 
-    qty = float(item.get('quantity') or 0)
-    amt = float(item.get('amount') or 0)
-    rate = float(item.get('rate') or 0)
-
-    if qty <= 0:
-        return None
-
-    # Try standard fill sizes in priority order (CUM)
-    for raw_size in (7, 7.5, 10):
-        count = qty / raw_size
-        count_int = round(count)
-        if count_int > 0 and abs(count - count_int) < 0.001:
-            size = _normalize_cylinder_size(raw_size)
-            size_label = int(size) if size == int(size) else size
-            rate_per_cyl = (amt / count_int) if (amt and count_int > 0) else rate
-            logger.debug(
-                f"[INFER-VARIANT] '{orig_name}': qty={qty} / {raw_size} = {count_int} cyl "
-                f"→ '{base_name} {size_label}cum (CYL)'"
-            )
-            return [{
-                'item_name':        f"{base_name} {size_label}cum (CYL)",
-                'quantity':         float(count_int),
-                'rate':             round(rate_per_cyl, 2),
-                'amount':           round(amt, 2),
-                'user_description': '',
-                '_orig_name':       orig_name,
-            }]
-
-    return None
-
-
-def _expand_item_by_description(item):
-    """
-    Expand one Tally item into variant items using BASICUSERDESCRIPTION.
-
-    Three formats are supported:
-
-    1. Total count only  →  '10'
-       size = Tally_qty / 10  →  single item with correct variant name + cylinder qty
-
-    2. Total + breakdown  →  '10,3X10,7X7'
-       Expand into 2 items: 3 cylinders of 10cum, 7 cylinders of 7cum
-
-    3. Breakdown only (no total prefix)  →  '3X30,2X30'
-       Same as format 2 but first token is already a QxS pair
-
-    If no description: infer variant from ACTUALQTY (total CUM) using standard sizes.
-
-    Returns expanded list, or [item] unchanged if format/inference is not valid.
+    Returns expanded item list, or None if description is absent/unparseable.
     """
     user_desc = (item.get('user_description') or '').strip()
     if not user_desc:
-        # No description — try to infer variant from total quantity (CUM)
-        return _infer_variant_no_description(item) or [item]
+        return None
 
-    # Normalize separators: Tally may store multi-line descriptions with \n or \r\n
+    # Normalize newline separators Tally sometimes uses
     user_desc_normalized = re.sub(r'[\r\n]+', ',', user_desc)
     tokens = [t.strip() for t in user_desc_normalized.split(',') if t.strip()]
     if not tokens:
-        return [item]
+        return None
 
     orig_name = (item.get('item_name') or '').strip()
     base_name  = ' '.join(orig_name.replace('=', ' ').split())
@@ -338,12 +279,12 @@ def _expand_item_by_description(item):
         }
 
     def _build_multi(variant_tokens):
-        """Build expanded list from a list of QxS token strings."""
+        """Build expanded list from QxS token strings (e.g. ['3X7', '2X10'])."""
         variants = []
         for tok in variant_tokens:
             parsed = _parse_variant_token(tok)
             if parsed is None:
-                return None          # invalid token → abort expansion
+                return None
             variants.append(parsed)
         total_cyls = sum(q for q, _ in variants)
         if total_cyls == 0:
@@ -351,7 +292,6 @@ def _expand_item_by_description(item):
         rate_per_cyl = (orig_amt / total_cyls) if total_cyls > 0 else (item.get('rate', 0.0) or 0.0)
         result = []
         for qty, size in variants:
-            # Apply business remapping (7.5 cum fill → 10 cum cylinder)
             size = _normalize_cylinder_size(size)
             size_label = int(size) if size == int(size) else size
             result.append(_make_item(
@@ -362,46 +302,127 @@ def _expand_item_by_description(item):
             ))
         return result
 
-    # --- Determine format ---
     first_as_variant = _parse_variant_token(tokens[0])
 
     if first_as_variant is None:
-        # First token is a plain number (total count)
+        # First token is a plain count (FORMAT 1 or FORMAT 2)
         try:
             total_count = int(tokens[0])
         except ValueError:
-            return [item]
-
+            return None
         if total_count <= 0:
-            return [item]
+            return None
 
-        if len(tokens) == 1:
-            # FORMAT 1: total count only → infer size from Tally qty
-            if orig_qty <= 0:
-                return [item]
-            size_f = orig_qty / total_count
-            # Accept fractional sizes (e.g. 7.5cum); round to 2 dp to avoid floating-point noise
-            size = round(size_f, 2)
-            if abs(size_f - size) > 0.001:          # not a clean division
-                return [item]
-            # Apply business remapping (7.5 cum fill → 10 cum cylinder)
-            size = _normalize_cylinder_size(size)
-            size_label = int(size) if size == int(size) else size
-            rate_per_cyl = (orig_amt / total_count) if (orig_amt and total_count > 0) else (item.get('rate', 0.0) or 0.0)
-            return [_make_item(
-                f"{base_name} {size_label}{variant_unit} (CYL)",
-                total_count,
-                rate_per_cyl,
-                orig_amt,
-            )]
-        else:
-            # FORMAT 2: total + QxS breakdown
+        if len(tokens) > 1:
+            # FORMAT 2: total + QxS breakdown — use breakdown, ignore total
             result = _build_multi(tokens[1:])
-            return result if result is not None else [item]
+            return result  # None means unparseable → caller falls back to [item]
+
+        # FORMAT 1: plain count only
+        # Try to derive cylinder size from ACTUALQTY ÷ count
+        rate_per_cyl = (orig_amt / total_count) if (orig_amt and total_count > 0) else (item.get('rate', 0.0) or 0.0)
+        if orig_qty > 0:
+            size_f = orig_qty / total_count
+            size   = round(size_f, 2)
+            if abs(size_f - size) <= 0.001:
+                size = _normalize_cylinder_size(size)
+                size_label = int(size) if size == int(size) else size
+                return [_make_item(
+                    f"{base_name} {size_label}{variant_unit} (CYL)",
+                    total_count, rate_per_cyl, orig_amt,
+                )]
+        # Division not clean or qty=0 — trust count; DB lookup resolves variant name
+        return [_make_item(base_name, total_count, rate_per_cyl, orig_amt)]
     else:
         # FORMAT 3: all tokens are QxS (no leading total)
         result = _build_multi(tokens)
-        return result if result is not None else [item]
+        return result
+
+
+def _qty_from_fields(item):
+    """
+    FUNCTION 2: Get cylinder quantity when NO description is present.
+
+    Priority:
+      1. nos_qty  — BILLEDQTY from Tally (explicit number-of-cylinders field)
+      2. Infer from ACTUALQTY ÷ standard fill sizes (7, 7.5, 10 cum)
+
+    Only applies to cylinder products (CO2/liquid/pallet are skipped).
+    Returns expanded item list, or None if neither method works.
+    """
+    orig_name = (item.get('item_name') or '').strip()
+    base_name = ' '.join(orig_name.replace('=', ' ').split())
+    base_name_l = base_name.lower()
+
+    # Skip non-cylinder product types
+    if 'co2' in base_name_l or 'carbon dioxide' in base_name_l:
+        return None
+    if 'liquid' in base_name_l:
+        return None
+    if 'pallet' in base_name_l or ' plt' in base_name_l:
+        return None
+
+    amt  = float(item.get('amount')   or 0)
+    rate = float(item.get('rate')     or 0)
+    qty  = float(item.get('quantity') or 0)
+
+    # --- Priority 1: BILLEDQTY / nos_qty (number of cylinders field) ---
+    nos_qty = item.get('nos_qty')
+    if nos_qty and float(nos_qty) > 0:
+        count = int(round(float(nos_qty)))
+        rate_per_cyl = (amt / count) if (amt and count > 0) else rate
+        logger.debug(
+            f"[NOS-QTY] '{orig_name}': nos_qty={count} cylinders"
+        )
+        return [{
+            'item_name':        base_name,
+            'quantity':         float(count),
+            'rate':             round(rate_per_cyl, 2),
+            'amount':           round(amt, 2),
+            'user_description': '',
+            '_orig_name':       orig_name,
+        }]
+
+    # --- Priority 2: Infer from ACTUALQTY ÷ standard fill sizes ---
+    if qty <= 0:
+        return None
+
+    for raw_size in (7, 7.5, 10):
+        count_f   = qty / raw_size
+        count_int = round(count_f)
+        if count_int > 0 and abs(count_f - count_int) < 0.001:
+            size       = _normalize_cylinder_size(raw_size)
+            size_label = int(size) if size == int(size) else size
+            rate_per_cyl = (amt / count_int) if (amt and count_int > 0) else rate
+            logger.debug(
+                f"[INFER-VARIANT] '{orig_name}': qty={qty} / {raw_size} = {count_int} cyl "
+                f"→ '{base_name} {size_label}cum (CYL)'"
+            )
+            return [{
+                'item_name':        f"{base_name} {size_label}cum (CYL)",
+                'quantity':         float(count_int),
+                'rate':             round(rate_per_cyl, 2),
+                'amount':           round(amt, 2),
+                'user_description': '',
+                '_orig_name':       orig_name,
+            }]
+
+    return None
+
+
+def _expand_item_by_description(item):
+    """
+    Main entry point: expand a Tally inventory item into cylinder variant rows.
+
+    Route:
+      • Description present  → _qty_from_description()  (FUNCTION 1)
+      • No description       → _qty_from_fields()        (FUNCTION 2)
+      • Neither works        → return item unchanged
+    """
+    result = _qty_from_description(item)
+    if result is not None:
+        return result if result else [item]
+    return _qty_from_fields(item) or [item]
 
 
 def _is_customer_asset_product(name):

@@ -1614,6 +1614,13 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
                     'rate': _prate(it.get('RATE', '0')),
                     'amount': _prate(it.get('AMOUNT', '0')),
                 }
+                # BILLEDQTY holds the number-of-cylinders (NOS) when Tally uses
+                # compound units (e.g. CUM for stock, NOS for billing).
+                billed_raw = it.get('BILLEDQTY', '').strip()
+                if billed_raw:
+                    nos = _pqty(billed_raw)
+                    if nos and nos > 0:
+                        item_dict['nos_qty'] = nos
                 if it.get('BASICUSERDESCRIPTION'):
                     item_dict['user_description'] = it['BASICUSERDESCRIPTION']
                 inv['items'].append(item_dict)

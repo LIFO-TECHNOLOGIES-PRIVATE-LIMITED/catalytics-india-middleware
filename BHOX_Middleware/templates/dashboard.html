@@ -1856,6 +1856,7 @@
                                             class="sort-indicator"></span></th>
                                     <th class="sortable" onclick="sortTable('invoices', 'total_amount')">Amount <span
                                             class="sort-indicator"></span></th>
+                                    <th>Qty</th>
                                     <th class="sortable" onclick="sortTable('invoices', 'dc_no')">DC No <span
                                             class="sort-indicator"></span></th>
                                     <th class="sortable" onclick="sortTable('invoices', 'is_synced')">Sync Status <span
@@ -3126,23 +3127,30 @@
             document.getElementById('invoices-count').textContent = invoices.length;
 
             if (invoices.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" style="text-align: center; padding: 40px; color: #999;">No invoices found in SQLite. Switch to Customers or Products tab to view available data</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; padding: 40px; color: #999;">No invoices found in SQLite. Switch to Customers or Products tab to view available data</td></tr>';
                 return;
             }
 
-            tbody.innerHTML = invoices.map(inv => `
+            tbody.innerHTML = invoices.map(inv => {
+                let totalQty = '-';
+                try {
+                    const items = JSON.parse(inv.items_json || '[]');
+                    if (items.length > 0) totalQty = items.reduce((s, i) => s + (parseFloat(i.quantity) || 0), 0);
+                } catch(e) {}
+                return `
                 <tr>
                     <td><strong>${inv.voucher_no}</strong></td>
                     <td><span class="status-badge-small fetched">${inv.tally_company.substring(0, 15)}</span></td>
                     <td>${formatTallyDate(inv.voucher_date)}</td>
                     <td>${inv.customer_name}</td>
                     <td>${parseFloat(inv.total_amount).toFixed(2)}</td>
+                    <td>${totalQty}</td>
                     <td>${inv.dc_no}</td>
                     <td><span class="status-badge-small fetched">Fetched</span></td>
                     <td><span class="status-badge-small ${inv.is_synced ? 'synced' : 'pending'}">${inv.is_synced ? 'Synced' : 'Pending'}</span></td>
                     <td>${inv.last_sync_at ? new Date(inv.last_sync_at).toLocaleString() : '-'}</td>
-                </tr>
-            `).join('');
+                </tr>`;
+            }).join('');
         }
 
         function normalizeCompany(value) {
@@ -4047,11 +4055,17 @@
             const startIndex = (pagination.invoices.page - 1) * pagination.invoices.pageSize;
 
             if (invoices.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="11" style="text-align: center; padding: 40px; color: #999;">No invoices found in SQLite. Switch to Customers or Products tab to view available data</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="12" style="text-align: center; padding: 40px; color: #999;">No invoices found in SQLite. Switch to Customers or Products tab to view available data</td></tr>';
                 return;
             }
 
-            tbody.innerHTML = invoices.map((inv, index) => `
+            tbody.innerHTML = invoices.map((inv, index) => {
+                let totalQty = '-';
+                try {
+                    const items = JSON.parse(inv.items_json || '[]');
+                    if (items.length > 0) totalQty = items.reduce((s, i) => s + (parseFloat(i.quantity) || 0), 0);
+                } catch(e) {}
+                return `
                 <tr>
                     <td class="checkbox-cell" onclick="event.stopPropagation()">
                         <input type="checkbox" class="row-checkbox"
@@ -4064,6 +4078,7 @@
                     <td onclick="showInvoiceDetail(${inv.id})" style="cursor: pointer;">${formatTallyDate(inv.voucher_date)}</td>
                     <td onclick="showInvoiceDetail(${inv.id})" style="cursor: pointer;">${inv.customer_name}</td>
                     <td onclick="showInvoiceDetail(${inv.id})" style="cursor: pointer;">INR ${parseFloat(inv.total_amount).toFixed(2)}</td>
+                    <td onclick="showInvoiceDetail(${inv.id})" style="cursor: pointer;">${totalQty}</td>
                     <td onclick="showInvoiceDetail(${inv.id})" style="cursor: pointer;">${inv.dc_no}</td>
                     <td onclick="showInvoiceDetail(${inv.id})" style="cursor: pointer;"><span class="status-badge-small ${inv.is_synced ? 'synced' : 'pending'}">${inv.is_synced ? 'Synced' : 'Pending'}</span></td>
                     <td onclick="showInvoiceDetail(${inv.id})" style="cursor: pointer;">${inv.last_sync_at ? new Date(inv.last_sync_at).toLocaleString() : '-'}</td>
@@ -4072,8 +4087,8 @@
                           <button class="row-action-btn refetch" onclick="refetchRecord('invoices', ${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Refetch</button>
                           <button class="row-action-btn resync" onclick="resyncRecord('invoices', ${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Resync</button>
                     </td>
-                </tr>
-            `).join('');
+                </tr>`;
+            }).join('');
 
             updateSelectionUI('invoices');
         }

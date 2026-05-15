@@ -368,7 +368,7 @@ def api_data_invoices():
         SELECT id, tally_voucher_no, tally_company, voucher_date,
                customer_name, total_amount, dc_no,
                is_synced, catalytics_dc_id, first_fetched_at, last_sync_at,
-               sync_attempts, last_sync_error
+               sync_attempts, last_sync_error, items_json
         FROM invoices
         ORDER BY first_fetched_at DESC
     ''')
@@ -390,6 +390,7 @@ def api_data_invoices():
             'last_sync_at': row[10],
             'sync_attempts': row[11],
             'last_sync_error': row[12],
+            'items_json': row[13] or '[]',
             'order_status': None
         }
         invoices.append(inv)

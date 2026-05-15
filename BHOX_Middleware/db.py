@@ -789,6 +789,30 @@ class Database:
             WHERE id = ?
         """, (error_msg, response_json, invoice_id))
 
+    def reset_transient_failed_invoices(self):
+        """
+        Reset sync_attempts for invoices that failed due to temporary connectivity
+        errors (backend down, DB unreachable, network timeout).
+        Called at the start of each sync cycle so they are retried when backend recovers.
+        """
+        transient_patterns = [
+            '%Connection refused%',
+            '%Max retries exceeded%',
+            '%timed out%',
+            '%ConnectionError%',
+            '%Cannot connect to entity database%',
+            '%Failed to establish a new connection%',
+        ]
+        for pattern in transient_patterns:
+            self.execute("""
+                UPDATE invoices
+                SET sync_attempts = 0,
+                    last_sync_error = NULL
+                WHERE is_synced = 0
+                  AND sync_attempts >= 10
+                  AND last_sync_error LIKE ?
+            """, (pattern,))
+
     def update_invoice_dc_info(self, invoice_id, dc_no, catalytics_dc_id):
         """Update invoice with DC information without marking as synced."""
         self.execute("""

@@ -239,10 +239,28 @@ def fetch_products_from_all_companies():
                     continue
 
                 overall_stats['matched'] += 1
-                base_name    = parsed['product_master_name']
-                product_type = parsed['product_type']
-                tally_guid   = product.get('guid', '')
-                variants     = _PRODUCT_VARIANTS[product_type]
+                base_name          = parsed['product_master_name']
+                product_type       = parsed['product_type']
+                extracted_variant  = parsed.get('extracted_variant')   # '7', '10', '7.5', or None
+                tally_guid         = product.get('guid', '')
+                variants           = _PRODUCT_VARIANTS[product_type]
+
+                # For CYLINDER type: if the Tally name already contains a specific size,
+                # only create that one variant instead of all variants.
+                # Apply 7.5 → 10 business rule here too.
+                if product_type == 'CYLINDER' and extracted_variant:
+                    try:
+                        ev_f = float(extracted_variant)
+                        # 7.5 cum gas fill → 10 cum cylinder
+                        if abs(ev_f - 7.5) < 0.01:
+                            ev_f = 10.0
+                        ev_str = str(int(ev_f)) if ev_f == int(ev_f) else str(ev_f)
+                        filtered = [v for v in variants if str(v[0]) == ev_str]
+                        if filtered:
+                            variants = filtered
+                        # If no match (e.g. unusual size), fall back to all variants
+                    except (ValueError, TypeError):
+                        pass
 
                 logger.info(
                     f"[PARSED] '{product_name}' -> base='{base_name}', "
