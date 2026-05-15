@@ -86,7 +86,7 @@ def check_tally_connection():
     try:
         response = requests.get(
             f"{config.TALLY_URL}",
-            timeout=2,
+            timeout=config.TALLY_CHECK_TIMEOUT,
             headers={"Connection": "close"},
         )
         return response.status_code == 200
@@ -98,7 +98,7 @@ def check_tally_connection():
 def check_catalytics_connection():
     """Check if Catalytics backend is accessible"""
     try:
-        response = requests.get(f"{config.CATALYTICS_API_BASE}", timeout=2)
+        response = requests.get(f"{config.CATALYTICS_API_BASE}", timeout=config.CATALYTICS_CHECK_TIMEOUT)
         return response.status_code in [200, 404]  # 404 is OK, means server is up
     except:
         return False
@@ -368,7 +368,7 @@ def api_data_invoices():
         SELECT id, tally_voucher_no, tally_company, voucher_date,
                customer_name, total_amount, dc_no,
                is_synced, catalytics_dc_id, first_fetched_at, last_sync_at,
-               sync_attempts, last_sync_error
+               sync_attempts, last_sync_error, items_json
         FROM invoices
         ORDER BY first_fetched_at DESC
     ''')
@@ -390,6 +390,7 @@ def api_data_invoices():
             'last_sync_at': row[10],
             'sync_attempts': row[11],
             'last_sync_error': row[12],
+            'items_json': row[13] or '[]',
             'order_status': None
         }
         invoices.append(inv)
@@ -2372,7 +2373,7 @@ def api_diagnostics():
             else:
                 try:
                     tally_response = requests.get(
-                        config.TALLY_URL, timeout=5,
+                        config.TALLY_URL, timeout=config.TALLY_CHECK_TIMEOUT,
                         headers={"Connection": "close"},
                     )
                     diagnostics['connections']['tally'] = {

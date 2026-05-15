@@ -8,6 +8,8 @@ from typing import List, Dict, Optional
 import requests
 import xml.etree.ElementTree as ET
 
+from config import config
+
 DEFAULT_URL = "http://localhost:9000/"
 logger = logging.getLogger(__name__)
 
@@ -906,6 +908,7 @@ def parse_delivery_notes(response_xml: str):
             voucher.findtext(".//GOODSVEHICLENUMBER") or
             voucher.findtext(".//MOTORVEHICLENO") or
             voucher.findtext(".//BASICMOTORVEHICLENO") or
+            voucher.findtext(".//BASICSHIPVESSELNO") or
             voucher.findtext(".//VATVEHICLENUMBER") or
             voucher.findtext(".//VATVEHICLENO") or
             voucher.findtext(".//VEHICLENO") or
@@ -1565,8 +1568,7 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
 </ENVELOPE>
 """
     try:
-        # Long timeout (5m) for massive XML exports from BHOX Tally
-        resp = send_request(xml, url, timeout=300)
+        resp = send_request(xml, url, timeout=config.TALLY_TIMEOUT_VOUCHER)
         raw_vouchers = parse_delivery_notes(resp)
         logger.info("[get_sales_invoices] Company='%s' got %d total vouchers from Tally report", company_name, len(raw_vouchers))
         
@@ -1612,6 +1614,13 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
                     'rate': _prate(it.get('RATE', '0')),
                     'amount': _prate(it.get('AMOUNT', '0')),
                 }
+                # BILLEDQTY holds the number-of-cylinders (NOS) when Tally uses
+                # compound units (e.g. CUM for stock, NOS for billing).
+                billed_raw = it.get('BILLEDQTY', '').strip()
+                if billed_raw:
+                    nos = _pqty(billed_raw)
+                    if nos and nos > 0:
+                        item_dict['nos_qty'] = nos
                 if it.get('BASICUSERDESCRIPTION'):
                     item_dict['user_description'] = it['BASICUSERDESCRIPTION']
                 inv['items'].append(item_dict)
@@ -1673,7 +1682,7 @@ def get_voucher_by_number(company_name: str, voucher_no: str, url: Optional[str]
 </ENVELOPE>
 """
     try:
-        resp = send_request(xml, url, timeout=30)
+        resp = send_request(xml, url, timeout=config.TALLY_TIMEOUT_LEDGER)
         vouchers = parse_delivery_notes(resp)
         if vouchers:
             # Also normalize to common schema

@@ -214,7 +214,7 @@ class AutomationManager:
         """Restart automation loops"""
         logger.info("Restarting automation...")
         self.stop()
-        time.sleep(2)
+        time.sleep(config.AUTOMATION_RESTART_SLEEP_SECONDS)
         return self.start()
 
     def _try_acquire_global(self, task):
@@ -420,7 +420,7 @@ class AutomationManager:
                 last_run_success = False
                 logger.error(f"[DAILY MASTER] Error: {e}", exc_info=True)
                 self._log_to_dashboard(f"=== DAILY MASTER SYNC ERROR: {e} ===")
-                self.stop_flags[task].wait(timeout=60)
+                self.stop_flags[task].wait(timeout=config.DAILY_MASTER_ERROR_WAIT_SECONDS)
 
     # _fetch_invoices_loop and _sync_loop removed — merged into _invoice_fetch_sync_loop
 
@@ -435,7 +435,7 @@ class AutomationManager:
 
         task = 'sync'
         syncer = CatalyticsSyncer()
-        interval = 20  # Fixed 20 seconds
+        interval = config.INVOICE_FETCH_SYNC_LOOP_SECONDS
 
         while not self.stop_flags[task].is_set():
             try:
@@ -484,7 +484,7 @@ class AutomationManager:
             except Exception as e:
                 logger.error(f"Error in invoice fetch+sync: {e}")
                 self._log_to_dashboard(f"=== AUTO: INVOICE FETCH+SYNC ERROR: {e} ===")
-                self.stop_flags[task].wait(timeout=10)
+                self.stop_flags[task].wait(timeout=config.LOOP_ERROR_RECOVERY_SECONDS)
 
 
 # Global automation manager instance

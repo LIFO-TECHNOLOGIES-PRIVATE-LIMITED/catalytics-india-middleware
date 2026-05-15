@@ -445,7 +445,7 @@ class Database:
 
     def insert_customer(self, customer_data):
         """Insert new customer"""
-        self.execute("""
+        cursor = self.execute("""
             INSERT INTO customers (
                 tally_guid, name, tally_company, gstin, pan,
                 address, state, city, pincode, phone, email,
@@ -465,6 +465,7 @@ class Database:
             customer_data.get('email'),
             customer_data.get('data_json')
         ))
+        return cursor.lastrowid if cursor else None
 
     def update_customer(self, customer_id, customer_data):
         """Update existing customer by id with fresh data and mark for re-sync."""
@@ -545,7 +546,7 @@ class Database:
 
     def insert_product(self, product_data):
         """Insert new product with canonical name for uniqueness checking"""
-        self.execute("""
+        cursor = self.execute("""
             INSERT INTO products (
                 tally_guid, name, name_canonical, tally_company, hsn_code, unit,
                 rate, description, data_json,
@@ -575,6 +576,7 @@ class Database:
             product_data.get('cgst_rate', 0.0),
             product_data.get('sgst_rate', 0.0),
         ))
+        return cursor.lastrowid if cursor else None
 
     def update_product(self, product_id, product_data):
         """Update existing product by id with fresh data and mark for re-sync."""
@@ -786,6 +788,30 @@ class Database:
                 last_sync_at = CURRENT_TIMESTAMP
             WHERE id = ?
         """, (error_msg, response_json, invoice_id))
+
+    def reset_transient_failed_invoices(self):
+        """
+        Reset sync_attempts for invoices that failed due to temporary connectivity
+        errors (backend down, DB unreachable, network timeout).
+        Called at the start of each sync cycle so they are retried when backend recovers.
+        """
+        transient_patterns = [
+            '%Connection refused%',
+            '%Max retries exceeded%',
+            '%timed out%',
+            '%ConnectionError%',
+            '%Cannot connect to entity database%',
+            '%Failed to establish a new connection%',
+        ]
+        for pattern in transient_patterns:
+            self.execute("""
+                UPDATE invoices
+                SET sync_attempts = 0,
+                    last_sync_error = NULL
+                WHERE is_synced = 0
+                  AND sync_attempts >= 10
+                  AND last_sync_error LIKE ?
+            """, (pattern,))
 
     def update_invoice_dc_info(self, invoice_id, dc_no, catalytics_dc_id):
         """Update invoice with DC information without marking as synced."""

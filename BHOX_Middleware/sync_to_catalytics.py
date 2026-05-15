@@ -76,6 +76,9 @@ _attach_product_sync_file_handler()
 class CatalyticsSyncer:
     """Sync data to Catalytics using Tally payload endpoints"""
 
+    # Set to True to re-enable Instant DC matching & reconciliation
+    _INSTANT_DC_ENABLED = False
+
     def __init__(self):
         self.db = Database(config.SQLITE_DB_PATH)
         self.verifier = SyncVerifier()
@@ -268,11 +271,77 @@ class CatalyticsSyncer:
         if row:
             return row
 
-        return self.db.query(
+        row = self.db.query(
             "SELECT * FROM products WHERE lower(replace(replace(name, '=', ''), ' ', '')) LIKE ? "
             "ORDER BY is_synced DESC, id ASC LIMIT 1",
             (normalized + '%',)
         )
+        if row:
+            return row
+
+        # Fetch-style fallback: parse base product and optionally variant from name.
+        # This handles names like "ACM GAS 10 CUM BHOX 10cum (CYL)" mapping to
+        # stored canonical names such as "ACM GAS BHOX 10cum (CYL)".
+        try:
+            from fetch_products import parse_stock_item_name
+            parsed = parse_stock_item_name(name)
+        except Exception:
+            parsed = None
+
+        if parsed:
+            base_name = ' '.join(str(parsed.get('product_master_name') or '').split())
+            if base_name:
+                base_norm = ''.join(base_name.replace('=', ' ').lower().split())
+                extracted_v = parsed.get('extracted_variant')
+                if extracted_v:
+                    row = self.db.query(
+                        "SELECT * FROM products "
+                        "WHERE lower(replace(replace(product_master_name, '=', ''), ' ', '')) = ? "
+                        "AND variant_name LIKE ? "
+                        "ORDER BY is_synced DESC, id ASC LIMIT 1",
+                        (base_norm, f"{extracted_v}%")
+                    )
+                    if row:
+                        return row
+
+                row = self.db.query(
+                    "SELECT * FROM products "
+                    "WHERE lower(replace(replace(product_master_name, '=', ''), ' ', '')) = ? "
+                    "ORDER BY is_synced DESC, id ASC LIMIT 1",
+                    (base_norm,)
+                )
+                if row:
+                    return row
+
+        # Final fallback: aggressive signature match against product name.
+        target_sig = ''.join(self._normalize_product_signature(name).split())
+        if not target_sig:
+            return None
+        candidates = self.db.query_all("SELECT * FROM products ORDER BY is_synced DESC, id ASC")
+        for cand in candidates:
+            cand_name = self._row_get(cand, 'name', '')
+            cand_sig = ''.join(self._normalize_product_signature(cand_name).split())
+            if cand_sig == target_sig:
+                return cand
+        return None
+
+    def _canonicalize_items_to_db_products(self, items):
+        """Mutate item names to DB canonical product names when possible."""
+        changed = 0
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            item_name = (item.get('item_name') or '').strip()
+            if not item_name:
+                continue
+            row = self._get_product_row_by_name(item_name)
+            if not row:
+                continue
+            canonical = (self._row_get(row, 'name') or '').strip()
+            if canonical and canonical != item_name:
+                item['item_name'] = canonical
+                changed += 1
+        return changed
 
     def _fetch_unsynced_instant_dcs(self):
         """
@@ -280,6 +349,8 @@ class CatalyticsSyncer:
         The enhanced list endpoint now returns dc_date, customer, and order_details.
         Falls back to per-DC detail fetch if the basic list is missing dc_date.
         """
+        if not self._INSTANT_DC_ENABLED:
+            return []
         logger.info("Fetching unsynced Instant DCs from Catalytics for matching...")
         try:
             response = self._api_request('GET', '/transaction/delivery_challan/instant/unsynced')
@@ -354,13 +425,44 @@ class CatalyticsSyncer:
         return ' '.join(s.split())
 
     @staticmethod
-    def _parse_variant_token(token):
-        """Parse token like '3X30' into (qty, size)."""
+    def _normalize_product_signature(value):
+        """
+        Aggressive product normalization for cross-format name matching.
+        Strips: type codes (CYL/TNK/PLT), variant sizes (7cum/30kg/200lit),
+        filler words (in, cylinder/s, bhox, airgas), and special characters.
+        Result: just the core gas name so portal names ('ARGON') and Tally names
+        ('ARGON IN CYLINDERS BHOX 7cum (CYL)') both reduce to the same token ('argon').
+        """
         import re
-        m = re.match(r'^\s*(\d+)\s*[xX]\s*(\d+)\s*$', str(token or ''))
+        s = str(value or '').lower().replace('=', ' ')
+        # Strip type codes
+        s = re.sub(r'\((?:cyl|tnk|plt|con)\)', ' ', s, flags=re.IGNORECASE)
+        # Strip variant sizes (7cum, 30kg, 200lit, 200litre, 7.5cum)
+        s = re.sub(r'\b\d+(?:\.\d+)?\s*(?:cum|kg|lit|litre)\b', ' ', s, flags=re.IGNORECASE)
+        # Strip filler words that never differentiate gas products
+        s = re.sub(r'\b(in|cylinder|cylinders|bhox|airgas|gas|private|limited|pvt|ltd)\b', ' ', s)
+        # Strip remaining non-alphanumeric
+        s = re.sub(r'[^a-z0-9\s]', ' ', s)
+        return ' '.join(s.split())
+
+    @staticmethod
+    def _parse_variant_token(token):
+        """Parse token like '3X30' or '2X7.5' into (qty, size)."""
+        import re
+        m = re.match(r'^\s*(\d+)\s*[xX]\s*(\d+(?:\.\d+)?)\s*$', str(token or ''))
         if not m:
             return None
-        return int(m.group(1)), int(m.group(2))
+        qty = int(m.group(1))
+        size = float(m.group(2))
+        return qty, size
+
+    @staticmethod
+    def _normalize_cylinder_size(size):
+        """Remap non-standard fill sizes to actual cylinder type.
+        7.5 cum gas fill → 10 cum cylinder (BHOX business rule)."""
+        _REMAP = {7.5: 10.0}
+        s = round(float(size), 2)
+        return float(_REMAP.get(s, s))
 
     @staticmethod
     def _parse_amount(value):
@@ -377,10 +479,15 @@ class CatalyticsSyncer:
 
     @staticmethod
     def _build_variant_name(base_name, size):
+        import re
         base = ' '.join(str(base_name or '').replace('=', ' ').split())
+        # Remove trailing variant suffix if already present, e.g. "... 10cum (CYL)"
+        base = re.sub(r'\s+\d+(?:\.\d+)?\s*(?:cum|kg|lit|litre)\s*\(cyl\)\s*$', '', base, flags=re.IGNORECASE)
         base_l = base.lower()
         unit = 'kg' if 'co2' in base_l else 'cum'
-        return f"{base} {int(size)}{unit} (CYL)"
+        size_val = float(size)
+        size_label = int(size_val) if size_val == int(size_val) else size_val
+        return f"{base} {size_label}{unit} (CYL)"
 
     def _expand_inventory_by_description(self, inventory):
         """
@@ -390,6 +497,8 @@ class CatalyticsSyncer:
         - '3X30,2X30' -> explicit multi-variant split
         """
         expanded = []
+        import re
+        already_variant_pat = re.compile(r'\b\d+\s*(?:cum|kg|lit|litre)\s*\(cyl\)\b', re.IGNORECASE)
         for line in (inventory or []):
             if not isinstance(line, dict):
                 expanded.append(line)
@@ -397,10 +506,46 @@ class CatalyticsSyncer:
 
             desc = str(line.get('BASICUSERDESCRIPTION') or '').strip()
             if not desc:
-                expanded.append(line)
+                # No description — try to infer cylinder variant from total qty
+                orig_name = (line.get('STOCKITEMNAME') or line.get('ITEMNAME') or '').strip()
+                base_l = ' '.join(orig_name.replace('=', ' ').split()).lower()
+                # Only attempt inference for cylinder-type products
+                is_cylinder = (
+                    'co2' not in base_l
+                    and 'carbon dioxide' not in base_l
+                    and 'liquid' not in base_l
+                    and 'pallet' not in base_l
+                    and ' plt' not in base_l
+                )
+                inferred = False
+                if is_cylinder and not already_variant_pat.search(orig_name):
+                    qty_total = self._parse_amount(line.get('ACTUALQTY'))
+                    amount = self._parse_amount(line.get('AMOUNT'))
+                    rate = self._parse_amount(line.get('RATE'))
+                    if qty_total > 0:
+                        for raw_size in (7, 7.5, 10):
+                            count = qty_total / raw_size
+                            count_int = round(count)
+                            if count_int > 0 and abs(count - count_int) < 0.001:
+                                size = self._normalize_cylinder_size(raw_size)
+                                variant_name = self._build_variant_name(orig_name, size)
+                                rate_per_cyl = (amount / count_int) if (amount and count_int > 0) else rate
+                                new_line = dict(line)
+                                new_line['STOCKITEMNAME'] = variant_name
+                                new_line['ACTUALQTY'] = str(float(count_int))
+                                new_line['BILLEDQTY'] = str(float(count_int))
+                                new_line['RATE'] = str(round(rate_per_cyl, 2))
+                                new_line['AMOUNT'] = str(round(amount, 2))
+                                expanded.append(new_line)
+                                inferred = True
+                                break
+                if not inferred:
+                    expanded.append(line)
                 continue
 
-            tokens = [t.strip() for t in desc.split(',') if t.strip()]
+            # Normalize separators: Tally may store multi-line descriptions with \n or \r\n
+            desc_normalized = re.sub(r'[\r\n]+', ',', desc)
+            tokens = [t.strip() for t in desc_normalized.split(',') if t.strip()]
             if not tokens:
                 expanded.append(line)
                 continue
@@ -410,20 +555,40 @@ class CatalyticsSyncer:
             qty_total = self._parse_amount(line.get('ACTUALQTY'))
             orig_name = (line.get('STOCKITEMNAME') or line.get('ITEMNAME') or '').strip()
 
+            # Fetch flow already expands to canonical variant names like "... 7cum (CYL)".
+            # Do not re-expand those names at sync time, otherwise we can generate
+            # invalid synthetic names such as "... 1cum (CYL)".
+            if already_variant_pat.search(orig_name):
+                expanded.append(line)
+                continue
+
             variants = []
             if all(self._parse_variant_token(t) is not None for t in tokens):
-                variants = [self._parse_variant_token(t) for t in tokens]
+                # FORMAT 3: all tokens are QxS — apply size remapping (7.5 → 10)
+                variants = [
+                    (q, self._normalize_cylinder_size(s))
+                    for q, s in [self._parse_variant_token(t) for t in tokens]
+                ]
             elif len(tokens) == 1 and tokens[0].isdigit():
                 count = int(tokens[0])
                 if count > 0 and qty_total > 0:
                     size_f = qty_total / count
-                    size_i = int(size_f)
-                    if abs(size_f - size_i) < 0.001:
-                        variants = [(count, size_i)]
+                    # Accept fractional sizes (e.g. 7.5); round to 2 dp to avoid float noise
+                    size = round(size_f, 2)
+                    if abs(size_f - size) < 0.001:
+                        # Apply size remapping (7.5 → 10)
+                        variants = [(count, self._normalize_cylinder_size(size))]
+                    else:
+                        # Can't derive size — trust description count as cylinder qty directly
+                        variants = [(count, None)]
             elif tokens and tokens[0].isdigit() and len(tokens) > 1:
                 tail = tokens[1:]
                 if all(self._parse_variant_token(t) is not None for t in tail):
-                    variants = [self._parse_variant_token(t) for t in tail]
+                    # FORMAT 2: total + QxS breakdown — apply size remapping
+                    variants = [
+                        (q, self._normalize_cylinder_size(s))
+                        for q, s in [self._parse_variant_token(t) for t in tail]
+                    ]
 
             if not variants:
                 expanded.append(line)
@@ -437,7 +602,8 @@ class CatalyticsSyncer:
             rate_per_cyl = (amount / total_cyls) if amount else rate
             for qty, size in variants:
                 new_line = dict(line)
-                variant_name = self._build_variant_name(orig_name, size)
+                # size=None when description count was trusted directly (can't infer size)
+                variant_name = self._build_variant_name(orig_name, size) if size is not None else orig_name
                 line_amount = round(rate_per_cyl * qty, 2)
                 new_line['STOCKITEMNAME'] = variant_name
                 new_line['ACTUALQTY'] = str(float(qty))
@@ -460,10 +626,12 @@ class CatalyticsSyncer:
         customer_name_norm = self._normalize_name(invoice.get('customer_name'))
         invoice_date = str(invoice.get('voucher_date') or '').replace('-', '').strip()
 
-        # Build product map for invoice: {normalized_product_name: total_qty}
+        # Build product map for invoice: {signature: total_qty}
+        # Use _normalize_product_signature so "ACM GAS BHOX 10cum (CYL)" matches
+        # "ACM GAS 10CUM" — strips variant size, type-code, junk characters.
         invoice_products = {}
         for it in items:
-            name = self._normalize_name(it.get('item_name'))
+            name = ''.join(self._normalize_product_signature(it.get('item_name')).split())
             qty = float(it.get('quantity') or 0)
             if name and qty > 0:
                 invoice_products[name] = invoice_products.get(name, 0) + qty
@@ -538,12 +706,19 @@ class CatalyticsSyncer:
             for it in dc_items:
                 product_obj = it.get('product')
                 if isinstance(product_obj, dict):
-                    name = self._normalize_name(product_obj.get('name'))
+                    raw_name = product_obj.get('name')
                 else:
-                    name = self._normalize_name(it.get('product_name'))
+                    raw_name = it.get('product_name')
+                name = ''.join(self._normalize_product_signature(raw_name).split())
                 qty = float(it.get('quantity') or 0)
+                logger.debug(
+                    f"  [DC {dc_id}] raw_product='{raw_name}' → normalized='{name}', qty={qty}"
+                )
                 if name and qty > 0:
                     dc_products[name] = dc_products.get(name, 0) + qty
+
+            logger.info(f"  [DC {dc_id}] DC products: {dc_products}")
+            logger.info(f"  [DC {dc_id}] Inv products: {invoice_products}")
 
             # 5. Compare product counts
             if len(dc_products) != len(invoice_products):
@@ -554,13 +729,14 @@ class CatalyticsSyncer:
                 )
                 continue
 
-            # 6. Compare each product + quantity
+            # 6. Compare each product + quantity (use tolerance for float comparison)
             matched = True
             for name, qty in invoice_products.items():
-                if dc_products.get(name) != qty:
+                dc_qty = dc_products.get(name)
+                if dc_qty is None or abs(dc_qty - qty) > 0.001:
                     logger.info(
                         f"  [DC {dc_id}] Product/Qty mismatch for '{name}': "
-                        f"DC={dc_products.get(name)}, Inv={qty}"
+                        f"DC={dc_qty}, Inv={qty}"
                     )
                     matched = False
                     break
@@ -574,6 +750,8 @@ class CatalyticsSyncer:
 
     def _validate_invoice_for_sync(self, invoice, items):
         """Validate that customer and products exist before syncing"""
+        # Align invoice item names to local DB canonical names first.
+        self._canonicalize_items_to_db_products(items)
         customer_name = invoice.get('customer_name', '').strip()
 
         # Check customer
@@ -586,6 +764,108 @@ class CatalyticsSyncer:
         if not products_ok:
             return False, products_msg
 
+        return True, None
+
+    def _ensure_invoice_dependencies_synced(self, invoice, items):
+        """
+        Attempt to sync missing customer/products needed by a single invoice.
+        Returns (True, None) on success, otherwise (False, error_msg).
+        """
+        voucher_no = str(invoice.get('tally_voucher_no') or invoice.get('voucher_no') or '').strip()
+        customer_name = (invoice.get('customer_name') or '').strip()
+
+        # 1) Customer recovery
+        customer_ok, customer_msg = self._customer_exists(customer_name)
+        if not customer_ok:
+            customer_row = self._get_customer_row_by_name(customer_name)
+            if not customer_row:
+                return False, f"{customer_msg}; customer not found in local DB"
+
+            sync_res = self.sync_single_customer(dict(customer_row))
+            if not sync_res.get('success'):
+                return False, f"{customer_msg}; customer sync failed: {sync_res.get('error')}"
+
+            customer_id = self._row_get(customer_row, 'id')
+            if customer_id:
+                self.db.mark_customer_synced(
+                    customer_id,
+                    sync_res.get('catalytics_id'),
+                    json.dumps(sync_res)
+                )
+
+        # 2) Product recovery (only products used in this invoice)
+        product_rows = []
+        for item in items or []:
+            item_name = (item.get('item_name') or '').strip()
+            if not item_name:
+                continue
+
+            row = self._get_product_row_by_name(item_name)
+            if not row:
+                return False, f"Product '{item_name}' not found in local DB"
+            if self._row_get(row, 'is_synced') == 1:
+                continue
+            product_rows.append(row)
+
+        # Deduplicate rows by SQLite id
+        seen_ids = set()
+        unique_rows = []
+        for row in product_rows:
+            rid = self._row_get(row, 'id')
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            unique_rows.append(row)
+
+        if unique_rows:
+            batch_items = []
+            batch_products = []
+            for row in unique_rows:
+                stock_item, err = self._prepare_stock_item(row)
+                if not stock_item:
+                    return False, f"Product prepare failed for '{self._row_get(row, 'name', '')}': {err}"
+                batch_items.append(stock_item)
+                batch_products.append(row)
+
+            payload = {
+                'entity_id': self.entity_id,
+                'stock_items': batch_items,
+                'created_by': config.DEFAULT_ADMIN_USER_ID,
+            }
+            response = self._api_request(
+                'POST',
+                '/import/tally-product-payload/',
+                json=payload,
+                timeout=config.API_TIMEOUT_BATCH_SYNC,
+            )
+            if response.status_code not in [200, 201]:
+                raw = (response.text or '')[:1200]
+                return False, f"Product sync HTTP {response.status_code}: {raw}"
+
+            try:
+                result = response.json()
+            except Exception:
+                return False, "Product sync returned invalid JSON"
+
+            data = result.get('data', result)
+            results_list = data.get('results', [])
+            for i, row in enumerate(batch_products):
+                row_res = results_list[i] if i < len(results_list) else {}
+                status = row_res.get('status', 'error')
+                if status in ('created', 'updated', 'skipped'):
+                    catalytics_id = (
+                        row_res.get('product_id')
+                        or row_res.get('id')
+                        or row_res.get('stock_item_id')
+                    )
+                    self.db.mark_product_synced(self._row_get(row, 'id'), catalytics_id, json.dumps(row_res))
+                else:
+                    return False, f"Product sync failed for '{self._row_get(row, 'name', '')}': {row_res}"
+
+        logger.info(
+            f"[AUTO-RECOVER] Invoice #{voucher_no}: dependency sync completed "
+            f"(customer='{customer_name}', products={len(unique_rows)})"
+        )
         return True, None
 
     def _get_filling_station_id(self, invoice):
@@ -682,7 +962,7 @@ class CatalyticsSyncer:
                 database=config.POSTGRES_DB,
                 user=config.POSTGRES_USER,
                 password=config.POSTGRES_PASSWORD,
-                connect_timeout=10
+                connect_timeout=config.POSTGRES_CONNECT_TIMEOUT
             )
             cursor = conn.cursor()
 
@@ -1080,7 +1360,7 @@ class CatalyticsSyncer:
                     'POST',
                     '/import/tally-customer-payload/',
                     json=request_payload,
-                    timeout=120,
+                    timeout=config.API_TIMEOUT_BATCH_SYNC,
                 )
             except Exception as e:
                 logger.error(f"Batch {batch_idx + 1} API request failed: {e}")
@@ -1409,7 +1689,7 @@ class CatalyticsSyncer:
                     'POST',
                     '/import/tally-product-payload/',
                     json=request_payload,
-                    timeout=120,
+                    timeout=config.API_TIMEOUT_BATCH_SYNC,
                 )
             except Exception as e:
                 logger.error(f"Batch {batch_idx + 1} API request failed: {e}")
@@ -1676,7 +1956,7 @@ class CatalyticsSyncer:
             'search_data': name,
         }
         try:
-            resp = requests.get(url, params=params, timeout=10)
+            resp = requests.get(url, params=params, timeout=config.API_TIMEOUT_SHORT)
             if resp.status_code >= 400:
                 logger.warning(f"Filling station lookup failed ({resp.status_code}) for '{name}'")
                 self._filling_station_cache[key] = None
@@ -1910,11 +2190,26 @@ class CatalyticsSyncer:
         if invoice.get('delivery_address') and not voucher.get('CONSIGNEE'):
             voucher['CONSIGNEE'] = {'ADDRESS': invoice.get('delivery_address')}
 
-        # Apply sync-time description expansion so payload is resilient even when
-        # fetch-time expansion/normalization was skipped for an old invoice row.
-        voucher_inventory = voucher.get('INVENTORY') or []
-        if isinstance(voucher_inventory, list) and voucher_inventory:
-            voucher['INVENTORY'] = self._expand_inventory_by_description(voucher_inventory)
+        # Override INVENTORY with the fetch-processed items_json.
+        # data_json INVENTORY holds raw Tally quantities (e.g. 14 CUM).
+        # items_json holds the description-expanded, qty-corrected values (e.g. 3 cylinders).
+        processed_items = self._safe_json_load(invoice.get('items_json')) or []
+        if processed_items:
+            voucher['INVENTORY'] = [
+                {
+                    'STOCKITEMNAME': it.get('item_name', ''),
+                    'ACTUALQTY':     str(it.get('quantity', 0)),
+                    'BILLEDQTY':     str(it.get('quantity', 0)),
+                    'RATE':          str(it.get('rate', 0)),
+                    'AMOUNT':        str(it.get('amount', 0)),
+                }
+                for it in processed_items
+                if it.get('item_name')
+            ]
+            logger.debug(
+                f"Invoice #{voucher_no}: INVENTORY overridden from items_json "
+                f"({len(voucher['INVENTORY'])} item(s))"
+            )
 
         # Extract ledger and stock data that were embedded during fetch
         ledgers_map = {}
@@ -1938,35 +2233,41 @@ class CatalyticsSyncer:
         stock_items = voucher.pop('STOCKITEMS', None)
         if isinstance(stock_items, dict):
             stock_items_map = stock_items
-        if not stock_items_map:
-            inventory_items = voucher.get('INVENTORY') or []
-            for item in inventory_items:
-                if not isinstance(item, dict):
-                    continue
-                item_name = (
-                    item.get('STOCKITEMNAME')
-                    or item.get('ITEMNAME')
-                    or ''
-                ).strip()
-                if not item_name:
-                    continue
-                product_row = self._get_product_row_by_name(item_name)
-                if not product_row or self._row_get(product_row, 'is_synced') != 1:
-                    continue
-                canonical_name = (self._row_get(product_row, 'name') or item_name).strip()
-                if canonical_name and canonical_name != item_name:
-                    item['STOCKITEMNAME'] = canonical_name
-                    item_name = canonical_name
-                if item_name in stock_items_map:
-                    continue
-                stock_item, stock_error = self._prepare_stock_item(product_row)
-                if stock_item:
-                    stock_items_map[item_name] = stock_item
-                elif stock_error:
-                    logger.warning(
-                        f"Invoice #{voucher_no}: could not rebuild stock item for "
-                        f"'{item_name}': {stock_error}"
-                    )
+        # Always canonicalize inventory item names to DB product names
+        # and rebuild stock_items_map from canonical rows.
+        rebuilt_stock_items_map = {}
+        inventory_items = voucher.get('INVENTORY') or []
+        for item in inventory_items:
+            if not isinstance(item, dict):
+                continue
+            item_name = (
+                item.get('STOCKITEMNAME')
+                or item.get('ITEMNAME')
+                or ''
+            ).strip()
+            if not item_name:
+                continue
+            product_row = self._get_product_row_by_name(item_name)
+            if not product_row:
+                continue
+            canonical_name = (self._row_get(product_row, 'name') or item_name).strip()
+            if canonical_name and canonical_name != item_name:
+                item['STOCKITEMNAME'] = canonical_name
+                item_name = canonical_name
+            if item_name in rebuilt_stock_items_map:
+                continue
+            stock_item, stock_error = self._prepare_stock_item(product_row)
+            if stock_item:
+                rebuilt_stock_items_map[item_name] = stock_item
+            elif stock_error:
+                logger.warning(
+                    f"Invoice #{voucher_no}: could not rebuild stock item for "
+                    f"'{item_name}': {stock_error}"
+                )
+
+        # Prefer rebuilt canonical map; fallback to embedded STOCKITEMS only if empty.
+        if rebuilt_stock_items_map:
+            stock_items_map = rebuilt_stock_items_map
 
         # Set filling station ID in voucher
         filling_station_id = self._get_filling_station_id(invoice)
@@ -1978,6 +2279,9 @@ class CatalyticsSyncer:
             or voucher.get('VEHICLE_NO')
             or voucher.get('MOTORVEHICLENO')
             or voucher.get('GOODSVEHICLENUMBER')
+            or voucher.get('BASICSHIPVESSELNO')
+            or voucher.get('DISPATCHEDTHROUGH')
+            or voucher.get('VEHICLENO')
             or ''
         ).strip()
         if vehicle_no == '-':
@@ -1985,6 +2289,10 @@ class CatalyticsSyncer:
             voucher['OTHERREFERENCE'] = 'd'
             voucher['VEHICLE_NO'] = '-'
             voucher['BASICMOTORVEHICLENO'] = '-'
+        elif vehicle_no:
+            # Normalise to the field names the backend expects
+            voucher['VEHICLE_NO'] = vehicle_no
+            voucher['BASICMOTORVEHICLENO'] = vehicle_no
 
         # Map Other Reference → challan type
         other_ref = str(voucher.get('BASICORDERREF') or voucher.get('OTHERREFERENCE') or '').strip().lower()
@@ -2002,17 +2310,22 @@ class CatalyticsSyncer:
         return voucher, ledgers_map, stock_items_map, None
 
     def sync_invoices_to_dc(self):
-        """Sync invoices as DCs in batches via /import/tally-dc-guid-payload/ (GUID-based).
+        """Sync invoices as DCs in batches via /import/tally-delivery-challan-payload/.
         All data comes from SQLite (enriched during fetch) — no Tally calls at sync time."""
         logger.info("\n" + "="*60)
         logger.info("INVOICE TO DC SYNC (batch mode, GUID-based)")
         logger.info("="*60)
+
+        # Reset invoices stuck due to temporary backend/network errors so they are retried
+        self.db.reset_transient_failed_invoices()
 
         invoices = self.db.get_unsynced_invoices()
         logger.info(f"Found {len(invoices)} unsynced invoices")
 
         if not invoices:
             logger.info("No invoices to sync")
+            # Still run reconciliation — instant DCs may have appeared after invoices were synced
+            self.reconcile_instant_dcs()
             return {'total': 0, 'synced': 0, 'verified': 0, 'failed': 0}
 
         # Fetch unsynced instant DCs from portal to attempt matching with incoming Tally invoices
@@ -2054,25 +2367,7 @@ class CatalyticsSyncer:
                     items = []
 
                 # INSTANT INVOICE MATCHING LOGIC
-                # 1. Check if we already have a matched DC ID stored in local DB
                 matched_dc_id = invoice.get('catalytics_dc_id')
-                matched_dc = None
-                
-                if not matched_dc_id:
-                    logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
-                    matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
-                    if matched_dc:
-                        matched_dc_id = matched_dc.get('id')
-                        logger.info(f"✓ Found potential match: DC {matched_dc['dc_no']} (ID: {matched_dc_id})")
-                        # Update local info immediately so we don't lose the link
-                        self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
-                        # Update memory dict for the rest of the loop
-                        invoice['catalytics_dc_id'] = matched_dc_id
-                        invoice['dc_no'] = matched_dc['dc_no']
-                        # Remove from batch list to avoid double matching
-                        instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
-                else:
-                    logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
 
                 # Proceed with sync (always building full payload)
                 try:
@@ -2081,40 +2376,15 @@ class CatalyticsSyncer:
                         matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
                         if matched_dc:
                             matched_dc_id = matched_dc.get('id')
-                            logger.info(f"Found potential match: DC {matched_dc['dc_no']} (ID: {matched_dc_id})")
-                            # Update local info immediately so we don't lose the link
+                            logger.info(f"✓ Found match: DC {matched_dc['dc_no']} (ID: {matched_dc_id})")
                             self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
-                            # Update memory dict for the rest of the loop
                             invoice['catalytics_dc_id'] = matched_dc_id
                             invoice['dc_no'] = matched_dc['dc_no']
-                            # Remove from batch list to avoid double matching
                             instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
                     else:
                         logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
 
-                    # Proceed with sync (always building full payload)
-
-                    # Validate customer and products exist before syncing
-                    is_valid, validation_error = self._validate_invoice_for_sync(invoice, items)
-                    if not is_valid:
-                        logger.info(
-                            f"[AUTO-RECOVER] Invoice #{voucher_no}: {validation_error}. "
-                            f"Attempting customer/product fetch+sync..."
-                        )
-                        recovered, recover_error = self._ensure_invoice_dependencies_synced(invoice, items)
-                        if not recovered:
-                            logger.warning(
-                                f"[VALIDATION FAILED] Invoice #{voucher_no}: {recover_error} - SKIPPING"
-                            )
-                            stats['failed'] += 1
-                            continue
-                        is_valid, validation_error = self._validate_invoice_for_sync(invoice, items)
-                        if not is_valid:
-                            logger.warning(
-                                f"[VALIDATION FAILED] Invoice #{voucher_no}: {validation_error} - SKIPPING"
-                            )
-                            stats['failed'] += 1
-                            continue
+                    # Validation gate intentionally removed: always proceed with sync payload.
 
                     voucher_payload, ledgers_map, stock_items_map, prep_error = self._prepare_voucher_payload(invoice)
                     if prep_error or not voucher_payload:
@@ -2169,9 +2439,9 @@ class CatalyticsSyncer:
             try:
                 response = self._api_request(
                     'POST',
-                    '/import/tally-dc-guid-payload/',
+                    '/import/tally-delivery-challan-payload/',
                     json=request_payload,
-                    timeout=180,
+                    timeout=config.API_TIMEOUT_INVOICE_SYNC,
                 )
 
             except Exception as e:
@@ -2264,6 +2534,10 @@ class CatalyticsSyncer:
             logger.info(f"Success Rate: {stats['verified']/stats['total']*100:.1f}%")
         logger.info(f"{'-'*60}")
 
+        # Retroactively match any unsynced instant DCs that may have been created
+        # after their corresponding invoices were already synced
+        self.reconcile_instant_dcs()
+
         return stats
 
     def sync_invoices_simple(self):
@@ -2329,32 +2603,18 @@ class CatalyticsSyncer:
                     continue
 
                 # INSTANT INVOICE MATCHING LOGIC
-                logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
-                matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
-                
-                if matched_dc:
-                    logger.info(f"✓ Found matching Instant DC: {matched_dc['dc_no']} (ID: {matched_dc['id']})")
-                    
-                    # 1. Mark as synced on portal
-                    self._mark_instant_dc_synced_on_portal(matched_dc['id'], tally_voucher_no=voucher_no)
-                    
-                    # 2. Update local DB with DC info and mark as synced
-                    self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc['id'])
-                    self.db.mark_invoice_synced(
-                        invoice_id, 
-                        matched_dc['dc_no'], 
-                        matched_dc['id'], 
-                        json.dumps({"matched_instant_dc": True, "dc_id": matched_dc['id']}),
-                        dc_name="instant dc"
-                    )
-                    
-                    stats['synced'] += 1
-                    stats['verified'] += 1
-                    logger.info(f"Invoice #{voucher_no} successfully matched and linked to Instant DC {matched_dc['dc_no']}")
-                    
-                    # Remove from local list to avoid double matching
-                    instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc['id']]
-                    continue
+                matched_dc = None
+                matched_dc_id = invoice.get('catalytics_dc_id')
+                if not matched_dc_id:
+                    logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
+                    matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
+                    if matched_dc:
+                        matched_dc_id = matched_dc['id']
+                        logger.info(f"✓ Found matching Instant DC: {matched_dc['dc_no']} (ID: {matched_dc_id})")
+                        self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
+                        instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
+                else:
+                    logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
 
                 # Build simple voucher payload (no ledgers, no stock_items)
                 voucher_payload = self._build_invoice_voucher_payload(invoice)
@@ -2363,6 +2623,7 @@ class CatalyticsSyncer:
                 filling_station_id = self._get_filling_station_id(invoice)
 
                 # Simple payload - only voucher data + filling station ID
+                # If matched to an instant DC, include matched_dc_id so backend UPDATES the existing DC
                 request_payload = {
                     'entity_id': self.entity_id,
                     'company_name': company,
@@ -2370,6 +2631,9 @@ class CatalyticsSyncer:
                     'filling_station_id': filling_station_id,
                     'created_by': config.DEFAULT_ADMIN_USER_ID,
                 }
+                if matched_dc_id:
+                    request_payload['matched_dc_id'] = matched_dc_id
+                    logger.info(f"Including matched_dc_id={matched_dc_id} in payload — backend will UPDATE existing DC")
                 try:
                     self.db.execute(
                         'UPDATE invoices SET sync_request_json = ? WHERE id = ?',
@@ -2384,7 +2648,7 @@ class CatalyticsSyncer:
 
                 response = self._api_request(
                     'POST',
-                    '/import/tally-dc-name-payload/',
+                    '/import/tally-delivery-challan-payload/',
                     json=request_payload,
                 )
 
@@ -2452,7 +2716,184 @@ class CatalyticsSyncer:
             logger.info(f"Success Rate: {stats['verified']/stats['total']*100:.1f}%")
         logger.info(f"{'-'*60}")
 
+        # Retroactively match any unsynced instant DCs that may have been created
+        # after their corresponding invoices were already synced
+        self.reconcile_instant_dcs()
+
         return stats
+
+    def reconcile_instant_dcs(self):
+        """
+        Retroactively match unsynced Instant DCs from the portal against ALL local
+        invoices — including ones already synced.
+
+        Solves the timing problem:
+          - Scenario A (handled by main loop): Instant DC created first → invoice
+            synced later → DC matched & updated during sync.
+          - Scenario B (handled here): Invoice synced first (DC created by middleware)
+            → incharge creates Instant DC later → this method finds the match and
+            re-sends the invoice payload with matched_dc_id so the backend UPDATES
+            the existing DC instead of creating a duplicate.
+
+        Runs after every sync_invoices_simple() call and can be called independently.
+        """
+        instant_dcs = self._fetch_unsynced_instant_dcs()
+        if not instant_dcs:
+            return
+
+        logger.info(f"[RECONCILE] Checking {len(instant_dcs)} unsynced Instant DC(s) against local invoices...")
+
+        for dc in instant_dcs:
+            dc_id = dc.get('id')
+            dc_no = dc.get('dc_no', '')
+
+            # Build DC date window: dc_date to dc_date + 7 days
+            raw_dc_date = dc.get('dc_date') or dc.get('date') or ''
+            dc_date_str = str(raw_dc_date).replace('-', '').replace(' ', '').strip()[:8]
+            if not dc_date_str or len(dc_date_str) != 8:
+                logger.info(f"  [RECONCILE DC {dc_id}] Skipping — invalid date: {raw_dc_date!r}")
+                continue
+
+            try:
+                from datetime import datetime, timedelta
+                dc_dt = datetime.strptime(dc_date_str, '%Y%m%d')
+                end_dt = dc_dt + timedelta(days=7)
+                end_date_str = end_dt.strftime('%Y%m%d')
+            except Exception:
+                end_date_str = dc_date_str
+
+            # Normalize DC customer name
+            customer_obj = dc.get('customer')
+            if isinstance(customer_obj, dict):
+                dc_customer = self._normalize_name(customer_obj.get('name'))
+            else:
+                dc_customer = self._normalize_name(dc.get('customer_name'))
+
+            if not dc_customer:
+                logger.info(f"  [RECONCILE DC {dc_id}] Skipping — no customer name")
+                continue
+
+            # Build DC product map
+            dc_items = dc.get('order_details') or dc.get('items') or []
+            dc_products = {}
+            for it in dc_items:
+                product_obj = it.get('product')
+                raw_name = product_obj.get('name') if isinstance(product_obj, dict) else it.get('product_name')
+                name = ''.join(self._normalize_product_signature(raw_name).split())
+                qty = float(it.get('quantity') or 0)
+                if name and qty > 0:
+                    dc_products[name] = dc_products.get(name, 0) + qty
+
+            if not dc_products:
+                logger.info(f"  [RECONCILE DC {dc_id}] Skipping — no products in DC")
+                continue
+
+            logger.info(
+                f"  [RECONCILE DC {dc_id}] dc_no={dc_no}, date={dc_date_str}, "
+                f"customer='{dc_customer}', products={dc_products}"
+            )
+
+            # Search local DB invoices in the date window
+            try:
+                rows = self.db.query_all(
+                    """SELECT * FROM invoices
+                       WHERE voucher_date >= ? AND voucher_date <= ?
+                         AND is_deleted = 0
+                       ORDER BY ABS(CAST(voucher_date AS INTEGER) - CAST(? AS INTEGER))""",
+                    (dc_date_str, end_date_str, dc_date_str)
+                )
+            except Exception as e:
+                logger.error(f"  [RECONCILE DC {dc_id}] DB query failed: {e}")
+                continue
+
+            matched_invoice = None
+            for row in (rows or []):
+                invoice = dict(row)
+
+                # Customer match
+                if self._normalize_name(invoice.get('customer_name')) != dc_customer:
+                    continue
+
+                # Build invoice product map
+                try:
+                    items = json.loads(invoice.get('items_json') or '[]')
+                except Exception:
+                    continue
+
+                inv_products = {}
+                for it in items:
+                    name = ''.join(self._normalize_product_signature(it.get('item_name')).split())
+                    qty = float(it.get('quantity') or 0)
+                    if name and qty > 0:
+                        inv_products[name] = inv_products.get(name, 0) + qty
+
+                if not inv_products:
+                    continue
+
+                # Product + qty match
+                if len(inv_products) != len(dc_products):
+                    continue
+
+                match = all(
+                    dc_products.get(name) is not None and abs(dc_products[name] - qty) <= 0.001
+                    for name, qty in inv_products.items()
+                )
+                if match:
+                    matched_invoice = invoice
+                    break
+
+            if not matched_invoice:
+                logger.info(f"  [RECONCILE DC {dc_id}] No matching local invoice found — will retry next cycle")
+                continue
+
+            voucher_no = matched_invoice.get('tally_voucher_no', '')
+            invoice_id = matched_invoice['id']
+            company = matched_invoice.get('tally_company', '')
+            logger.info(f"  [RECONCILE DC {dc_id}] Matched invoice #{voucher_no} (SQLite ID={invoice_id})")
+
+            # Build and send payload with matched_dc_id to update the instant DC
+            try:
+                voucher_payload = self._build_invoice_voucher_payload(matched_invoice)
+                filling_station_id = self._get_filling_station_id(matched_invoice)
+                request_payload = {
+                    'entity_id': self.entity_id,
+                    'company_name': company,
+                    'voucher': voucher_payload,
+                    'filling_station_id': filling_station_id,
+                    'created_by': config.DEFAULT_ADMIN_USER_ID,
+                    'matched_dc_id': dc_id,
+                }
+                response = self._api_request(
+                    'POST',
+                    '/import/tally-delivery-challan-payload/',
+                    json=request_payload,
+                )
+                if response.status_code in [200, 201]:
+                    result = response.json()
+                    data = result.get('data', {})
+                    dc_status = data.get('status', '')
+                    new_dc_no = data.get('dc_no', voucher_no)
+                    new_dc_id = data.get('dc_id') or dc_id
+                    if dc_status in ['created', 'updated']:
+                        self.db.update_invoice_dc_info(invoice_id, new_dc_no, new_dc_id)
+                        self.db.mark_invoice_synced(
+                            invoice_id, new_dc_no, new_dc_id,
+                            json.dumps({'reconciled_instant_dc': True, 'dc_id': dc_id}),
+                            dc_name='instant dc'
+                        )
+                        logger.info(
+                            f"  [RECONCILE DC {dc_id}] [{dc_status.upper()}] "
+                            f"Invoice #{voucher_no} → DC {new_dc_no} (Catalytics={new_dc_id})"
+                        )
+                    else:
+                        logger.warning(f"  [RECONCILE DC {dc_id}] Unexpected status: {dc_status}")
+                else:
+                    logger.error(
+                        f"  [RECONCILE DC {dc_id}] API error: HTTP {response.status_code} "
+                        f"— {response.text[:200]}"
+                    )
+            except Exception as e:
+                logger.error(f"  [RECONCILE DC {dc_id}] Failed: {e}", exc_info=True)
 
     def sync_all(self):
         """Run complete sync cycle"""
