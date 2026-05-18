@@ -34,6 +34,7 @@ ENTITY_ID=25
 # Catalytics Backend
 CATALYTICS_API_BASE=http://localhost:8000
 CATALYTICS_API_KEY=your-api-key-here
+CATALYTICS_USE_AUTH=auto
 
 # Tally Companies
 TALLY_COMPANY_1=BHARATH OXYGEN LICENSEE
