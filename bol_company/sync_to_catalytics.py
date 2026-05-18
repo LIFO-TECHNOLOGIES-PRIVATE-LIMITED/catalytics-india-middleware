@@ -100,9 +100,10 @@ class CatalyticsSyncer:
         # Note: Payload endpoints use AllowAny permission
         # They only check TALLY_MIDDLEWARE_API_KEY if it's configured in Django settings
         # Since it's not configured, we don't send authentication headers
+        # Match Chennai Oxygen middleware behaviour:
+        # payload/instant-DC helper endpoints are AllowAny, so do not send a
+        # bearer token or middleware key from BOL sync requests.
         headers['Content-Type'] = 'application/json'
-        if self.api_key:
-            headers['Authorization'] = f'Bearer {self.api_key}'
 
         try:
             timeout = kwargs.pop('timeout', 30)
@@ -1224,6 +1225,176 @@ class CatalyticsSyncer:
                 'error': str(e),
                 'catalytics_id': None
             }
+
+    def sync_single_product(self, product_dict):
+        """
+        Sync a single product to Catalytics.
+        Used by invoice dependency auto-recovery.
+
+        Returns:
+            dict: {'success': bool, 'error': str, 'catalytics_id': int}
+        """
+        name = (product_dict.get('name') or '').strip()
+
+        try:
+            logger.info(f"Syncing single product '{name}'...")
+
+            stock_item, error = self._prepare_stock_item(product_dict)
+            if not stock_item:
+                return {
+                    'success': False,
+                    'error': error or f"Could not prepare product '{name}'",
+                    'catalytics_id': None,
+                }
+
+            request_payload = {
+                'entity_id': self.entity_id,
+                'stock_item': stock_item,
+                'created_by': config.DEFAULT_ADMIN_USER_ID,
+            }
+
+            response = self._api_request(
+                'POST',
+                '/import/tally-product-payload/',
+                json=request_payload,
+            )
+
+            if response.status_code not in [200, 201]:
+                error_msg = f"HTTP {response.status_code}"
+                try:
+                    error_result = response.json()
+                    error_detail = error_result.get('message', response.text[:200])
+                    error_msg = f"{error_msg} - {error_detail}"
+                except Exception:
+                    pass
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'catalytics_id': None,
+                }
+
+            result = response.json()
+            if result.get('status') != 'success':
+                return {
+                    'success': False,
+                    'error': f"API returned non-success: {result.get('message')}",
+                    'catalytics_id': None,
+                }
+
+            data = result.get('data', {})
+            created = data.get('created', 0)
+            updated = data.get('updated', 0)
+            errors = data.get('errors', 0)
+
+            if errors > 0:
+                error_msg = data.get('results', [{}])[0].get('message', 'Unknown error')
+                return {
+                    'success': False,
+                    'error': f"API error: {error_msg}",
+                    'catalytics_id': None,
+                }
+
+            if created == 0 and updated == 0:
+                return {
+                    'success': False,
+                    'error': "Product not created or updated",
+                    'catalytics_id': None,
+                }
+
+            catalytics_id = None
+            results_list = data.get('results', [])
+            if results_list and isinstance(results_list, list):
+                first_result = results_list[0]
+                if isinstance(first_result, dict):
+                    catalytics_id = first_result.get('product_id') or first_result.get('id')
+
+            logger.info(
+                f"✓ Product '{name}' synced "
+                f"(Created={created}, Updated={updated}, ID={catalytics_id})"
+            )
+
+            return {
+                'success': True,
+                'error': None,
+                'catalytics_id': catalytics_id,
+            }
+
+        except Exception as e:
+            logger.error(f"Error syncing product '{name}': {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'catalytics_id': None,
+            }
+
+    def _ensure_invoice_dependencies_synced(self, invoice, items):
+        """
+        Auto-recover missing invoice dependencies by syncing the customer and any
+        unsynced products required by the invoice before retrying invoice sync.
+        """
+        customer_name = (invoice.get('customer_name') or '').strip()
+        company = invoice.get('tally_company')
+
+        customer_ok, customer_msg = self._customer_exists(customer_name)
+        if not customer_ok:
+            customer_row = self.db.query(
+                "SELECT * FROM customers WHERE name = ? LIMIT 1",
+                (customer_name,),
+            )
+            if not customer_row:
+                return False, customer_msg or f"Customer '{customer_name}' not found locally"
+
+            customer_result = self.sync_single_customer(dict(customer_row))
+            if not customer_result.get('success'):
+                return False, customer_result.get('error') or customer_msg
+
+            self.db.mark_customer_synced(
+                customer_row['id'],
+                customer_result.get('catalytics_id'),
+                json.dumps(customer_result),
+            )
+
+        missing_products = []
+        for item in items or []:
+            item_name = (item.get('item_name') or '').strip()
+            if not item_name:
+                continue
+            result = self.db.query(
+                "SELECT id FROM products WHERE name = ? AND is_synced = 1 LIMIT 1",
+                (item_name,),
+            )
+            if not result:
+                missing_products.append(item_name)
+
+        for product_name in missing_products:
+            normalized_product_name = self._normalize_name(product_name)
+            product_row = self.db.query(
+                (
+                    "SELECT * FROM products "
+                    "WHERE lower(replace(name, ' ', '')) = ? "
+                    "AND (? IS NULL OR tally_company = ?) "
+                    "LIMIT 1"
+                ),
+                (normalized_product_name, company, company),
+            )
+            if not product_row:
+                return False, f"Product '{product_name}' not found locally"
+
+            product_dict = dict(product_row)
+            if not product_dict.get('tally_company'):
+                product_dict['tally_company'] = company
+
+            product_result = self.sync_single_product(product_dict)
+            if not product_result.get('success'):
+                return False, product_result.get('error') or f"Failed syncing product '{product_name}'"
+
+            self.db.mark_product_synced(
+                product_row['id'],
+                product_result.get('catalytics_id'),
+                json.dumps(product_result),
+            )
+
+        return True, None
 
     # ========================================================================
     # PRODUCT SYNC

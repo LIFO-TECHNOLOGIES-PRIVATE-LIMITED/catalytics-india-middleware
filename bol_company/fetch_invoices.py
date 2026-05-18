@@ -206,35 +206,29 @@ def _fetch_vehicle_master_numbers():
     for candidate_base in candidate_bases:
         url = f"{candidate_base.rstrip('/')}/master/vehicle"
         tried_urls.append(url)
-        header_attempts = [dict(base_headers)]
-        if config.CATALYTICS_API_KEY:
-            auth_headers = dict(base_headers)
-            auth_headers['Authorization'] = f'Bearer {config.CATALYTICS_API_KEY}'
-            header_attempts.append(auth_headers)
 
-        for headers in header_attempts:
-            try:
-                response = requests.get(
-                    url, headers=headers,
-                    params={'limit_start': 0, 'limit_end': 100000}, timeout=30,
+        try:
+            response = requests.get(
+                url,
+                headers=dict(base_headers),
+                params={'limit_start': 0, 'limit_end': 100000},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json() or {}
+            for vehicle in payload.get('data') or []:
+                normalized = _normalize_vehicle_no((vehicle or {}).get('vehicle_no'))
+                if normalized:
+                    normalized_numbers.add(normalized)
+            if normalized_numbers:
+                logger.info(
+                    f"[VEHICLE_API] Loaded {len(normalized_numbers)} vehicle numbers "
+                    f"from {url} via anonymous access"
                 )
-                response.raise_for_status()
-                payload = response.json() or {}
-                for vehicle in payload.get('data') or []:
-                    normalized = _normalize_vehicle_no((vehicle or {}).get('vehicle_no'))
-                    if normalized:
-                        normalized_numbers.add(normalized)
-                if normalized_numbers:
-                    auth_mode = 'authenticated' if 'Authorization' in headers else 'anonymous'
-                    logger.info(
-                        f"[VEHICLE_API] Loaded {len(normalized_numbers)} vehicle numbers "
-                        f"from {url} via {auth_mode} access"
-                    )
-                    _VEHICLE_MASTER_CACHE = normalized_numbers
-                    return _VEHICLE_MASTER_CACHE
-            except Exception as exc:
-                auth_mode = 'authenticated' if 'Authorization' in headers else 'anonymous'
-                logger.warning(f"[VEHICLE_API] Fetch failed from {url} via {auth_mode}: {exc}")
+                _VEHICLE_MASTER_CACHE = normalized_numbers
+                return _VEHICLE_MASTER_CACHE
+        except Exception as exc:
+            logger.warning(f"[VEHICLE_API] Fetch failed from {url} via anonymous access: {exc}")
 
     # Fallback: query PostgreSQL directly
     try:
@@ -577,8 +571,15 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                         _addr_parts.append(_astr)
                 _cust_address = ', '.join(_addr_parts)
 
+            existing_customer = db.query(
+                "SELECT id FROM customers WHERE name = ? AND tally_company = ? LIMIT 1",
+                (customer_name, company_name),
+            )
+
             _cust_data = {
-                'tally_guid': '',
+                # Keep GUID null for DC-driven fallback customers.
+                # SQLite UNIQUE allows multiple NULLs but not repeated empty strings.
+                'tally_guid': None,
                 'name': customer_name,
                 'tally_company': company_name,
                 'gstin': _cust_gstin,
@@ -597,7 +598,10 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 }),
             }
             try:
-                db.insert_customer(_cust_data)
+                if existing_customer:
+                    db.update_customer(existing_customer['id'], _cust_data)
+                else:
+                    db.insert_customer(_cust_data)
                 ledger_data = json_loads(_cust_data['data_json'])
                 ledger_cache[ledger_cache_key] = ledger_data
                 overall_stats.setdefault('auto_fetched_customers', 0)
@@ -660,8 +664,15 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                         'canonical_name': f'{mp_name} (CYL)',
                     }
 
+                existing_product = db.query(
+                    "SELECT id FROM products WHERE name = ? AND tally_company = ? LIMIT 1",
+                    (mp_name, company_name),
+                )
+
                 _prod_data = {
-                    'tally_guid': '',
+                    # Keep GUID null for DC-driven fallback products.
+                    # SQLite UNIQUE allows multiple NULLs but not repeated empty strings.
+                    'tally_guid': None,
                     'name': mp_name,
                     'name_canonical': parsed['canonical_name'],
                     'tally_company': company_name,
@@ -685,7 +696,10 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                     'sgst_rate': 0.0,
                 }
                 try:
-                    db.insert_product(_prod_data)
+                    if existing_product:
+                        db.update_product(existing_product['id'], _prod_data)
+                    else:
+                        db.insert_product(_prod_data)
                     normalized_mp = _normalize_name_key(mp_name)
                     cache_key = f"{company_name}::{normalized_mp}"
                     stock_cache[cache_key] = json_loads(_prod_data['data_json'])

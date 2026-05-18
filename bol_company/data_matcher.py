@@ -48,7 +48,6 @@ class DataMatcher:
         url = f"{self.api_base}{endpoint}"
         headers = kwargs.pop('headers', {})
         headers.update({
-            'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
         })
 
