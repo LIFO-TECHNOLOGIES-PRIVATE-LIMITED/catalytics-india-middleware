@@ -1418,24 +1418,16 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
     Returns:
         List of delivery note vouchers from daybook only
     """
-    # Hard clamp Day Book DC fetch to a 3-day window: yesterday, today, tomorrow.
-    # This prevents old daybook data from being fetched even when callers pass a wider range.
-    today = datetime.now()
-    allowed_from_date = (today - timedelta(days=1)).strftime("%Y%m%d")
-    allowed_to_date = (today + timedelta(days=1)).strftime("%Y%m%d")
+    # Use the caller's date range as-is (controlled by DC_PAST_DAYS / DC_FUTURE_DAYS in .env)
     original_from_date = from_date
     original_to_date = to_date
-    from_date = allowed_from_date
-    to_date = allowed_to_date
 
     logger.info("=" * 80)
     logger.info("DAY BOOK FETCH STARTED")
     logger.info("=" * 80)
     logger.info("Company: %s", company_name)
     logger.info(
-        "Date Range requested=%s to %s | enforced=%s to %s (3-day window only)",
-        original_from_date,
-        original_to_date,
+        "Date Range: %s to %s",
         from_date,
         to_date,
     )
@@ -1523,14 +1515,14 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
         dropped_count = pre_date_count - len(delivery_vouchers)
         if dropped_count > 0:
             logger.warning(
-                "[FUNCTION] Dropped %d delivery vouchers outside enforced window %s..%s",
+                "[FUNCTION] Dropped %d delivery vouchers outside date window %s..%s",
                 dropped_count,
                 from_date,
                 to_date,
             )
 
         logger.info(
-            "[FUNCTION] Day Book Summary: Enforced Date Range %s to %s — %d total vouchers, %d delivery notes (daybook only) for company '%s'",
+            "[FUNCTION] Day Book Summary: Date Range %s to %s — %d total vouchers, %d delivery notes (daybook only) for company '%s'",
             from_date, to_date, len(all_vouchers), len(delivery_vouchers), company_name,
         )
         print(f"[FUNCTION] Day Book Summary: {len(all_vouchers)} total vouchers, {len(delivery_vouchers)} delivery notes (daybook only)")

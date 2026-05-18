@@ -525,12 +525,15 @@ class AutomationManager:
         """
         Combined invoice fetch + sync loop:
         1. Fetch DCs from Tally Day Book (auto-creates missing customers/products)
-        2. Sync unsynced DCs to Catalytics (batch)
+        2. Sync any unsynced customers/products to Catalytics (created by DC fetch)
+        3. Sync unsynced DCs to Catalytics (batch)
         Runs every FETCH_SYNC_INTERVAL_SECONDS (default 20s).
         No lock competition — fetch and sync are sequential in the same thread.
         """
         from fetch_invoices import build_config as build_fetch_config, run_once as fetch_once
         from sync_catalytics import build_config as build_dc_sync_config, run_once as sync_dc_once
+        from sync_customers import build_config as build_customer_sync_config, run_once as sync_customers_once
+        from sync_products import build_config as build_product_sync_config, run_once as sync_products_once
 
         task = 'sync'
 
@@ -573,7 +576,29 @@ class AutomationManager:
                         logger.error("DC fetch failed: %s", e, exc_info=True)
                         self._log_to_dashboard(f"=== AUTO: DC FETCH FAILED: {e} ===")
 
-                    # Step 2: Sync unsynced DCs to Catalytics
+                    # Step 2: Sync any unsynced customers (auto-created by DC fetch)
+                    cust_stats = {'ok': 0, 'failed': 0}
+                    try:
+                        master_args = self._build_master_sync_args()
+                        cust_stats = sync_customers_once(build_customer_sync_config(master_args))
+                        if cust_stats.get('ok', 0) > 0:
+                            logger.info("Customers synced: ok=%d, failed=%d",
+                                        cust_stats.get('ok', 0), cust_stats.get('failed', 0))
+                    except Exception as e:
+                        logger.error("Customer sync failed: %s", e, exc_info=True)
+
+                    # Step 3: Sync any unsynced products (auto-created by DC fetch)
+                    prod_stats = {'ok': 0, 'failed': 0}
+                    try:
+                        master_args = self._build_master_sync_args()
+                        prod_stats = sync_products_once(build_product_sync_config(master_args))
+                        if prod_stats.get('ok', 0) > 0:
+                            logger.info("Products synced: ok=%d, failed=%d",
+                                        prod_stats.get('ok', 0), prod_stats.get('failed', 0))
+                    except Exception as e:
+                        logger.error("Product sync failed: %s", e, exc_info=True)
+
+                    # Step 4: Sync unsynced DCs to Catalytics
                     dc_stats = {'ok': 0, 'failed': 0}
                     try:
                         dc_sync_args = self._build_dc_sync_args()
@@ -585,7 +610,8 @@ class AutomationManager:
                     self._log_to_dashboard(
                         f"=== AUTO: FETCH+SYNC COMPLETED "
                         f"(fetched: new={fetch_created} upd={fetch_updated} | "
-                        f"synced: ok={dc_stats.get('ok', 0)} failed={dc_stats.get('failed', 0)}) ==="
+                        f"cust={cust_stats.get('ok', 0)} prod={prod_stats.get('ok', 0)} "
+                        f"dc={dc_stats.get('ok', 0)} failed={dc_stats.get('failed', 0)}) ==="
                     )
 
                     self._mark_task_complete(task)

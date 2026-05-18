@@ -335,9 +335,6 @@ class Config:
         """Validate configuration"""
         errors = []
 
-        if not cls.CATALYTICS_API_KEY:
-            errors.append("CATALYTICS_API_KEY is not set")
-
         if not cls.get_active_companies():
             errors.append("No active Tally companies configured")
 

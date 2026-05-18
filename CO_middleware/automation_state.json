@@ -1,20 +1,20 @@
 {
-  "status": "stopped",
+  "status": "running",
   "intervals": {
-    "fetch_master": 86400,
-    "fetch_invoices": 30,
-    "sync": 30
+    "fetch_master": 1800,
+    "fetch_invoices": 10,
+    "sync": 10
   },
   "last_runs": {
     "fetch_master": "2026-04-08T10:59:53.982953",
-    "fetch_invoices": "2026-04-08T12:19:17.667993",
-    "sync": "2026-04-08T12:19:25.228662"
+    "fetch_invoices": "2026-05-14T17:23:45.546186",
+    "sync": "2026-05-14T17:23:45.546186"
   },
   "next_runs": {
-    "fetch_master": "2026-04-09T10:59:33.215556",
-    "fetch_invoices": "2026-04-08T12:19:57.540098",
-    "sync": "2026-04-08T12:19:55.198721"
+    "fetch_master": "2026-05-15T10:00:00",
+    "fetch_invoices": "2026-05-14T17:23:34.801281",
+    "sync": "2026-05-14T17:23:34.801281"
   },
-  "started_at": "2026-04-08T10:59:33.065814",
+  "started_at": "2026-05-14T16:05:07.995666",
   "stopped_at": null
 }

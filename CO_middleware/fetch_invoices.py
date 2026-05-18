@@ -122,19 +122,22 @@ def _extract_tally_guid(voucher: Dict[str, Any]) -> str:
     return ""
 
 
-DEFAULT_DC_PAST_DAYS = 1
+DEFAULT_DC_PAST_DAYS = 3
 DEFAULT_DC_FUTURE_DAYS = 1
 
 
 def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
     now = datetime.now()
-    # Dynamic 3-day window: yesterday to tomorrow.
-    # Tally Day Book only returns data for the currently open date.
-    # By covering yesterday+today+tomorrow, whichever date is open in
-    # Tally will match and its DCs will be fetched.
-    # Keep this fixed at 3 days only; do not expand into older daybooks.
-    from_dt = now - timedelta(days=DEFAULT_DC_PAST_DAYS)
-    to_dt = now + timedelta(days=DEFAULT_DC_FUTURE_DAYS)
+    # DC_PAST_DAYS / DC_FUTURE_DAYS control the fetch window.
+    # TALLY_DAYS_BACK (days_back param) overrides DC_PAST_DAYS if set.
+    from config import get_env_int
+    if days_back is not None and days_back > 0:
+        past = days_back
+    else:
+        past = get_env_int("DC_PAST_DAYS", DEFAULT_DC_PAST_DAYS)
+    future = get_env_int("DC_FUTURE_DAYS", DEFAULT_DC_FUTURE_DAYS)
+    from_dt = now - timedelta(days=past)
+    to_dt = now + timedelta(days=future)
     return from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")
 
 def _normalize_name_key(value: str) -> str:
