@@ -191,9 +191,14 @@ class CatalyticsSyncer:
         if not customer_name:
             return False, "Customer name is empty"
 
+        normalized_customer_name = self._normalize_name(customer_name)
         result = self.db.query(
-            "SELECT id FROM customers WHERE name = ? AND is_synced = 1 LIMIT 1",
-            (customer_name,)
+            (
+                "SELECT id FROM customers "
+                "WHERE lower(replace(name, ' ', '')) = ? "
+                "AND is_synced = 1 LIMIT 1"
+            ),
+            (normalized_customer_name,)
         )
         if result:
             return True, None
@@ -210,9 +215,14 @@ class CatalyticsSyncer:
             if not item_name:
                 continue
 
+            normalized_item_name = self._normalize_name(item_name)
             result = self.db.query(
-                "SELECT id FROM products WHERE name = ? AND is_synced = 1 LIMIT 1",
-                (item_name,)
+                (
+                    "SELECT id FROM products "
+                    "WHERE lower(replace(name, ' ', '')) = ? "
+                    "AND is_synced = 1 LIMIT 1"
+                ),
+                (normalized_item_name,)
             )
             if not result:
                 missing_products.append(item_name)
