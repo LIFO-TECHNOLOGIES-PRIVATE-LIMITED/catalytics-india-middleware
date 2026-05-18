@@ -4,6 +4,7 @@ Verifies data exists in Catalytics PostgreSQL after sync.
 """
 import logging
 import time
+import os
 from datetime import datetime
 
 import psycopg2
@@ -21,6 +22,7 @@ class SyncVerifier:
     def __init__(self):
         self.api_base = config.CATALYTICS_API_BASE
         self.api_key = config.CATALYTICS_API_KEY
+        self.auth_mode = os.getenv('CATALYTICS_USE_AUTH', 'auto').strip().lower()
         self.entity_id = config.ENTITY_ID
         self.timeout = config.VERIFY_TIMEOUT_SECONDS
         self.retry_count = config.VERIFY_RETRY_COUNT
@@ -37,20 +39,49 @@ class SyncVerifier:
         url = f"{self.api_base}{endpoint}"
         headers = kwargs.pop('headers', {})
         headers.update({
-            'Authorization': f'Bearer {self.api_key}',
             'Entity-Id': str(self.entity_id),
             'Content-Type': 'application/json'
         })
 
         try:
-            response = requests.request(
+            if self.auth_mode in ('1', 'true', 'yes', 'on'):
+                if self.api_key:
+                    headers['Authorization'] = f'Bearer {self.api_key}'
+                return requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    **kwargs
+                )
+
+            if self.auth_mode == 'auto':
+                response = requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    **kwargs
+                )
+                if response.status_code in (401, 403) and self.api_key:
+                    retry_headers = dict(headers)
+                    retry_headers['Authorization'] = f'Bearer {self.api_key}'
+                    return requests.request(
+                        method,
+                        url,
+                        headers=retry_headers,
+                        timeout=self.timeout,
+                        **kwargs
+                    )
+                return response
+
+            return requests.request(
                 method,
                 url,
                 headers=headers,
                 timeout=self.timeout,
                 **kwargs
             )
-            return response
 
         except requests.RequestException as e:
             logger.error(f"API request failed: {e}")

@@ -6,8 +6,10 @@ Verifies data consistency and identifies mismatches
 import sqlite3
 import psycopg2
 import logging
+import os
 from datetime import datetime
 from typing import Dict, List, Tuple
+import requests
 from config import config
 from db import Database
 
@@ -24,6 +26,9 @@ class DataMatcher:
 
     def __init__(self):
         self.db = Database(config.SQLITE_DB_PATH)
+        self.api_base = config.CATALYTICS_API_BASE
+        self.api_key = config.CATALYTICS_API_KEY
+        self.auth_mode = os.getenv('CATALYTICS_USE_AUTH', 'auto').strip().lower()
         self.entity_id = config.ENTITY_ID
 
         # PostgreSQL connection details from .env
@@ -47,20 +52,47 @@ class DataMatcher:
         """Make API request to Catalytics"""
         url = f"{self.api_base}{endpoint}"
         headers = kwargs.pop('headers', {})
-        headers.update({
-            'Authorization': f'Bearer {self.api_key}',
-            'Content-Type': 'application/json'
-        })
+        headers['Content-Type'] = 'application/json'
 
         try:
-            response = requests.request(
+            if self.auth_mode in ('1', 'true', 'yes', 'on'):
+                if self.api_key:
+                    headers['Authorization'] = f'Bearer {self.api_key}'
+                return requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=30,
+                    **kwargs
+                )
+
+            if self.auth_mode == 'auto':
+                response = requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=30,
+                    **kwargs
+                )
+                if response.status_code in (401, 403) and self.api_key:
+                    retry_headers = dict(headers)
+                    retry_headers['Authorization'] = f'Bearer {self.api_key}'
+                    return requests.request(
+                        method,
+                        url,
+                        headers=retry_headers,
+                        timeout=30,
+                        **kwargs
+                    )
+                return response
+
+            return requests.request(
                 method,
                 url,
                 headers=headers,
                 timeout=30,
                 **kwargs
             )
-            return response
         except requests.RequestException as e:
             logger.error(f"API request failed: {e}")
             raise

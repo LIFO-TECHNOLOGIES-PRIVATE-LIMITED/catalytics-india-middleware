@@ -381,9 +381,8 @@ class Config:
     def validate(cls):
         """Validate configuration"""
         errors = []
-
-        if not cls.CATALYTICS_API_KEY:
-            errors.append("CATALYTICS_API_KEY is not set")
+        # Keep API key optional to match CO_middleware behavior.
+        # Sync layer already sends Authorization header only when key is present.
 
         if not cls.get_active_companies():
             errors.append("No active Tally companies configured")

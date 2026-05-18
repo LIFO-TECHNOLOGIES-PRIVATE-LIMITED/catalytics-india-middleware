@@ -7,6 +7,7 @@ import logging
 import requests
 import json
 import time
+import os
 from pathlib import Path
 from datetime import datetime
 from config import config, BASE_DIR
@@ -84,6 +85,11 @@ class CatalyticsSyncer:
         self.verifier = SyncVerifier()
         self.api_base = config.CATALYTICS_API_BASE.rstrip('/')
         self.api_key = config.CATALYTICS_API_KEY
+        # Auth mode:
+        # - false: never send token
+        # - true: always send token
+        # - auto: try without token; if unauthorized, retry once with token
+        self.auth_mode = os.getenv('CATALYTICS_USE_AUTH', 'auto').strip().lower()
         self.entity_id = config.ENTITY_ID
         # No batch limit — sync all unsynced records in one pass
         self.verify_enabled = config.VERIFY_AFTER_SYNC
@@ -100,15 +106,44 @@ class CatalyticsSyncer:
 
         headers = kwargs.pop('headers', {})
 
-        # Note: Payload endpoints use AllowAny permission
-        # They only check TALLY_MIDDLEWARE_API_KEY if it's configured in Django settings
-        # Since it's not configured, we don't send authentication headers
         headers['Content-Type'] = 'application/json'
-        if self.api_key:
-            headers['Authorization'] = f'Bearer {self.api_key}'
 
         try:
             timeout = kwargs.pop('timeout', 30)
+            if self.auth_mode in ('1', 'true', 'yes', 'on'):
+                if self.api_key:
+                    headers['Authorization'] = f'Bearer {self.api_key}'
+                response = requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    **kwargs
+                )
+                return response
+
+            if self.auth_mode == 'auto':
+                # First try anonymous, then retry with token only on auth failure.
+                response = requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    **kwargs
+                )
+                if response.status_code in (401, 403) and self.api_key:
+                    retry_headers = dict(headers)
+                    retry_headers['Authorization'] = f'Bearer {self.api_key}'
+                    return requests.request(
+                        method,
+                        url,
+                        headers=retry_headers,
+                        timeout=timeout,
+                        **kwargs
+                    )
+                return response
+
+            # Default/false mode: never send token
             response = requests.request(
                 method,
                 url,
