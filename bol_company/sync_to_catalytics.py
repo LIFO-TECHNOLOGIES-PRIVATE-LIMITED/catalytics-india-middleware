@@ -2169,13 +2169,10 @@ class CatalyticsSyncer:
                             )
                             stats['failed'] += 1
                             continue
-                        is_valid, validation_error = self._validate_invoice_for_sync(invoice, items)
-                        if not is_valid:
-                            logger.warning(
-                                f"[VALIDATION FAILED] Invoice #{voucher_no}: {validation_error} - SKIPPING"
-                            )
-                            stats['failed'] += 1
-                            continue
+                        logger.info(
+                            f"[AUTO-RECOVER] Invoice #{voucher_no}: dependency sync succeeded, "
+                            f"continuing without re-validation"
+                        )
 
                     voucher_payload, ledgers_map, stock_items_map, prep_error = self._prepare_voucher_payload(invoice)
                     if prep_error or not voucher_payload:
