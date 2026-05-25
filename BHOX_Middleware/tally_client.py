@@ -1630,11 +1630,13 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
                 amt = _prate(le.get('AMOUNT', '0'))
                 if any(t in name for t in ['CGST','SGST','IGST','GST']):
                     inv['tax_amount'] += abs(amt)
-                elif amt:
+                elif abs(amt) and not any(t in name for t in ['ROUND', 'ROUNDOFF', 'ROUND OFF']):
+                    # The party/customer ledger entry is always the highest amount
+                    # (it equals goods + GST + freight = the exact invoice total).
                     inv['total_amount'] = max(inv['total_amount'], abs(amt))
-            
+
             if inv['total_amount'] == 0.0 and inv['items']:
-                inv['total_amount'] = sum(abs(x.get('amount', 0)) for x in inv['items'])
+                inv['total_amount'] = round(sum(abs(x.get('amount', 0)) for x in inv['items']), 2)
                 
             normalized.append(inv)
             

@@ -77,9 +77,6 @@ _attach_product_sync_file_handler()
 class CatalyticsSyncer:
     """Sync data to Catalytics using Tally payload endpoints"""
 
-    # Set to True to re-enable Instant DC matching & reconciliation
-    _INSTANT_DC_ENABLED = False
-
     def __init__(self):
         self.db = Database(config.SQLITE_DB_PATH)
         self.verifier = SyncVerifier()
@@ -378,75 +375,6 @@ class CatalyticsSyncer:
                 changed += 1
         return changed
 
-    def _fetch_unsynced_instant_dcs(self):
-        """
-        Fetch unsynced Instant DCs from Catalytics for matching.
-        The enhanced list endpoint now returns dc_date, customer, and order_details.
-        Falls back to per-DC detail fetch if the basic list is missing dc_date.
-        """
-        if not self._INSTANT_DC_ENABLED:
-            return []
-        logger.info("Fetching unsynced Instant DCs from Catalytics for matching...")
-        try:
-            response = self._api_request('GET', '/transaction/delivery_challan/instant/unsynced')
-            if response.status_code != 200:
-                logger.error(f"Failed to fetch unsynced Instant DCs: HTTP {response.status_code}")
-                return []
-
-            data = response.json()
-            basic_results = data.get('results', [])
-            logger.info(f"Received {len(basic_results)} unsynced Instant DCs from portal")
-
-            # Check if the enhanced list already includes dc_date (new backend)
-            needs_detail_fetch = bool(basic_results and not basic_results[0].get('dc_date'))
-            if needs_detail_fetch:
-                logger.info("Backend list missing 'dc_date' — falling back to per-DC detail fetch")
-
-            if not needs_detail_fetch:
-                return basic_results
-
-            # Fallback: fetch full detail per DC (old backend)
-            full_results = []
-            for basic in basic_results:
-                dc_id = basic.get('id')
-                try:
-                    detail_resp = self._api_request('GET', f'/transaction/delivery_challan/{dc_id}')
-                    if detail_resp.status_code == 200:
-                        detail_data = detail_resp.json()
-                        if isinstance(detail_data, dict) and 'data' in detail_data and isinstance(detail_data['data'], dict):
-                            full_results.append(detail_data['data'])
-                        else:
-                            full_results.append(detail_data)
-                    else:
-                        logger.warning(f"DC {dc_id} detail fetch returned HTTP {detail_resp.status_code}, using basic")
-                        full_results.append(basic)
-                except Exception as e:
-                    logger.warning(f"Failed to fetch detail for DC {dc_id}: {e}")
-                    full_results.append(basic)
-
-            return full_results
-
-        except Exception as e:
-            logger.error(f"Error fetching unsynced Instant DCs: {e}")
-            return []
-
-
-    def _mark_instant_dc_synced_on_portal(self, dc_pk, tally_voucher_no=None):
-        """Mark an instant DC as synced on the portal."""
-        try:
-            payload = {}
-            if tally_voucher_no:
-                payload['tally_voucher_no'] = tally_voucher_no
-                
-            response = self._api_request('POST', f'/transaction/delivery_challan/instant/{dc_pk}/mark-synced', json=payload)
-            if response.status_code != 200:
-                logger.error(f"Failed to mark Instant DC {dc_pk} as synced on portal: HTTP {response.status_code}")
-                try:
-                    logger.error(f"  Response: {response.text[:300]}")
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.error(f"Error marking Instant DC {dc_pk} as synced: {e}")
 
     @staticmethod
     def _normalize_name(value):
@@ -649,138 +577,6 @@ class CatalyticsSyncer:
 
         return expanded
 
-    def _find_matching_instant_dc(self, invoice, items, instant_dcs):
-        """
-        Match a Tally invoice with an unsynced Instant DC from the portal.
-        All criteria must pass:
-          1. DC must be an instant DC and NOT already synced
-          2. Date must match (YYYYMMDD normalized)
-          3. Customer name must match (fuzzy: normalized whitespace, case-insensitive)
-          4. Product list + quantities must match exactly
-        """
-        customer_name_norm = self._normalize_name(invoice.get('customer_name'))
-        invoice_date = str(invoice.get('voucher_date') or '').replace('-', '').strip()
-
-        # Build product map for invoice: {signature: total_qty}
-        # Use _normalize_product_signature so "ACM GAS BHOX 10cum (CYL)" matches
-        # "ACM GAS 10CUM" — strips variant size, type-code, junk characters.
-        invoice_products = {}
-        for it in items:
-            name = ''.join(self._normalize_product_signature(it.get('item_name')).split())
-            qty = float(it.get('quantity') or 0)
-            if name and qty > 0:
-                invoice_products[name] = invoice_products.get(name, 0) + qty
-
-        if not invoice_products:
-            logger.info("  No invoice products to match — skipping instant DC matching")
-            return None
-
-        if instant_dcs:
-            logger.info(
-                f"  Matching invoice: date={invoice_date}, "
-                f"customer='{customer_name_norm}', products={invoice_products} "
-                f"against {len(instant_dcs)} instant DCs"
-            )
-
-        for dc in instant_dcs:
-            dc_id = dc.get('id')
-
-            # 1. Verify flags (None = unknown from old backend; False = skip)
-            is_instant = dc.get('is_instant_dc')
-            is_synced = dc.get('dc_synced')
-            if is_instant is False:
-                logger.info(f"  [DC {dc_id}] Skip: is_instant_dc=False")
-                continue
-            if is_synced is True:
-                logger.info(f"  [DC {dc_id}] Skip: dc_synced=True")
-                continue
-
-            # 2. Date match (Allowed: DC date <= Invoice date, within a 7-day window)
-            raw_dc_date = dc.get('dc_date') or dc.get('date') or ''
-            dc_date_norm = str(raw_dc_date).replace('-', '').replace(' ', '').strip()
-            
-            try:
-                from datetime import datetime
-                # invoice_date and dc_date_norm are in YYYYMMDD format
-                inv_dt = datetime.strptime(invoice_date, '%Y%m%d')
-                dc_dt = datetime.strptime(dc_date_norm, '%Y%m%d')
-                
-                delta = (inv_dt - dc_dt).days
-                
-                if delta < 0:
-                    logger.info(f"  [DC {dc_id}] Skip: DC date {dc_date_norm} is AFTER invoice date {invoice_date}")
-                    continue
-                
-                if delta > 7:
-                    logger.info(f"  [DC {dc_id}] Skip: DC date {dc_date_norm} is too old (>7 days) for invoice date {invoice_date}")
-                    continue
-                    
-                if delta > 0:
-                    logger.info(f"  [DC {dc_id}] Matching with {delta}-day gap: DC={dc_date_norm}, Inv={invoice_date}")
-                    
-            except Exception as e:
-                # Fallback to strict match if dates are weirdly formatted or parsing fails
-                if dc_date_norm != invoice_date:
-                    logger.info(f"  [DC {dc_id}] Date mismatch (fallback): DC={dc_date_norm!r}, Inv={invoice_date!r}")
-                    continue
-
-            # 3. Customer match (normalized)
-            customer_obj = dc.get('customer')
-            if isinstance(customer_obj, dict):
-                dc_customer = self._normalize_name(customer_obj.get('name'))
-            else:
-                dc_customer = self._normalize_name(dc.get('customer_name'))
-
-            if dc_customer != customer_name_norm:
-                logger.info(f"  [DC {dc_id}] Customer mismatch: DC='{dc_customer}', Inv='{customer_name_norm}'")
-                continue
-
-            # 4. Build DC product map from order_details / items
-            dc_items = dc.get('order_details') or dc.get('items') or []
-            dc_products = {}
-            for it in dc_items:
-                product_obj = it.get('product')
-                if isinstance(product_obj, dict):
-                    raw_name = product_obj.get('name')
-                else:
-                    raw_name = it.get('product_name')
-                name = ''.join(self._normalize_product_signature(raw_name).split())
-                qty = float(it.get('quantity') or 0)
-                logger.debug(
-                    f"  [DC {dc_id}] raw_product='{raw_name}' → normalized='{name}', qty={qty}"
-                )
-                if name and qty > 0:
-                    dc_products[name] = dc_products.get(name, 0) + qty
-
-            logger.info(f"  [DC {dc_id}] DC products: {dc_products}")
-            logger.info(f"  [DC {dc_id}] Inv products: {invoice_products}")
-
-            # 5. Compare product counts
-            if len(dc_products) != len(invoice_products):
-                logger.info(
-                    f"  [DC {dc_id}] Product count mismatch: "
-                    f"DC has {len(dc_products)} {list(dc_products.keys())}, "
-                    f"Inv has {len(invoice_products)} {list(invoice_products.keys())}"
-                )
-                continue
-
-            # 6. Compare each product + quantity (use tolerance for float comparison)
-            matched = True
-            for name, qty in invoice_products.items():
-                dc_qty = dc_products.get(name)
-                if dc_qty is None or abs(dc_qty - qty) > 0.001:
-                    logger.info(
-                        f"  [DC {dc_id}] Product/Qty mismatch for '{name}': "
-                        f"DC={dc_qty}, Inv={qty}"
-                    )
-                    matched = False
-                    break
-
-            if matched:
-                logger.info(f"  [DC {dc_id}] MATCH FOUND: dc_no={dc.get('dc_no')}")
-                return dc
-
-        return None
 
 
     def _validate_invoice_for_sync(self, invoice, items):
@@ -2342,6 +2138,21 @@ class CatalyticsSyncer:
             voucher.pop('PARTYORDERNO', None)
             voucher.pop('PONUMBER', None)
 
+        # Pass the exact Tally invoice total (party ledger amount = goods + GST + all charges)
+        # so the backend can store it directly as challan_total_amount without recomputing.
+        total_amount = invoice.get('total_amount') or 0.0
+        tax_amount = invoice.get('tax_amount') or 0.0
+        try:
+            total_amount = round(float(total_amount), 2)
+            tax_amount = round(float(tax_amount), 2)
+        except (TypeError, ValueError):
+            total_amount = 0.0
+            tax_amount = 0.0
+        if total_amount > 0:
+            voucher['INVOICETOTAL'] = str(total_amount)
+        if tax_amount > 0:
+            voucher['INVOICETAX'] = str(tax_amount)
+
         return voucher, ledgers_map, stock_items_map, None
 
     def sync_invoices_to_dc(self):
@@ -2359,13 +2170,7 @@ class CatalyticsSyncer:
 
         if not invoices:
             logger.info("No invoices to sync")
-            # Still run reconciliation — instant DCs may have appeared after invoices were synced
-            self.reconcile_instant_dcs()
             return {'total': 0, 'synced': 0, 'verified': 0, 'failed': 0}
-
-        # Fetch unsynced instant DCs from portal to attempt matching with incoming Tally invoices
-        instant_dcs = self._fetch_unsynced_instant_dcs()
-        logger.info(f"Retrieved {len(instant_dcs)} unsynced Instant DCs from portal for matching")
 
         stats = {
             'total': len(invoices),
@@ -2401,33 +2206,13 @@ class CatalyticsSyncer:
                 except:
                     items = []
 
-                # INSTANT INVOICE MATCHING LOGIC
-                matched_dc_id = invoice.get('catalytics_dc_id')
-
                 # Proceed with sync (always building full payload)
                 try:
-                    if not matched_dc_id:
-                        logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
-                        matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
-                        if matched_dc:
-                            matched_dc_id = matched_dc.get('id')
-                            logger.info(f"✓ Found match: DC {matched_dc['dc_no']} (ID: {matched_dc_id})")
-                            self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
-                            invoice['catalytics_dc_id'] = matched_dc_id
-                            invoice['dc_no'] = matched_dc['dc_no']
-                            instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
-                    else:
-                        logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
-
                     # Validation gate intentionally removed: always proceed with sync payload.
 
                     voucher_payload, ledgers_map, stock_items_map, prep_error = self._prepare_voucher_payload(invoice)
                     if prep_error or not voucher_payload:
                         raise ValueError(prep_error or f"Could not prepare payload for invoice #{voucher_no}")
-
-                    if matched_dc_id:
-                        voucher_payload['MATCHED_DC_ID'] = matched_dc_id
-                        logger.info(f"Adding MATCHED_DC_ID={matched_dc_id} to Tally payload")
 
                     all_ledgers.update(ledgers_map)
                     all_stock_items.update(stock_items_map)
@@ -2569,10 +2354,6 @@ class CatalyticsSyncer:
             logger.info(f"Success Rate: {stats['verified']/stats['total']*100:.1f}%")
         logger.info(f"{'-'*60}")
 
-        # Retroactively match any unsynced instant DCs that may have been created
-        # after their corresponding invoices were already synced
-        self.reconcile_instant_dcs()
-
         return stats
 
     def sync_invoices_simple(self):
@@ -2591,10 +2372,6 @@ class CatalyticsSyncer:
         if not invoices:
             logger.info("No invoices to sync")
             return {'total': 0, 'synced': 0, 'verified': 0, 'failed': 0}
-
-        # Fetch unsynced instant DCs from portal to attempt matching with incoming Tally invoices
-        instant_dcs = self._fetch_unsynced_instant_dcs()
-        logger.info(f"Retrieved {len(instant_dcs)} unsynced Instant DCs from portal for matching")
 
         stats = {
             'total': len(invoices),
@@ -2637,20 +2414,6 @@ class CatalyticsSyncer:
                     stats['failed'] += 1
                     continue
 
-                # INSTANT INVOICE MATCHING LOGIC
-                matched_dc = None
-                matched_dc_id = invoice.get('catalytics_dc_id')
-                if not matched_dc_id:
-                    logger.info(f"Searching for matching Instant DC for invoice #{voucher_no}...")
-                    matched_dc = self._find_matching_instant_dc(invoice, items, instant_dcs)
-                    if matched_dc:
-                        matched_dc_id = matched_dc['id']
-                        logger.info(f"✓ Found matching Instant DC: {matched_dc['dc_no']} (ID: {matched_dc_id})")
-                        self.db.update_invoice_dc_info(invoice_id, matched_dc['dc_no'], matched_dc_id)
-                        instant_dcs = [d for d in instant_dcs if d['id'] != matched_dc_id]
-                else:
-                    logger.info(f"Using previously matched DC ID {matched_dc_id} for invoice #{voucher_no}")
-
                 # Build simple voucher payload (no ledgers, no stock_items)
                 voucher_payload = self._build_invoice_voucher_payload(invoice)
 
@@ -2658,7 +2421,6 @@ class CatalyticsSyncer:
                 filling_station_id = self._get_filling_station_id(invoice)
 
                 # Simple payload - only voucher data + filling station ID
-                # If matched to an instant DC, include matched_dc_id so backend UPDATES the existing DC
                 request_payload = {
                     'entity_id': self.entity_id,
                     'company_name': company,
@@ -2666,9 +2428,6 @@ class CatalyticsSyncer:
                     'filling_station_id': filling_station_id,
                     'created_by': config.DEFAULT_ADMIN_USER_ID,
                 }
-                if matched_dc_id:
-                    request_payload['matched_dc_id'] = matched_dc_id
-                    logger.info(f"Including matched_dc_id={matched_dc_id} in payload — backend will UPDATE existing DC")
                 try:
                     self.db.execute(
                         'UPDATE invoices SET sync_request_json = ? WHERE id = ?',
@@ -2751,184 +2510,7 @@ class CatalyticsSyncer:
             logger.info(f"Success Rate: {stats['verified']/stats['total']*100:.1f}%")
         logger.info(f"{'-'*60}")
 
-        # Retroactively match any unsynced instant DCs that may have been created
-        # after their corresponding invoices were already synced
-        self.reconcile_instant_dcs()
-
         return stats
-
-    def reconcile_instant_dcs(self):
-        """
-        Retroactively match unsynced Instant DCs from the portal against ALL local
-        invoices — including ones already synced.
-
-        Solves the timing problem:
-          - Scenario A (handled by main loop): Instant DC created first → invoice
-            synced later → DC matched & updated during sync.
-          - Scenario B (handled here): Invoice synced first (DC created by middleware)
-            → incharge creates Instant DC later → this method finds the match and
-            re-sends the invoice payload with matched_dc_id so the backend UPDATES
-            the existing DC instead of creating a duplicate.
-
-        Runs after every sync_invoices_simple() call and can be called independently.
-        """
-        instant_dcs = self._fetch_unsynced_instant_dcs()
-        if not instant_dcs:
-            return
-
-        logger.info(f"[RECONCILE] Checking {len(instant_dcs)} unsynced Instant DC(s) against local invoices...")
-
-        for dc in instant_dcs:
-            dc_id = dc.get('id')
-            dc_no = dc.get('dc_no', '')
-
-            # Build DC date window: dc_date to dc_date + 7 days
-            raw_dc_date = dc.get('dc_date') or dc.get('date') or ''
-            dc_date_str = str(raw_dc_date).replace('-', '').replace(' ', '').strip()[:8]
-            if not dc_date_str or len(dc_date_str) != 8:
-                logger.info(f"  [RECONCILE DC {dc_id}] Skipping — invalid date: {raw_dc_date!r}")
-                continue
-
-            try:
-                from datetime import datetime, timedelta
-                dc_dt = datetime.strptime(dc_date_str, '%Y%m%d')
-                end_dt = dc_dt + timedelta(days=7)
-                end_date_str = end_dt.strftime('%Y%m%d')
-            except Exception:
-                end_date_str = dc_date_str
-
-            # Normalize DC customer name
-            customer_obj = dc.get('customer')
-            if isinstance(customer_obj, dict):
-                dc_customer = self._normalize_name(customer_obj.get('name'))
-            else:
-                dc_customer = self._normalize_name(dc.get('customer_name'))
-
-            if not dc_customer:
-                logger.info(f"  [RECONCILE DC {dc_id}] Skipping — no customer name")
-                continue
-
-            # Build DC product map
-            dc_items = dc.get('order_details') or dc.get('items') or []
-            dc_products = {}
-            for it in dc_items:
-                product_obj = it.get('product')
-                raw_name = product_obj.get('name') if isinstance(product_obj, dict) else it.get('product_name')
-                name = ''.join(self._normalize_product_signature(raw_name).split())
-                qty = float(it.get('quantity') or 0)
-                if name and qty > 0:
-                    dc_products[name] = dc_products.get(name, 0) + qty
-
-            if not dc_products:
-                logger.info(f"  [RECONCILE DC {dc_id}] Skipping — no products in DC")
-                continue
-
-            logger.info(
-                f"  [RECONCILE DC {dc_id}] dc_no={dc_no}, date={dc_date_str}, "
-                f"customer='{dc_customer}', products={dc_products}"
-            )
-
-            # Search local DB invoices in the date window
-            try:
-                rows = self.db.query_all(
-                    """SELECT * FROM invoices
-                       WHERE voucher_date >= ? AND voucher_date <= ?
-                         AND is_deleted = 0
-                       ORDER BY ABS(CAST(voucher_date AS INTEGER) - CAST(? AS INTEGER))""",
-                    (dc_date_str, end_date_str, dc_date_str)
-                )
-            except Exception as e:
-                logger.error(f"  [RECONCILE DC {dc_id}] DB query failed: {e}")
-                continue
-
-            matched_invoice = None
-            for row in (rows or []):
-                invoice = dict(row)
-
-                # Customer match
-                if self._normalize_name(invoice.get('customer_name')) != dc_customer:
-                    continue
-
-                # Build invoice product map
-                try:
-                    items = json.loads(invoice.get('items_json') or '[]')
-                except Exception:
-                    continue
-
-                inv_products = {}
-                for it in items:
-                    name = ''.join(self._normalize_product_signature(it.get('item_name')).split())
-                    qty = float(it.get('quantity') or 0)
-                    if name and qty > 0:
-                        inv_products[name] = inv_products.get(name, 0) + qty
-
-                if not inv_products:
-                    continue
-
-                # Product + qty match
-                if len(inv_products) != len(dc_products):
-                    continue
-
-                match = all(
-                    dc_products.get(name) is not None and abs(dc_products[name] - qty) <= 0.001
-                    for name, qty in inv_products.items()
-                )
-                if match:
-                    matched_invoice = invoice
-                    break
-
-            if not matched_invoice:
-                logger.info(f"  [RECONCILE DC {dc_id}] No matching local invoice found — will retry next cycle")
-                continue
-
-            voucher_no = matched_invoice.get('tally_voucher_no', '')
-            invoice_id = matched_invoice['id']
-            company = matched_invoice.get('tally_company', '')
-            logger.info(f"  [RECONCILE DC {dc_id}] Matched invoice #{voucher_no} (SQLite ID={invoice_id})")
-
-            # Build and send payload with matched_dc_id to update the instant DC
-            try:
-                voucher_payload = self._build_invoice_voucher_payload(matched_invoice)
-                filling_station_id = self._get_filling_station_id(matched_invoice)
-                request_payload = {
-                    'entity_id': self.entity_id,
-                    'company_name': company,
-                    'voucher': voucher_payload,
-                    'filling_station_id': filling_station_id,
-                    'created_by': config.DEFAULT_ADMIN_USER_ID,
-                    'matched_dc_id': dc_id,
-                }
-                response = self._api_request(
-                    'POST',
-                    '/import/tally-delivery-challan-payload/',
-                    json=request_payload,
-                )
-                if response.status_code in [200, 201]:
-                    result = response.json()
-                    data = result.get('data', {})
-                    dc_status = data.get('status', '')
-                    new_dc_no = data.get('dc_no', voucher_no)
-                    new_dc_id = data.get('dc_id') or dc_id
-                    if dc_status in ['created', 'updated']:
-                        self.db.update_invoice_dc_info(invoice_id, new_dc_no, new_dc_id)
-                        self.db.mark_invoice_synced(
-                            invoice_id, new_dc_no, new_dc_id,
-                            json.dumps({'reconciled_instant_dc': True, 'dc_id': dc_id}),
-                            dc_name='instant dc'
-                        )
-                        logger.info(
-                            f"  [RECONCILE DC {dc_id}] [{dc_status.upper()}] "
-                            f"Invoice #{voucher_no} → DC {new_dc_no} (Catalytics={new_dc_id})"
-                        )
-                    else:
-                        logger.warning(f"  [RECONCILE DC {dc_id}] Unexpected status: {dc_status}")
-                else:
-                    logger.error(
-                        f"  [RECONCILE DC {dc_id}] API error: HTTP {response.status_code} "
-                        f"— {response.text[:200]}"
-                    )
-            except Exception as e:
-                logger.error(f"  [RECONCILE DC {dc_id}] Failed: {e}", exc_info=True)
 
     def sync_all(self):
         """Run complete sync cycle"""
