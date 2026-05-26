@@ -11,3 +11,6 @@ lxml==5.1.0
 # Dashboard UI
 Flask==3.0.0
 Flask-CORS==4.0.0
+
+# QR code generation (offline DC print)
+qrcode[pil]==7.4.2

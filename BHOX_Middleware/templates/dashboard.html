@@ -1146,6 +1146,15 @@
             background: #d1fae5;
         }
 
+        .row-action-btn.print {
+            border-color: #f59e0b;
+            color: #f59e0b;
+        }
+
+        .row-action-btn.print:hover {
+            background: #fef3c7;
+        }
+
         .row-action-btn:disabled {
             opacity: 0.4;
             cursor: not-allowed;
@@ -4086,6 +4095,7 @@
                         <button class="row-action-btn view" onclick="showInvoiceDetail(${inv.id})">View</button>
                           <button class="row-action-btn refetch" onclick="refetchRecord('invoices', ${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Refetch</button>
                           <button class="row-action-btn resync" onclick="resyncRecord('invoices', ${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Resync</button>
+                          <button class="row-action-btn print" onclick="window.open('/print/dc/${encodeURIComponent(inv.voucher_no)}', '_blank')" title="Print DC offline">Print DC</button>
                     </td>
                 </tr>`;
             }).join('');
