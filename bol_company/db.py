@@ -509,13 +509,15 @@ class Database:
                 UPDATE customers SET last_updated_at = CURRENT_TIMESTAMP WHERE id = ?
             """, (customer_id,))
 
-    def get_unsynced_customers(self):
-        """Get all customers that haven't been synced."""
+    def get_unsynced_customers(self, max_attempts=10):
+        """Get all customers that haven't been synced.
+        Excludes customers that failed too many times."""
         return self.query_all("""
             SELECT * FROM customers
             WHERE is_synced = 0
+              AND COALESCE(sync_attempts, 0) < ?
             ORDER BY first_fetched_at
-        """)
+        """, (max_attempts,))
 
     def mark_customer_synced(self, customer_id, catalytics_id, response_json=None):
         """Mark customer as successfully synced"""
@@ -634,13 +636,15 @@ class Database:
             product_id,
         ))
 
-    def get_unsynced_products(self):
-        """Get all products that haven't been synced"""
+    def get_unsynced_products(self, max_attempts=10):
+        """Get all products that haven't been synced.
+        Excludes products that failed too many times."""
         return self.query_all("""
             SELECT * FROM products
             WHERE is_synced = 0
+              AND COALESCE(sync_attempts, 0) < ?
             ORDER BY first_fetched_at
-        """)
+        """, (max_attempts,))
 
     def mark_product_synced(self, product_id, catalytics_id, response_json=None):
         """Mark product as successfully synced"""

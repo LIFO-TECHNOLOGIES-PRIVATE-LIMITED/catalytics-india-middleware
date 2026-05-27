@@ -80,7 +80,6 @@ class SyncConfig:
     limit: int
     max_attempts: int
     allow_tally_fetch: bool
-    enable_instant_dc_matching: bool
     dry_run: bool
     log_level: str
     log_json: bool
@@ -102,8 +101,7 @@ def _fetch_unsynced(
     params.append(limit)
     rows = conn.execute(
         f"""
-        SELECT dn.*, ss.is_synced, ss.attempts, ss.payload_hash,
-               dn.is_instant, dn.matched_dc_id
+        SELECT dn.*, ss.is_synced, ss.attempts, ss.payload_hash
         FROM delivery_notes dn
         LEFT JOIN sync_status ss ON ss.delivery_note_id = dn.id
         WHERE COALESCE(ss.is_synced, 0) = 0
@@ -156,7 +154,6 @@ def _load_stock_items(conn, company_id: int, inventory_items: List[Dict[str, Any
 
 
 _FILL_STATION_LIST_CACHE: Dict[str, List[Dict[str, Any]]] = {}
-_INSTANT_DC_MATCH_DISABLED_UNTIL_TS: float = 0.0
 
 
 def _forced_dc_id_for_no(dc_no: Optional[str]) -> Optional[int]:
@@ -948,338 +945,12 @@ def _safe_qty(value: Any) -> Optional[float]:
         return None
 
 
-def _build_item_qty_map(
-    items: List[Dict[str, Any]],
-    *,
-    is_portal_item: bool = False,
-) -> Dict[str, float]:
-    product_map: Dict[str, float] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-
-        if is_portal_item:
-            product_obj = item.get("product")
-            if isinstance(product_obj, dict):
-                name = str(product_obj.get("name") or "").strip()
-            else:
-                name = str(item.get("product_name") or item.get("name") or "").strip()
-            qty = _safe_qty(item.get("quantity") or item.get("qty"))
-        else:
-            name = str(item.get("STOCKITEMNAME") or item.get("ITEMNAME") or "").strip()
-            qty = _safe_qty(item.get("BILLEDQTY") or item.get("ACTUALQTY") or item.get("QTY"))
-
-        if not name or qty is None:
-            continue
-
-        key = _normalize_name_key(name)
-        product_map[key] = product_map.get(key, 0.0) + qty
-
-    return product_map
-
-
-def _parse_instant_dc_results(payload: Any) -> List[Dict[str, Any]]:
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict):
-        data = payload.get("data")
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
-        if isinstance(data, dict):
-            return [data]
-        results = payload.get("results")
-        if isinstance(results, list):
-            return [item for item in results if isinstance(item, dict)]
-        if isinstance(results, dict):
-            return [results]
-    return []
-
-
 def _build_optional_auth_headers(api_key: Optional[str]) -> Dict[str, str]:
     headers: Dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
-
-def _fetch_unsynced_instant_dcs(
-    api_base_url: str,
-    entity_id: Optional[int],
-    api_key: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    global _INSTANT_DC_MATCH_DISABLED_UNTIL_TS
-    now_ts = time.time()
-    if _INSTANT_DC_MATCH_DISABLED_UNTIL_TS > now_ts:
-        remaining = int(_INSTANT_DC_MATCH_DISABLED_UNTIL_TS - now_ts)
-        logger.info(
-            "Instant DC matching temporarily disabled due to previous backend 500 (cooldown %ss)",
-            max(1, remaining),
-        )
-        return []
-
-    logger.info("Fetching unsynced Instant DCs from portal for matching")
-    params: Dict[str, Any] = {}
-    # entity_id is NOT a query param — backend filters by auth/session context
-    headers = _build_optional_auth_headers(api_key)
-
-    last_error = None
-    for base in [_server_base_url(api_base_url)]:
-        path = "/transaction/delivery_challan/instant/unsynced"
-        try:
-            url = base + path
-            response = requests.get(url, params=params, headers=headers, timeout=20)
-            if response.status_code != 200:
-                last_error = f"HTTP {response.status_code}"
-                if response.status_code >= 500:
-                    _INSTANT_DC_MATCH_DISABLED_UNTIL_TS = time.time() + 900  # 15 minutes
-                    logger.warning(
-                        "Instant DC endpoint returned HTTP %s; disabling Instant DC matching for 15 minutes",
-                        response.status_code,
-                    )
-                    try:
-                        logger.warning("Unsynced Instant DC fetch response: %s", response.text[:800])
-                    except Exception:
-                        pass
-                    return []
-                if response.status_code == 404:
-                    logger.debug("Instant DC endpoint not found on %s%s", base, path)
-                else:
-                    logger.warning(
-                        "Unsynced Instant DC fetch failed on %s%s: HTTP %s",
-                        base,
-                        path,
-                        response.status_code,
-                    )
-                try:
-                    if response.status_code != 404:
-                        logger.warning("Unsynced Instant DC fetch response: %s", response.text[:800])
-                except Exception:
-                    pass
-                continue
-
-            basic_results = _parse_instant_dc_results(response.json())
-            if not basic_results:
-                return []
-
-            needs_detail_fetch = bool(basic_results and not basic_results[0].get("dc_date"))
-            if not needs_detail_fetch:
-                return basic_results
-
-            logger.info("Instant DC list missing dc_date; fetching per-DC details")
-            full_results: List[Dict[str, Any]] = []
-            for basic in basic_results:
-                dc_id = basic.get("id")
-                if not dc_id:
-                    full_results.append(basic)
-                    continue
-
-                detail_path = f"/transaction/delivery_challan/{dc_id}"
-                detail_found = False
-                try:
-                    detail_url = base + detail_path
-                    detail_resp = requests.get(detail_url, headers=headers, timeout=20)
-                    if detail_resp.status_code == 200:
-                        parsed_detail = _parse_instant_dc_results(detail_resp.json())
-                        full_results.append(parsed_detail[0] if parsed_detail else basic)
-                        detail_found = True
-                except Exception:
-                    pass
-                if not detail_found:
-                    full_results.append(basic)
-            return full_results
-        except Exception as exc:
-            last_error = str(exc)
-            logger.warning("Unsynced Instant DC fetch error on %s%s: %s", base, path, exc)
-
-    if last_error:
-        logger.warning("Failed to fetch unsynced Instant DCs after trying all bases: %s", last_error)
-    return []
-
-
-def _find_matching_instant_dc(
-    note: Dict[str, Any],
-    voucher: Dict[str, Any],
-    items: List[Dict[str, Any]],
-    instant_dcs: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    if not instant_dcs:
-        return None
-
-    invoice_date = _normalize_date_yyyymmdd(note.get("voucher_date") or voucher.get("DATE"))
-    if not invoice_date:
-        return None
-
-    customer_name = (
-        note.get("party_ledger_name")
-        or voucher.get("PARTYLEDGERNAME")
-        or voucher.get("PARTYNAME")
-        or ""
-    )
-    customer_name_norm = _normalize_name_key(customer_name)
-    if not customer_name_norm:
-        return None
-
-    invoice_products = _build_item_qty_map(items, is_portal_item=False)
-    if not invoice_products:
-        logger.info("Instant DC match: Tally voucher has no parseable products; skipping match")
-        return None
-
-    try:
-        invoice_dt = datetime.strptime(invoice_date, "%Y%m%d")
-    except Exception:
-        return None
-
-    logger.info(
-        "Instant DC match: Tally dc_no=? date=%s customer=%r products=%s",
-        invoice_date, customer_name_norm, list(invoice_products.keys()),
-    )
-
-    # Step 1: collect all DCs that pass date + customer filter
-    candidates: List[Dict[str, Any]] = []
-    for dc in instant_dcs:
-        dc_id = dc.get("id")
-        if not dc_id:
-            continue
-        if dc.get("is_instant_dc") is False:
-            logger.info("  DC id=%s skipped: is_instant_dc=False", dc_id)
-            continue
-        if dc.get("dc_synced") is True:
-            logger.info("  DC id=%s skipped: dc_synced=True", dc_id)
-            continue
-
-        dc_date_norm = _normalize_date_yyyymmdd(dc.get("dc_date") or dc.get("date"))
-        if not dc_date_norm:
-            logger.info("  DC id=%s skipped: no dc_date", dc_id)
-            continue
-
-        try:
-            dc_dt = datetime.strptime(dc_date_norm, "%Y%m%d")
-            delta = (invoice_dt - dc_dt).days
-            if delta < 0 or delta > 7:
-                logger.info("  DC id=%s skipped: date delta=%d (dc=%s tally=%s)", dc_id, delta, dc_date_norm, invoice_date)
-                continue
-        except Exception:
-            if dc_date_norm != invoice_date:
-                logger.info("  DC id=%s skipped: date mismatch (%s vs %s)", dc_id, dc_date_norm, invoice_date)
-                continue
-
-        customer_obj = dc.get("customer")
-        if isinstance(customer_obj, dict):
-            dc_customer_norm = _normalize_name_key(customer_obj.get("name"))
-        else:
-            dc_customer_norm = _normalize_name_key(dc.get("customer_name"))
-        if dc_customer_norm != customer_name_norm:
-            logger.info("  DC id=%s skipped: customer mismatch (portal=%r tally=%r)", dc_id, dc_customer_norm, customer_name_norm)
-            continue
-
-        logger.info("  DC id=%s passed date+customer filter (dc_date=%s customer=%r)", dc_id, dc_date_norm, dc_customer_norm)
-        candidates.append(dc)
-
-    if not candidates:
-        return None
-
-    # Step 2: try to narrow down by product name + quantity match
-    def _score_dc(dc: Dict[str, Any]) -> int:
-        """Return match score: 2=full qty match, 1=name-only match, 0=no product data."""
-        dc_items = dc.get("order_details") or dc.get("items") or []
-        dc_products = _build_item_qty_map(dc_items, is_portal_item=True)
-
-        if dc_products:
-            # Full product+quantity check
-            if len(dc_products) != len(invoice_products):
-                return -1  # product count mismatch — eliminate
-            for tally_key, expected_qty in invoice_products.items():
-                got_qty = dc_products.get(tally_key)
-                if got_qty is None:
-                    candidates_qty = [
-                        qty for pk, qty in dc_products.items()
-                        if pk.startswith(tally_key) or tally_key.startswith(pk)
-                    ]
-                    got_qty = candidates_qty[0] if len(candidates_qty) == 1 else None
-                if got_qty is None or abs(got_qty - expected_qty) >= 1e-6:
-                    return -1  # qty mismatch — eliminate
-            return 2  # full match
-
-        if dc_items:
-            # Items exist but no quantity field — try name-only match
-            dc_names: set = set()
-            for it in dc_items:
-                if isinstance(it, dict):
-                    pobj = it.get("product")
-                    name = (isinstance(pobj, dict) and pobj.get("name")) or it.get("product_name") or it.get("name") or ""
-                elif isinstance(it, str):
-                    name = it
-                else:
-                    name = ""
-                if name:
-                    dc_names.add(_normalize_name_key(str(name)))
-            tally_names = set(invoice_products.keys())
-            has_overlap = bool(dc_names & tally_names) or any(
-                any(pk.startswith(tk) or tk.startswith(pk) for pk in dc_names)
-                for tk in tally_names
-            )
-            if has_overlap:
-                return 1  # name-only match
-            return -1  # names don't match either — eliminate
-
-        # No items at all — can't verify products, treat as weak match
-        return 0
-
-    scored = [(dc, _score_dc(dc)) for dc in candidates]
-    logger.info(
-        "  Candidate scores: %s",
-        [(dc.get("id"), score) for dc, score in scored],
-    )
-
-    # Eliminate any DC with score -1 (definite mismatch)
-    viable = [(dc, score) for dc, score in scored if score >= 0]
-    if not viable:
-        # All candidates were eliminated by product check — fall back to all candidates
-        logger.info("  All candidates eliminated by product check; falling back to best date+customer match")
-        viable = [(dc, 0) for dc in candidates]
-
-    # Pick the highest-scoring candidate; ties broken by id (prefer higher/latest)
-    viable.sort(key=lambda x: (x[1], x[0].get("id") or 0), reverse=True)
-    best_dc, best_score = viable[0]
-    logger.info("  Selected DC id=%s with score=%d", best_dc.get("id"), best_score)
-    return best_dc
-
-
-def _mark_instant_dc_synced_on_portal(
-    api_base_url: str,
-    dc_pk: Any,
-    tally_voucher_no: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> bool:
-    """Mark matched instant DC as synced on the portal."""
-    dc_id = str(dc_pk or "").strip()
-    if not dc_id:
-        return False
-
-    payload: Dict[str, Any] = {}
-    if tally_voucher_no:
-        payload["tally_voucher_no"] = str(tally_voucher_no).strip()
-    headers = _build_optional_auth_headers(api_key)
-
-    endpoint_paths = [f"/transaction/delivery_challan/instant/{dc_id}/mark-synced"]
-
-    for base in [_server_base_url(api_base_url)]:
-        for path in endpoint_paths:
-            try:
-                url = base + path
-                resp = requests.post(url, json=payload, headers=headers, timeout=20)
-                if resp.status_code == 200:
-                    return True
-                logger.warning(
-                    "Instant DC mark-synced failed for id=%s on %s%s: HTTP %s",
-                    dc_id, base, path, resp.status_code
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Instant DC mark-synced error for id=%s on %s%s: %s",
-                    dc_id, base, path, exc
-                )
-    return False
 
 
 def _update_sync_status(
@@ -1361,6 +1032,164 @@ def _import_base_url(api_base_url: str) -> str:
     if not base:
         return ""
     return base if base.endswith("/import") else (base + "/import")
+
+
+def _fetch_unsynced_instant_dcs(
+    api_base_url: str,
+    entity_id: Optional[int],
+    api_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch unsynced Instant DCs from Catalytics portal for matching."""
+    headers = _build_optional_auth_headers(api_key)
+    base = _server_base_url(api_base_url)
+    try:
+        url = base + "/transaction/delivery_challan/instant/unsynced"
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            logger.error("Failed to fetch unsynced instant DCs: HTTP %s", resp.status_code)
+            return []
+        data = resp.json()
+        basic_results = data.get("results") or []
+        logger.info("Received %d unsynced instant DCs from portal", len(basic_results))
+
+        # Check if enhanced list already includes dc_date (new backend)
+        if basic_results and not basic_results[0].get("dc_date"):
+            logger.info("Backend list missing 'dc_date' — falling back to per-DC detail fetch")
+            full_results: List[Dict[str, Any]] = []
+            for basic in basic_results:
+                dc_id = basic.get("id")
+                try:
+                    detail_resp = requests.get(
+                        base + f"/transaction/delivery_challan/{dc_id}",
+                        headers=headers,
+                        timeout=15,
+                    )
+                    if detail_resp.status_code == 200:
+                        detail_data = detail_resp.json()
+                        if isinstance(detail_data, dict) and isinstance(detail_data.get("data"), dict):
+                            full_results.append(detail_data["data"])
+                        else:
+                            full_results.append(detail_data)
+                    else:
+                        full_results.append(basic)
+                except Exception as e:
+                    logger.warning("Failed to fetch detail for DC %s: %s", dc_id, e)
+                    full_results.append(basic)
+            return full_results
+
+        return basic_results
+    except Exception as e:
+        logger.error("Error fetching unsynced instant DCs: %s", e)
+        return []
+
+
+def _find_matching_instant_dc(
+    note: Dict[str, Any],
+    voucher: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    instant_dcs: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Match a Tally voucher with an unsynced Instant DC from the portal.
+    Criteria: date match (within 7 days), customer name match, product+qty match.
+    """
+    customer_name = _normalize_name_key(
+        note.get("party_ledger_name") or voucher.get("PARTYLEDGERNAME") or ""
+    )
+    invoice_date = _normalize_date_yyyymmdd(
+        note.get("voucher_date") or voucher.get("DATE") or ""
+    )
+
+    # Build product map: {normalized_name: total_qty}
+    invoice_products: Dict[str, float] = {}
+    for it in items:
+        name = _normalize_name_key(it.get("STOCKITEMNAME") or it.get("ITEMNAME") or "")
+        qty_raw = it.get("BILLEDQTY") or it.get("ACTUALQTY") or ""
+        try:
+            qty = abs(float(str(qty_raw).split()[0].replace(",", "")))
+        except (ValueError, IndexError):
+            qty = 0.0
+        if name and qty > 0:
+            invoice_products[name] = invoice_products.get(name, 0) + qty
+
+    if not invoice_products:
+        return None
+
+    for dc in instant_dcs:
+        is_instant = dc.get("is_instant_dc")
+        is_synced = dc.get("dc_synced")
+        if is_instant is False or is_synced is True:
+            continue
+
+        # Date match (DC date <= invoice date, within 7-day window)
+        raw_dc_date = str(dc.get("dc_date") or dc.get("date") or "").replace("-", "").strip()
+        try:
+            from datetime import datetime as _dt
+            inv_dt = _dt.strptime(invoice_date, "%Y%m%d")
+            dc_dt = _dt.strptime(raw_dc_date, "%Y%m%d")
+            delta = (inv_dt - dc_dt).days
+            if delta < 0 or delta > 7:
+                continue
+        except Exception:
+            if raw_dc_date != invoice_date:
+                continue
+
+        # Customer match
+        customer_obj = dc.get("customer")
+        if isinstance(customer_obj, dict):
+            dc_customer = _normalize_name_key(customer_obj.get("name"))
+        else:
+            dc_customer = _normalize_name_key(dc.get("customer_name"))
+        if dc_customer != customer_name:
+            continue
+
+        # Product+qty match
+        dc_products: Dict[str, float] = {}
+        order_details = dc.get("order_details") or dc.get("items") or []
+        for od in order_details:
+            prod = od.get("product")
+            if isinstance(prod, dict):
+                pname = _normalize_name_key(prod.get("name") or prod.get("short_name"))
+            else:
+                pname = _normalize_name_key(od.get("product_name"))
+            pqty = float(od.get("quantity") or 0)
+            if pname and pqty > 0:
+                dc_products[pname] = dc_products.get(pname, 0) + pqty
+
+        if dc_products == invoice_products:
+            logger.info(
+                "Matched instant DC id=%s dc_no=%s for invoice %s",
+                dc.get("id"), dc.get("dc_no"),
+                note.get("dc_no") or voucher.get("VOUCHERNUMBER"),
+            )
+            return dc
+
+    return None
+
+
+def _mark_instant_dc_synced_on_portal(
+    api_base_url: str,
+    dc_pk: int,
+    tally_voucher_no: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> None:
+    """Mark an instant DC as synced on the portal."""
+    headers = _build_optional_auth_headers(api_key)
+    base = _server_base_url(api_base_url)
+    try:
+        payload: Dict[str, Any] = {}
+        if tally_voucher_no:
+            payload["tally_voucher_no"] = tally_voucher_no
+        resp = requests.post(
+            base + f"/transaction/delivery_challan/instant/{dc_pk}/mark-synced",
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logger.error("Failed to mark instant DC %s as synced: HTTP %s", dc_pk, resp.status_code)
+    except Exception as e:
+        logger.error("Error marking instant DC %s as synced: %s", dc_pk, e)
 
 
 def _lookup_dc_id_by_no(
@@ -1497,7 +1326,6 @@ def build_config(args: argparse.Namespace) -> SyncConfig:
         limit=args.limit or cfg.get_env_int("SYNC_LIMIT", 200) or 200,
         max_attempts=args.max_attempts or cfg.get_env_int("SYNC_MAX_ATTEMPTS", 5) or 5,
         allow_tally_fetch=bool(args.allow_tally_fetch) or cfg.get_env_bool("SYNC_ALLOW_TALLY_FETCH", False),
-        enable_instant_dc_matching=cfg.get_env_bool("ENABLE_INSTANT_DC_MATCHING", True),
         dry_run=bool(args.dry_run) or cfg.get_env_bool("SYNC_DRY_RUN", False),
         log_level=args.log_level or cfg.get_env("LOG_LEVEL", "INFO"),
         log_json=bool(args.log_json) or cfg.get_env_bool("LOG_JSON", False),
@@ -1530,12 +1358,8 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         logger.info("No unsynced delivery notes found")
         return {"sent": 0, "ok": 0, "failed": 0}
 
-    instant_dcs: List[Dict[str, Any]] = []
-    if config.enable_instant_dc_matching:
-        instant_dcs = _fetch_unsynced_instant_dcs(config.api_base_url, config.entity_id, config.api_key)
-        logger.info("Retrieved %d unsynced Instant DCs for matching", len(instant_dcs))
-    else:
-        logger.info("Instant DC matching disabled (ENABLE_INSTANT_DC_MATCHING=false)")
+    # Instant DC matching is handled entirely by the backend now.
+    # Middleware just sends the Tally voucher payload as-is.
 
     # Build liquid product name map once for this sync run
     liquid_master_map, liquid_variant_map = _build_liquid_name_maps(config.master_db_path)
@@ -1556,8 +1380,6 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
 
     for note in notes:
         dc_no = _norm_dc_no(note.get("dc_no"))
-        # Restore previously persisted matched_dc_id if sync failed on a prior attempt
-        matched_dc_id: Optional[int] = note.get("matched_dc_id") or None
         try:
             payload, payload_hash = _build_payload_for_note(
                 conn,
@@ -1606,48 +1428,8 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             total_fail += 1
             continue
 
-        if matched_dc_id:
-            # Previously persisted match from a failed prior attempt — reuse it
-            voucher["MATCHED_DC_ID"] = matched_dc_id
-            logger.info("Reusing persisted MATCHED_DC_ID=%s for dc_no=%s", matched_dc_id, dc_no or "?")
-            instant_dcs = [dc for dc in instant_dcs if dc.get("id") != matched_dc_id]
-        else:
-            matched_dc = _find_matching_instant_dc(note, voucher, items, instant_dcs)
-            if matched_dc and matched_dc.get("id"):
-                matched_dc_id = matched_dc.get("id")
-                voucher["MATCHED_DC_ID"] = matched_dc_id
-                logger.info("Matched Instant DC for %s -> portal DC %s (id=%s)",
-                            dc_no or "?", matched_dc.get("dc_no"), matched_dc_id)
-                # Persist matched DC ID immediately so it survives a failed sync (like BOL middleware)
-                db.update_delivery_note_matched_dc(conn, delivery_note_id=note["id"], matched_dc_id=matched_dc_id)
-                instant_dcs = [dc for dc in instant_dcs if dc.get("id") != matched_dc_id]
-
-        if not matched_dc_id and dc_no:
-            logger.info("No instant match for dc_no=%s; trying dc_no lookup fallback", dc_no)
-            # Fallback: if instant-list endpoint is unavailable, attempt direct dc_no lookup
-            # so payload can update existing DC instead of creating duplicate.
-            existing_dc_id = _lookup_dc_id_by_no(
-                config.api_base_url,
-                config.entity_id,
-                dc_no,
-                config.api_key,
-                expected_date=note.get("voucher_date") or voucher.get("DATE"),
-                expected_customer=note.get("party_ledger_name") or voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME"),
-            )
-            if existing_dc_id:
-                matched_dc_id = existing_dc_id
-                voucher["MATCHED_DC_ID"] = existing_dc_id
-                logger.info("Matched existing portal DC by dc_no=%s (id=%s)", dc_no, existing_dc_id)
-            else:
-                logger.info("No existing portal DC found by dc_no=%s; payload may create new DC", dc_no)
-
-        if matched_dc_id:
-            logger.info("Using MATCHED_DC_ID=%s for dc_no=%s", matched_dc_id, dc_no or "?")
-        else:
-            logger.info("MATCHED_DC_ID not set for dc_no=%s", dc_no or "?")
-
         logger.info(
-            "Syncing DC #%s | party=%s | date=%s | filling_station=%s | po=%s | items=%d | terms=%s | instant=%s",
+            "Syncing DC #%s | party=%s | date=%s | filling_station=%s | po=%s | items=%d | terms=%s",
             dc_no or "?",
             voucher.get("PARTYLEDGERNAME") or "?",
             voucher.get("DATE") or "?",
@@ -1655,7 +1437,6 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             voucher.get("PARTYORDERNO") or "[EMPTY]",
             len(voucher.get("INVENTORY") or []),
             voucher.get("TERMSOFDELIVERY") or "[EMPTY]",
-            bool(note.get("is_instant")),
         )
 
         # Send single voucher per request â€" matching Arasan's sync_invoices_to_dc pattern
@@ -1666,6 +1447,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             "ledgers": payload.get("ledgers") or {},
             "stock_items": payload.get("stock_items") or {},
             "allow_tally_fetch": config.allow_tally_fetch,
+            "created_by": _get_default_admin_user_id(),
         }
 
         if config.dry_run:
@@ -1749,19 +1531,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                                     payload_hash=payload_hash, response_json=response_json, error_text=None)
                 total_ok += 1
 
-                if matched_dc_id:
-                    mark_ok = _mark_instant_dc_synced_on_portal(
-                        config.api_base_url,
-                        matched_dc_id,
-                        tally_voucher_no=tally_voucher_no,
-                        api_key=config.api_key,
-                    )
-                    if mark_ok:
-                        logger.info("Marked Instant DC as synced on portal (id=%s)", matched_dc_id)
-                    else:
-                        logger.warning("Could not mark Instant DC as synced on portal (id=%s)", matched_dc_id)
-
-                # Step 2: Always update fill_station after successful DC sync
+                # Update fill_station after successful DC sync
                 default_fs_id = _get_default_fill_station_id()
                 if default_fs_id:
                     # Use server ID from response if available, otherwise look it up

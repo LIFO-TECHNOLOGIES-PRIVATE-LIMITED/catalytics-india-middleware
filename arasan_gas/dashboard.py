@@ -227,8 +227,7 @@ def api_status():
                 for key in config.TALLY_COMPANY_ACTIVE
                 if config.TALLY_COMPANIES.get(key)
             },
-            'sync_batch_size': config.SYNC_BATCH_SIZE,
-            'invoice_fetch_start_date': config.INVOICE_FETCH_START_DATE or 'Today',
+            'invoice_fetch_start_date': config.INVOICE_FETCH_START_DATE or 'Day Book',
             'product_type_map': config.PRODUCT_TYPE_MAP
         }
     })
@@ -757,10 +756,10 @@ def trigger_sync_invoices():
                 'status': 'started'
             })
 
-        dashboard_logger.write_log("=== INVOICE SYNC TO CATALYTICS STARTED (LIGHTWEIGHT API) ===")
+        dashboard_logger.write_log("=== INVOICE SYNC TO CATALYTICS STARTED ===")
 
         syncer = CatalyticsSyncer()
-        success, output = _guarded_run("Sync Invoices", syncer.sync_invoices_simple)
+        success, output = _guarded_run("Sync Invoices", syncer.sync_invoices_to_dc)
 
         dashboard_logger.write_log(
             f"=== INVOICE SYNC TO CATALYTICS {'COMPLETED' if success else 'FAILED'} ==="
@@ -2568,37 +2567,53 @@ def maybe_start_automation():
 
 
 def maybe_register_windows_startup():
-    """Register packaged EXE in HKCU Run for auto-start on Windows login."""
+    """Register in HKCU Run for auto-start on Windows login.
+    Works for both frozen EXE and Python script."""
     if os.name != 'nt':
         return
 
     if not _env_flag('AUTO_REGISTER_WINDOWS_STARTUP', 'false'):
         return
 
-    if not getattr(sys, 'frozen', False):
-        logger.info("Skipping Windows startup registration (not running as EXE)")
-        return
-
     try:
         import winreg
 
         app_name = os.getenv('WINDOWS_STARTUP_APP_NAME', 'ArasanGasMiddlewareDashboard').strip() or 'ArasanGasMiddlewareDashboard'
-        exe_path = f'"{sys.executable}"'
+
+        if getattr(sys, 'frozen', False):
+            # Running as PyInstaller EXE
+            exe_path = f'"{sys.executable}"'
+        else:
+            # Running as Python script — register: python.exe dashboard.py
+            script_path = str(BASE_DIR / 'dashboard.py')
+            exe_path = f'"{sys.executable}" "{script_path}"'
 
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
-            r'Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+            r'Software\Microsoft\Windows\CurrentVersion\Run',
             0,
             winreg.KEY_SET_VALUE
         ) as run_key:
             winreg.SetValueEx(run_key, app_name, 0, winreg.REG_SZ, exe_path)
 
-        logger.info(f"Windows startup registration ensured for: {app_name}")
+        logger.info(f"Windows startup registered: {app_name} -> {exe_path}")
     except Exception as exc:
         logger.warning(f"Could not register Windows startup: {exc}")
 if __name__ == '__main__':
     # Ensure logs directory exists (next to the exe, not in CWD)
     os.makedirs(str(BASE_DIR / 'logs'), exist_ok=True)
+
+    # Set Windows process/console title so Task Manager shows correct name
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW("Arasan Gas Middleware Dashboard")
+    except Exception:
+        pass
+    try:
+        import multiprocessing
+        multiprocessing.current_process().name = "ArasanGasMiddleware"
+    except Exception:
+        pass
 
     default_debug = 'false' if getattr(sys, 'frozen', False) else 'true'
     dashboard_debug = _env_flag('DASHBOARD_DEBUG', default_debug)

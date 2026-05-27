@@ -1413,17 +1413,6 @@ def resync_invoice(invoice_id):
         customer_name = row[3]
         catalytics_dc_id = row[4]
 
-        # Check if DC is accepted in Catalytics (order_status 1 or 2 = accepted)
-        if catalytics_dc_id:
-            order_status, pg_err = _check_dc_order_status(catalytics_dc_id)
-            if order_status is not None and order_status in (1, 2):
-                conn.close()
-                status_name = 'Accepted' if order_status == 1 else 'Processed'
-                return jsonify({
-                    'success': False,
-                    'error': f'Cannot resync Invoice #{voucher_no} Ã¢â‚¬â€ DC #{catalytics_dc_id} is already {status_name} (order_status={order_status}) in Catalytics.'
-                }), 400
-
         # Reset invoice for resync (including enhanced fields)
         cursor.execute('''
             UPDATE invoices
@@ -1565,11 +1554,19 @@ def refetch_customer(customer_id):
                 conn.close()
                 return jsonify({'success': False, 'error': f'Customer "{customer_name}" not found in Tally'}), 404
 
+            # Normalize name from Tally (collapse spaces)
+            refreshed_name = ' '.join((ledger_data.get('name') or customer_name).split())
+
             # Prepare update data with all customer fields
             customer_data = {
-                'tally_guid': ledger_data.get('guid'),
-                'gstin': ledger_data.get('gstin', ''),
-                'pan': ledger_data.get('pan', ''),
+                'name': refreshed_name,
+                'tally_company': company_name,
+                'tally_guid': (
+                    ledger_data.get('GUID') or ledger_data.get('guid')
+                    or ledger_data.get('MASTERID') or ''
+                ).strip() or None,
+                'gstin': (ledger_data.get('gstin') or ledger_data.get('GSTIN') or '').lstrip(':'),
+                'pan': ledger_data.get('pan') or ledger_data.get('INCOMETAXNUMBER') or '',
                 'address': ledger_data.get('address', ''),
                 'state': ledger_data.get('state', ''),
                 'city': ledger_data.get('city', ''),
@@ -1805,17 +1802,6 @@ def refetch_invoice(invoice_id):
 
         invoice_id, voucher_no, company_name, catalytics_dc_id = row
 
-        # Check if DC is accepted in Catalytics (order_status 1 or 2 = accepted)
-        if catalytics_dc_id:
-            order_status, pg_err = _check_dc_order_status(catalytics_dc_id)
-            if order_status is not None and order_status in (1, 2):
-                conn.close()
-                status_name = 'Accepted' if order_status == 1 else 'Processed'
-                return jsonify({
-                    'success': False,
-                    'error': f'Cannot refetch Invoice #{voucher_no} Ã¢â‚¬â€ DC #{catalytics_dc_id} is already {status_name} (order_status={order_status}) in Catalytics.'
-                }), 400
-
         # Fetch invoices from Tally using the correct TallyClient method
         try:
             from tally_client import TallyClient
@@ -1842,15 +1828,26 @@ def refetch_invoice(invoice_id):
 
             # Update local DB with fresh Tally data
             from db import json_dumps
+
+            # Normalize customer name (collapse spaces) to match fetch_customers
+            customer_name = ' '.join(matched_invoice.get('customer_name', '').split())
             items_json = json_dumps(matched_invoice.get('items', []))
 
             # Build data_json from raw voucher if available
             raw_voucher = matched_invoice.get('raw_voucher', {})
             data_json = json_dumps(raw_voucher) if raw_voucher else None
 
+            # Extract customer GUID from raw voucher LEDGERDATA
+            _ledger_block = raw_voucher.get('LEDGERDATA') or {}
+            customer_guid = ''
+            if isinstance(_ledger_block, dict):
+                customer_guid = (
+                    _ledger_block.get('guid') or _ledger_block.get('GUID')
+                    or _ledger_block.get('MASTERID') or ''
+                ).strip()
+
             # Fetch ledger data for customer
             ledger_data_json = None
-            customer_name = matched_invoice.get('customer_name', '')
             if customer_name:
                 try:
                     from tally_client import get_ledger_by_name
@@ -1860,30 +1857,52 @@ def refetch_invoice(invoice_id):
                 except Exception:
                     pass
 
+            # Build stock_items_json from raw voucher STOCKITEMS
+            stock_items_json = None
+            _stock_block = raw_voucher.get('STOCKITEMS')
+            if _stock_block and isinstance(_stock_block, dict):
+                stock_items_json = json_dumps(_stock_block)
+
+            # Extract godown/filling station from inventory
+            g_name = ''
+            for _inv in (raw_voucher.get('INVENTORY') or []):
+                if isinstance(_inv, dict):
+                    g_name = _inv.get('GODOWNNAME') or ''
+                    if g_name:
+                        break
+
             cursor.execute('''
                 UPDATE invoices
                 SET customer_name = ?,
+                    customer_guid = ?,
                     voucher_date = ?,
                     total_amount = ?,
                     tax_amount = ?,
                     items_json = ?,
                     data_json = ?,
                     ledger_data_json = ?,
+                    stock_items_json = ?,
                     billing_address = ?,
                     delivery_address = ?,
+                    godown_name = ?,
                     is_synced = 0,
+                    sync_attempts = 0,
+                    last_sync_error = NULL,
                     last_updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             ''', (
                 customer_name,
+                customer_guid,
                 matched_invoice.get('voucher_date', ''),
                 matched_invoice.get('total_amount', 0),
                 matched_invoice.get('tax_amount', 0),
                 items_json,
                 data_json,
                 ledger_data_json,
+                stock_items_json,
                 matched_invoice.get('billing_address', ''),
                 matched_invoice.get('delivery_address', ''),
+                g_name,
                 invoice_id
             ))
             conn.commit()

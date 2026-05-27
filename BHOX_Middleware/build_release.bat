@@ -12,7 +12,7 @@ if errorlevel 1 (
 
 echo [2/5] Preparing release directory...
 for /f %%i in ('powershell -NoProfile -Command "(Get-Date).ToString('yyyyMMdd_HHmm')"') do set "STAMP=%%i"
-set "RELEASE_DIR=%cd%\release\bol_client_release_%STAMP%"
+set "RELEASE_DIR=%cd%\release\bhox_client_release_%STAMP%"
 set "ZIP_PATH=%RELEASE_DIR%.zip"
 
 if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
@@ -20,7 +20,7 @@ mkdir "%RELEASE_DIR%"
 mkdir "%RELEASE_DIR%\logs"
 
 echo [3/5] Copying client files...
-copy /y "dist\bol_dashboard.exe" "%RELEASE_DIR%\" >nul
+copy /y "dist\bhox_dashboard.exe" "%RELEASE_DIR%\" >nul
 copy /y ".env.example" "%RELEASE_DIR%\.env.example" >nul
 copy /y ".env.example" "%RELEASE_DIR%\.env" >nul
 copy /y "README_CLIENT_SETUP.txt" "%RELEASE_DIR%\" >nul
@@ -44,7 +44,7 @@ echo.
 echo Client deployment steps:
 echo   1. Unzip on client system
 echo   2. Edit .env
-echo   3. Double-click bol_dashboard.exe
+echo   3. Double-click bhox_dashboard.exe
 echo   4. Startup auto-registers by default on first EXE launch (Install_AutoStart.bat is fallback)
 
 endlocal

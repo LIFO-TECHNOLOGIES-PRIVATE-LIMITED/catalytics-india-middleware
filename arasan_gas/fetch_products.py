@@ -196,20 +196,57 @@ def fetch_products_from_all_companies():
                 existing = db.product_exists_normalized(canonical_name)
 
                 if existing:
+                    existing_id = existing['id']
                     owner_company = existing['tally_company']
-                    logger.warning(
-                        f"[DUPLICATE SKIPPED] '{product_name}' "
-                        f"(canonical: '{canonical_name}') "
-                        f"(owned by {owner_company}, attempted by {company_name})"
-                    )
-                    db.log_duplicate(
-                        entity_type='product',
-                        entity_name=canonical_name,
-                        tally_company=company_name,
-                        owned_by_company=owner_company,
-                        details=f"HSN: {product.get('hsn_code', 'N/A')}, Original: {product_name}"
-                    )
-                    overall_stats['duplicates_skipped'] += 1
+                    if owner_company != company_name:
+                        # Different company owns this name — skip
+                        logger.warning(
+                            f"[DUPLICATE SKIPPED] '{product_name}' "
+                            f"(canonical: '{canonical_name}') "
+                            f"(owned by {owner_company}, attempted by {company_name})"
+                        )
+                        db.log_duplicate(
+                            entity_type='product',
+                            entity_name=canonical_name,
+                            tally_company=company_name,
+                            owned_by_company=owner_company,
+                            details=f"HSN: {product.get('hsn_code', 'N/A')}, Original: {product_name}"
+                        )
+                        overall_stats['duplicates_skipped'] += 1
+                        continue
+
+                    # Same company — update with full Tally data
+                    # (enriches DC-driven auto-created records with GUID, HSN, GST rates)
+                    try:
+                        product_data = {
+                            'tally_guid': product['guid'],
+                            'hsn_code': product.get('hsn_code', ''),
+                            'unit': product.get('unit', ''),
+                            'rate': product.get('rate', 0.0),
+                            'description': product.get('description', ''),
+                            'data_json': json.dumps(product),
+                            'product_master_name': parsed['product_master_name'],
+                            'variant_name': parsed['variant_name'],
+                            'unit_name': parsed['unit_name'],
+                            'product_type_code': parsed['product_type_code'],
+                            'product_type_name': parsed['product_type_name'],
+                            'gst_applicable': product.get('gst_applicable', ''),
+                            'gst_rate': product.get('gst_rate', 0.0),
+                            'igst_rate': product.get('igst_rate', 0.0),
+                            'cgst_rate': product.get('cgst_rate', 0.0),
+                            'sgst_rate': product.get('sgst_rate', 0.0),
+                        }
+                        db.update_product(existing_id, product_data)
+                        overall_stats.setdefault('updated', 0)
+                        overall_stats['updated'] += 1
+                        logger.info(
+                            f"[UPDATED PRODUCT] '{product_name}' refreshed with Tally data "
+                            f"(company: {company_name}, GUID: {product.get('guid', 'N/A')}, "
+                            f"HSN: {product.get('hsn_code', 'N/A')})"
+                        )
+                    except Exception as e:
+                        logger.error(f"[ERROR] Failed to update product '{product_name}': {e}", exc_info=True)
+                        overall_stats['errors'] += 1
                     continue
 
                 # Step 4: Save to SQLite with parsed fields
@@ -217,20 +254,18 @@ def fetch_products_from_all_companies():
                     product_data = {
                         'tally_guid': product['guid'],
                         'name': product_name,
-                        'name_canonical': canonical_name,  # ← Canonical name for uniqueness
+                        'name_canonical': canonical_name,
                         'tally_company': company_name,
                         'hsn_code': product.get('hsn_code', ''),
                         'unit': product.get('unit', ''),
                         'rate': product.get('rate', 0.0),
                         'description': product.get('description', ''),
                         'data_json': json.dumps(product),
-                        # Parsed fields
                         'product_master_name': parsed['product_master_name'],
                         'variant_name': parsed['variant_name'],
                         'unit_name': parsed['unit_name'],
                         'product_type_code': parsed['product_type_code'],
                         'product_type_name': parsed['product_type_name'],
-                        # GST fields from Tally
                         'gst_applicable': product.get('gst_applicable', ''),
                         'gst_rate': product.get('gst_rate', 0.0),
                         'igst_rate': product.get('igst_rate', 0.0),

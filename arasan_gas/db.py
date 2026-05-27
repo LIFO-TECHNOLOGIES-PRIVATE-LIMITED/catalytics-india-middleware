@@ -535,14 +535,20 @@ class Database:
             product_id,
         ))
 
-    def get_unsynced_products(self, limit=50):
+    def get_unsynced_products(self, limit=None):
         """Get products that haven't been synced"""
+        if limit:
+            return self.query_all("""
+                SELECT * FROM products
+                WHERE is_synced = 0
+                ORDER BY first_fetched_at
+                LIMIT ?
+            """, (limit,))
         return self.query_all("""
             SELECT * FROM products
             WHERE is_synced = 0
             ORDER BY first_fetched_at
-            LIMIT ?
-        """, (limit,))
+        """)
 
     def mark_product_synced(self, product_id, catalytics_id, response_json=None):
         """Mark product as successfully synced"""

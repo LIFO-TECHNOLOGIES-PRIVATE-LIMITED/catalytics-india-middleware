@@ -477,7 +477,10 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
 
     for invoice in invoices:
         voucher_no = invoice.get('voucher_no', '')
-        customer_name = invoice.get('customer_name', '')
+        # Normalize customer name: collapse multiple spaces so it matches
+        # the name stored by fetch_customers.py (which also collapses spaces).
+        customer_name = ' '.join(invoice.get('customer_name', '').split())
+        invoice['customer_name'] = customer_name
         voucher_date = invoice.get('voucher_date', '')
 
         if not voucher_no or not customer_name:
@@ -538,11 +541,32 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 f"source='{delivery_source}' | vehicle='{vehicle_no}'"
             )
 
+        # Extract customer GUID from raw voucher LEDGERDATA (enriched during fetch)
+        raw_voucher = invoice.get('raw_voucher', {}) or {}
+        _ledger_block = raw_voucher.get('LEDGERDATA') or {}
+        customer_guid = (
+            _ledger_block.get('guid') or _ledger_block.get('GUID')
+            or _ledger_block.get('MASTERID') or ''
+        ).strip() if isinstance(_ledger_block, dict) else ''
+        invoice['customer_guid'] = customer_guid
+
+        # Lookup customer: GUID first, then normalized name fallback
         normalized_customer = _normalize_name_key(customer_name)
         ledger_cache_key = f"{company_name}::{normalized_customer}"
         if ledger_cache_key not in ledger_cache:
             try:
-                row = db.query("SELECT name, data_json FROM customers WHERE lower(replace(name, ' ', '')) = ?", (normalized_customer,))
+                row = None
+                if customer_guid:
+                    row = db.query(
+                        "SELECT name, data_json FROM customers WHERE tally_guid = ?",
+                        (customer_guid,),
+                    )
+                if not row:
+                    row = db.query(
+                        "SELECT name, data_json FROM customers "
+                        "WHERE lower(replace(name, ' ', '')) = ?",
+                        (normalized_customer,),
+                    )
                 ledger_cache[ledger_cache_key] = json_loads(row['data_json']) if (row and row['data_json']) else None
             except Exception:
                 ledger_cache[ledger_cache_key] = None
@@ -571,15 +595,21 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                         _addr_parts.append(_astr)
                 _cust_address = ', '.join(_addr_parts)
 
-            existing_customer = db.query(
-                "SELECT id FROM customers WHERE name = ? AND tally_company = ? LIMIT 1",
-                (customer_name, company_name),
-            )
+            existing_customer = None
+            if customer_guid:
+                existing_customer = db.query(
+                    "SELECT id FROM customers WHERE tally_guid = ? LIMIT 1",
+                    (customer_guid,),
+                )
+            if not existing_customer:
+                existing_customer = db.query(
+                    "SELECT id FROM customers "
+                    "WHERE lower(replace(name, ' ', '')) = ? AND tally_company = ? LIMIT 1",
+                    (_normalize_name_key(customer_name), company_name),
+                )
 
             _cust_data = {
-                # Keep GUID null for DC-driven fallback customers.
-                # SQLite UNIQUE allows multiple NULLs but not repeated empty strings.
-                'tally_guid': None,
+                'tally_guid': customer_guid or None,
                 'name': customer_name,
                 'tally_company': company_name,
                 'gstin': _cust_gstin,
@@ -615,6 +645,16 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                 overall_stats['skipped_missing_customer'] += 1
                 continue
 
+        # Extract stock item GUIDs from raw voucher STOCKITEMS dict (enriched during fetch)
+        _stock_items_block = raw_voucher.get('STOCKITEMS') or {}
+        _stock_guid_map = {}  # item_name -> guid
+        if isinstance(_stock_items_block, dict):
+            for _si_name, _si_data in _stock_items_block.items():
+                if isinstance(_si_data, dict):
+                    _si_guid = (_si_data.get('guid') or _si_data.get('GUID') or _si_data.get('MASTERID') or '').strip()
+                    if _si_guid:
+                        _stock_guid_map[_si_name] = _si_guid
+
         inventory_items = invoice.get('items', [])
         stock_items_map = {}
         missing_products = []
@@ -624,7 +664,19 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
             stock_cache_key = f"{company_name}::{normalized_item_name}"
             if stock_cache_key not in stock_cache:
                 try:
-                    row = db.query("SELECT name, data_json FROM products WHERE lower(replace(name, ' ', '')) = ?", (normalized_item_name,))
+                    row = None
+                    _item_guid = _stock_guid_map.get(item_name, '')
+                    if _item_guid:
+                        row = db.query(
+                            "SELECT name, data_json FROM products WHERE tally_guid = ?",
+                            (_item_guid,),
+                        )
+                    if not row:
+                        row = db.query(
+                            "SELECT name, data_json FROM products "
+                            "WHERE lower(replace(name, ' ', '')) = ?",
+                            (normalized_item_name,),
+                        )
                     stock_cache[stock_cache_key] = json_loads(row['data_json']) if (row and row['data_json']) else None
                 except Exception:
                     stock_cache[stock_cache_key] = None
@@ -664,15 +716,22 @@ def _process_invoice_batch(db, tally, company_name, invoices, from_date, to_date
                         'canonical_name': f'{mp_name} (CYL)',
                     }
 
-                existing_product = db.query(
-                    "SELECT id FROM products WHERE name = ? AND tally_company = ? LIMIT 1",
-                    (mp_name, company_name),
-                )
+                _mp_guid = _stock_guid_map.get(mp_name, '')
+                existing_product = None
+                if _mp_guid:
+                    existing_product = db.query(
+                        "SELECT id FROM products WHERE tally_guid = ? LIMIT 1",
+                        (_mp_guid,),
+                    )
+                if not existing_product:
+                    existing_product = db.query(
+                        "SELECT id FROM products "
+                        "WHERE lower(replace(name, ' ', '')) = ? AND tally_company = ? LIMIT 1",
+                        (_normalize_name_key(mp_name), company_name),
+                    )
 
                 _prod_data = {
-                    # Keep GUID null for DC-driven fallback products.
-                    # SQLite UNIQUE allows multiple NULLs but not repeated empty strings.
-                    'tally_guid': None,
+                    'tally_guid': _mp_guid or None,
                     'name': mp_name,
                     'name_canonical': parsed['canonical_name'],
                     'tally_company': company_name,

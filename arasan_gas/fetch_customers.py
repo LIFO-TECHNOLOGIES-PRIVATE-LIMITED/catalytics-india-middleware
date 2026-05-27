@@ -102,23 +102,49 @@ def fetch_customers_from_all_companies():
                 existing = db.customer_exists(customer_name)
 
                 if existing:
-                    # Duplicate found - skip and log
+                    existing_id = existing['id']
                     owner_company = existing['tally_company']
-                    logger.warning(
-                        f"[DUPLICATE SKIPPED] '{customer_name}' "
-                        f"(owned by {owner_company}, attempted by {company_name})"
-                    )
+                    if owner_company != company_name:
+                        # Different company owns this name — skip
+                        logger.warning(
+                            f"[DUPLICATE SKIPPED] '{customer_name}' "
+                            f"(owned by {owner_company}, attempted by {company_name})"
+                        )
+                        db.log_duplicate(
+                            entity_type='customer',
+                            entity_name=customer_name,
+                            tally_company=company_name,
+                            owned_by_company=owner_company,
+                            details=f"GSTIN: {customer.get('gstin', 'N/A')}"
+                        )
+                        overall_stats['duplicates_skipped'] += 1
+                        continue
 
-                    # Log duplicate for audit
-                    db.log_duplicate(
-                        entity_type='customer',
-                        entity_name=customer_name,
-                        tally_company=company_name,
-                        owned_by_company=owner_company,
-                        details=f"GSTIN: {customer.get('gstin', 'N/A')}"
-                    )
-
-                    overall_stats['duplicates_skipped'] += 1
+                    # Same company — update with full Tally data
+                    # (enriches DC-driven auto-created records with GUID, full details)
+                    try:
+                        customer_data = {
+                            'tally_guid': customer['guid'],
+                            'gstin': customer.get('gstin', ''),
+                            'pan': customer.get('pan', ''),
+                            'address': customer.get('address', ''),
+                            'state': customer.get('state', ''),
+                            'city': customer.get('city', ''),
+                            'pincode': customer.get('pincode', ''),
+                            'phone': customer.get('phone', ''),
+                            'email': customer.get('email', ''),
+                            'data_json': json.dumps(customer),
+                        }
+                        db.update_customer(existing_id, customer_data)
+                        overall_stats.setdefault('updated', 0)
+                        overall_stats['updated'] += 1
+                        logger.info(
+                            f"[UPDATED CUSTOMER] '{customer_name}' refreshed with Tally data "
+                            f"(company: {company_name}, GUID: {customer.get('guid', 'N/A')})"
+                        )
+                    except Exception as e:
+                        logger.error(f"[ERROR] Failed to update customer '{customer_name}': {e}", exc_info=True)
+                        overall_stats['errors'] += 1
                     continue
 
                 # Step 4: New customer - save to SQLite
@@ -135,7 +161,7 @@ def fetch_customers_from_all_companies():
                         'pincode': customer.get('pincode', ''),
                         'phone': customer.get('phone', ''),
                         'email': customer.get('email', ''),
-                        'data_json': json.dumps(customer)  # Store full Tally response
+                        'data_json': json.dumps(customer)
                     }
 
                     db.insert_customer(customer_data)

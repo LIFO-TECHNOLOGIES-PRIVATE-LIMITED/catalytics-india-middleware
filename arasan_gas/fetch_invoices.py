@@ -5,9 +5,10 @@ Fetch invoices from multiple Tally companies with enhanced change detection.
 - Supports soft delete tracking for deleted invoices
 - Filters by config start date (from-date onward) and delivery information
 """
+import os
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config import config, BASE_DIR
 from db import Database, json_dumps, json_loads, sha256_text
@@ -153,7 +154,7 @@ def _invoice_in_date_range(invoice, from_date, to_date):
     """
     vd = str(invoice.get('voucher_date', '') or '').replace('-', '').strip()
     if not vd or len(vd) != 8:
-        return True  # unknown date â€” include and let DB decide
+        return True  # unknown date â€" include and let DB decide
     return vd >= from_date
 
 
@@ -170,7 +171,7 @@ def _has_delivery_info(invoice):
     other_ref_norm = ' '.join(other_ref.split())
     other_ref_compact = other_ref_norm.replace(' ', '')
 
-    exact = {'dc'}
+    exact = {'dc', 'd', 'c'}
     substrings = (
         'delivery',
         'delivery challan',
@@ -197,25 +198,23 @@ def _normalize_name_key(value):
 def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     """
     Fetch invoices from all active Tally companies.
-
-    Args:
-        from_date: Start date (YYYYMMDD), defaults to config or today.
-        to_date: End date (YYYYMMDD), optional override. If not provided,
-                 a far-future date is used so effective behavior is
-                 "from start date onward".
+    Uses configurable rolling window (CO_middleware pattern):
+      from_date = now - DC_PAST_DAYS   (default 3)
+      to_date   = now + DC_FUTURE_DAYS (default 1)
     """
-    # Always re-read .env so changes to INVOICE_FETCH_START_DATE
-    # take effect without restarting dashboard.py
     try:
         config.reload_from_env()
     except AttributeError:
-        pass  # Older dashboard instance â€” use cached config values
+        pass
 
-    if not from_date:
-        from_date = config.INVOICE_FETCH_START_DATE or datetime.now().strftime('%Y%m%d')
-
-    if not to_date:
-        to_date = '20991231'
+    today_dt = datetime.now()
+    past_days = int(os.getenv('DC_PAST_DAYS', '3'))
+    future_days = int(os.getenv('DC_FUTURE_DAYS', '1'))
+    from_date = (today_dt - timedelta(days=past_days)).strftime('%Y%m%d')
+    to_date = (today_dt + timedelta(days=future_days)).strftime('%Y%m%d')
+    logger.info(f"Day Book fetch (Reference: {today_dt.strftime('%Y%m%d')})")
+    logger.info(f" -> From Date: {from_date} (-{past_days} days)")
+    logger.info(f" -> To Date:   {to_date} (+{future_days} days)")
 
     db = Database(config.SQLITE_DB_PATH)
     tally = TallyClient(config.TALLY_URL)
@@ -232,7 +231,7 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
         }
 
     logger.info(f"Starting invoice fetch from {len(active_companies)} companies")
-    logger.info(f"Date filter: from {from_date} onward (query upper bound: {to_date})")
+    logger.info(f"Date range: {from_date} to {to_date}")
     logger.info(f"Active companies: {', '.join(active_companies)}")
 
     overall_stats = {
@@ -260,16 +259,37 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
         logger.info(f"{'='*60}")
 
         try:
-            try:
-                invoices = tally.get_sales_invoices(company_name, from_date, to_date)
-            except Exception as tally_err:
-                logger.error(
-                    f"[TALLY CONNECTION FAILED] Could not fetch invoices from '{company_name}': {tally_err}",
-                    exc_info=True
-                )
-                overall_stats['errors'] += 1
-                continue
+            # Batch in 30-day chunks to handle large date ranges (bol_company pattern)
+            from_dt = datetime.strptime(from_date, '%Y%m%d')
+            to_dt = datetime.strptime(to_date, '%Y%m%d') if to_date != '20991231' else datetime.now()
 
+            all_invoices = []
+            curr_start = from_dt
+            while curr_start <= to_dt:
+                curr_end = curr_start + timedelta(days=29)
+                if curr_end > to_dt:
+                    curr_end = to_dt
+
+                s_date = curr_start.strftime('%Y%m%d')
+                e_date = curr_end.strftime('%Y%m%d')
+
+                logger.info(f" -> Batch: {s_date} to {e_date}")
+                try:
+                    batch = tally.get_sales_invoices(company_name, s_date, e_date)
+                    if batch:
+                        all_invoices.extend(batch)
+                except Exception as tally_err:
+                    logger.error(
+                        f"[TALLY CONNECTION FAILED] Batch {s_date}-{e_date} from '{company_name}': {tally_err}",
+                        exc_info=True
+                    )
+                    overall_stats['errors'] += 1
+
+                curr_start = curr_start + timedelta(days=30)
+                import time
+                time.sleep(2)
+
+            invoices = all_invoices
             overall_stats['total_fetched'] += len(invoices)
 
             if not invoices:
@@ -313,7 +333,10 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                     )
                     continue
 
-                # --- Customer must exist in SQLite (ignore spaces/case) ---
+                # --- Customer: lookup or auto-create from voucher ---
+                # Invoice is NEVER skipped. ledger_data_json in invoices table
+                # holds customer data from the voucher itself. Daily master sync
+                # will later update the customers table with full Tally data.
                 normalized_customer = _normalize_name_key(customer_name)
                 ledger_cache_key = f"{company_name}::{normalized_customer}"
                 if ledger_cache_key not in ledger_cache:
@@ -326,11 +349,10 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                         if row_dict.get('data_json'):
                             ledger_cache[ledger_cache_key] = json_loads(row_dict.get('data_json'))
                             db_name = str(row_dict.get('name') or '').strip()
-                            if db_name and _normalize_name_key(db_name) == normalized_customer:
-                                if _normalize_name_key(customer_name) == normalized_customer and db_name != customer_name:
-                                    logger.info(
-                                        f"[CUSTOMER MATCH NORMALIZED] Invoice='{customer_name}' matched DB='{db_name}'"
-                                    )
+                            if db_name and db_name != customer_name:
+                                logger.info(
+                                    f"[CUSTOMER MATCH NORMALIZED] Invoice='{customer_name}' matched DB='{db_name}'"
+                                )
                         else:
                             ledger_cache[ledger_cache_key] = None
                     except Exception as e:
@@ -339,21 +361,82 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
 
                 ledger_data = ledger_cache[ledger_cache_key]
                 if not ledger_data:
-                    overall_stats['skipped_missing_customer'] += 1
-                    logger.info(
-                        f"[SKIP MISSING CUSTOMER] #{voucher_no} ({customer_name}) - "
-                        f"customer not found in SQLite (ignoring spaces)"
-                    )
-                    continue
+                    # Build ledger_data from invoice voucher (stored in ledger_data_json)
+                    raw = invoice.get('raw_voucher', {}) or {}
+                    _cust_gstin = (raw.get('PARTYGSTIN') or raw.get('CONSIGNEEGSTIN') or '').strip().lstrip(':')
+                    _cust_pan = (raw.get('BUYERPINNUMBER') or raw.get('INCOMETAXNUMBER') or '').strip()
+                    _cust_state = (raw.get('STATENAME') or raw.get('CONSIGNEESTATENAME') or '').strip()
+                    _cust_pincode = (raw.get('PARTYPINCODE') or raw.get('CONSIGNEEPINCODE') or '').strip()
+                    _cust_phone = ''
+                    _cust_email = ''
+                    _cust_address = ''
+                    _addr_lines = raw.get('ADDRESSES') or []
+                    if isinstance(_addr_lines, list):
+                        _addr_parts = []
+                        for _aline in _addr_lines:
+                            _astr = str(_aline).strip()
+                            if _astr.lower().startswith('phone:') or _astr.lower().startswith('mobile:'):
+                                _cust_phone = _astr.split(':', 1)[1].strip()
+                            elif _astr.lower().startswith('email:'):
+                                _cust_email = _astr.split(':', 1)[1].strip()
+                            else:
+                                _addr_parts.append(_astr)
+                        _cust_address = ', '.join(_addr_parts)
 
-                # --- All products in invoice must exist in SQLite (exact name match) ---
+                    # ledger_data for invoice's ledger_data_json column
+                    ledger_data = {
+                        'NAME': customer_name, 'PARTYGSTIN': _cust_gstin,
+                        'INCOMETAXNUMBER': _cust_pan, 'STATE': _cust_state,
+                        'PINCODE': _cust_pincode, 'MOBILE': _cust_phone,
+                        'EMAIL': _cust_email, '_source': 'dc_voucher',
+                    }
+                    ledger_cache[ledger_cache_key] = ledger_data
+
+                    # Auto-create customer in SQLite (is_synced=0, synced in combined loop)
+                    _cust_data = {
+                        'tally_guid': None,
+                        'name': customer_name,
+                        'tally_company': company_name,
+                        'gstin': _cust_gstin,
+                        'pan': _cust_pan,
+                        'address': _cust_address,
+                        'state': _cust_state,
+                        'city': '',
+                        'pincode': _cust_pincode,
+                        'phone': _cust_phone,
+                        'email': _cust_email,
+                        'data_json': json_dumps(ledger_data),
+                    }
+                    try:
+                        existing_customer = db.query(
+                            "SELECT id FROM customers WHERE name = ? AND tally_company = ? LIMIT 1",
+                            (customer_name, company_name),
+                        )
+                        if existing_customer:
+                            db.update_customer(existing_customer['id'], _cust_data)
+                        else:
+                            db.insert_customer(_cust_data)
+                        overall_stats.setdefault('auto_fetched_customers', 0)
+                        overall_stats['auto_fetched_customers'] += 1
+                        logger.info(
+                            f"[DC-DRIVEN:CUSTOMER] #{voucher_no} | '{customer_name}' "
+                            f"created from voucher data (GSTIN: {_cust_gstin or 'N/A'})"
+                        )
+                    except Exception as exc:
+                        # Customer insert failed but invoice still proceeds -
+                        # ledger_data is already set from voucher for ledger_data_json
+                        logger.warning(f"[DC-DRIVEN] Customer insert failed for '{customer_name}': {exc}")
+
+                # --- Products: lookup or auto-create from voucher ---
+                # Invoice is NEVER skipped. stock_items_json in invoices table
+                # holds product data from the voucher. Daily master sync
+                # will later update the products table with full Tally data.
                 inventory_items = invoice.get('items', [])
                 stock_items_map = {}
                 missing_products = []
                 for item in inventory_items:
                     item_name = (item.get('item_name') or '').strip()
                     if not item_name:
-                        missing_products.append('<empty>')
                         continue
                     normalized_item_name = _normalize_name_key(item_name)
                     stock_cache_key = f"{company_name}::{normalized_item_name}"
@@ -367,11 +450,10 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                             if row_dict.get('data_json'):
                                 stock_cache[stock_cache_key] = json_loads(row_dict.get('data_json'))
                                 db_name = str(row_dict.get('name') or '').strip()
-                                if db_name and _normalize_name_key(db_name) == normalized_item_name:
-                                    if _normalize_name_key(item_name) == normalized_item_name and db_name != item_name:
-                                        logger.info(
-                                            f"[PRODUCT MATCH NORMALIZED] Invoice='{item_name}' matched DB='{db_name}'"
-                                        )
+                                if db_name and db_name != item_name:
+                                    logger.info(
+                                        f"[PRODUCT MATCH NORMALIZED] Invoice='{item_name}' matched DB='{db_name}'"
+                                    )
                             else:
                                 stock_cache[stock_cache_key] = None
                         except Exception as e:
@@ -383,13 +465,86 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                     else:
                         missing_products.append(item_name)
 
+                # Auto-create missing products + build stock_items_map from voucher
                 if missing_products:
-                    overall_stats['skipped_missing_product'] += 1
-                    logger.info(
-                        f"[SKIP MISSING PRODUCT] #{voucher_no} ({customer_name}) - "
-                        f"missing products (ignoring spaces): {', '.join(sorted(set(missing_products)))[:200]}"
-                    )
-                    continue
+                    raw = invoice.get('raw_voucher', {}) or {}
+                    for mp_name in missing_products:
+                        # Extract HSN/rate from matching INVENTORY line in voucher
+                        _hsn = ''
+                        _rate = 0.0
+                        for _inv_item in (raw.get('INVENTORY') or []):
+                            if ((_inv_item.get('STOCKITEMNAME') or _inv_item.get('ITEMNAME') or '').strip() == mp_name):
+                                _hsn = (_inv_item.get('GSTHSNNAME') or '').strip()
+                                try:
+                                    _rate_str = (_inv_item.get('RATE') or '').strip()
+                                    if '/' in _rate_str:
+                                        _rate_str = _rate_str.split('/')[0].strip()
+                                    _rate = float(_rate_str.split()[0]) if _rate_str else 0.0
+                                except (ValueError, IndexError):
+                                    _rate = 0.0
+                                break
+
+                        parsed = parse_stock_item_name(mp_name)
+                        if not parsed:
+                            parsed = {
+                                'product_master_name': mp_name,
+                                'unit_name': 'CUM',
+                                'variant_name': '7',
+                                'product_type_code': 'CYL',
+                                'product_type_name': 'CYLINDER',
+                                'canonical_name': f'{mp_name} (CYL)',
+                            }
+
+                        # stock_items_map entry for invoice's stock_items_json column
+                        _prod_json = {
+                            'NAME': mp_name, 'HSNCODE': _hsn,
+                            '_source': 'dc_voucher', '_dc_no': voucher_no,
+                        }
+                        stock_items_map[mp_name] = _prod_json
+
+                        # Auto-create product in SQLite (is_synced=0, synced in combined loop)
+                        _prod_data = {
+                            'tally_guid': None,
+                            'name': mp_name,
+                            'name_canonical': parsed['canonical_name'],
+                            'tally_company': company_name,
+                            'hsn_code': _hsn,
+                            'unit': parsed.get('unit_name', ''),
+                            'rate': _rate,
+                            'description': '',
+                            'data_json': json_dumps(_prod_json),
+                            'product_master_name': parsed['product_master_name'],
+                            'variant_name': parsed['variant_name'],
+                            'unit_name': parsed['unit_name'],
+                            'product_type_code': parsed['product_type_code'],
+                            'product_type_name': parsed['product_type_name'],
+                            'gst_applicable': '',
+                            'gst_rate': 0.0,
+                            'igst_rate': 0.0,
+                            'cgst_rate': 0.0,
+                            'sgst_rate': 0.0,
+                        }
+                        try:
+                            existing_product = db.query(
+                                "SELECT id FROM products WHERE name = ? AND tally_company = ? LIMIT 1",
+                                (mp_name, company_name),
+                            )
+                            if existing_product:
+                                db.update_product(existing_product['id'], _prod_data)
+                            else:
+                                db.insert_product(_prod_data)
+                            normalized_mp = _normalize_name_key(mp_name)
+                            stock_cache[f"{company_name}::{normalized_mp}"] = _prod_json
+                            overall_stats.setdefault('auto_fetched_products', 0)
+                            overall_stats['auto_fetched_products'] += 1
+                            logger.info(
+                                f"[DC-DRIVEN:PRODUCT] #{voucher_no} | '{mp_name}' "
+                                f"created from voucher data (HSN: {_hsn or 'N/A'})"
+                            )
+                        except Exception as exc:
+                            # Product insert failed but invoice still proceeds -
+                            # stock_items_map already has voucher data for stock_items_json
+                            logger.warning(f"[DC-DRIVEN] Product insert failed for '{mp_name}': {exc}")
 
                 try:
                     # Prepare invoice data
@@ -565,6 +720,8 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     logger.info(f"Skipped (no delivery info): {overall_stats['skipped_no_delivery']}")
     logger.info(f"Skipped (missing customer): {overall_stats['skipped_missing_customer']}")
     logger.info(f"Skipped (missing product): {overall_stats['skipped_missing_product']}")
+    logger.info(f"Auto-Fetch Cust:     {overall_stats.get('auto_fetched_customers', 0)}")
+    logger.info(f"Auto-Fetch Prod:     {overall_stats.get('auto_fetched_products', 0)}")
     logger.info(f"New Invoices Saved: {overall_stats['new_saved']}")
     logger.info(f"Updated Invoices (hash/data changed): {overall_stats['updated_saved']}")
     logger.info(f"Already Exists (Unchanged): {overall_stats['already_exists']}")

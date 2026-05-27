@@ -27,7 +27,7 @@ echo.
 echo [2/6] Cleaning previous build artifacts...
 if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
-if exist "bol_dashboard.spec" del /q "bol_dashboard.spec"
+if exist "bhox_dashboard.spec" del /q "bhox_dashboard.spec"
 echo [OK] Cleaned build artifacts
 
 echo.
@@ -37,7 +37,7 @@ py -m PyInstaller ^
     --clean ^
     --onefile ^
     --noconsole ^
-    --name bol_dashboard ^
+    --name bhox_dashboard ^
     --add-data "templates;templates" ^
     --collect-all psycopg2 ^
     --hidden-import fetch_customers ^
@@ -60,7 +60,7 @@ echo [OK] EXE built successfully
 echo.
 echo [4/6] Preparing release directory...
 for /f %%i in ('powershell -NoProfile -Command "(Get-Date).ToString('yyyyMMdd_HHmm')"') do set "STAMP=%%i"
-set "RELEASE_DIR=%cd%\release\bol_client_release_%STAMP%"
+set "RELEASE_DIR=%cd%\release\bhox_client_release_%STAMP%"
 set "ZIP_PATH=%RELEASE_DIR%.zip"
 
 if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
@@ -70,7 +70,7 @@ echo [OK] Release directory created: %RELEASE_DIR%
 
 echo.
 echo [5/6] Copying client files...
-copy /y "dist\bol_dashboard.exe" "%RELEASE_DIR%\" >nul
+copy /y "dist\bhox_dashboard.exe" "%RELEASE_DIR%\" >nul
 if errorlevel 1 (
     echo [ERROR] Failed to copy EXE
     exit /b 1
@@ -86,7 +86,7 @@ copy /y "Install_AutoStart.bat" "%RELEASE_DIR%\" >nul
 copy /y "Remove_AutoStart.bat" "%RELEASE_DIR%\" >nul
 
 echo [OK] Files copied:
-echo   - bol_dashboard.exe
+echo   - bhox_dashboard.exe
 echo   - .env (current config)
 echo   - .env.example
 echo   - README_CLIENT_SETUP.txt
@@ -129,7 +129,7 @@ echo.
 echo Deployment Steps:
 echo   1. Unzip on client system
 echo   2. Review .env (set DEFAULT_ADMIN_USER_ID, ENTITY_ID, etc.)
-echo   3. Double-click bol_dashboard.exe
+echo   3. Double-click bhox_dashboard.exe
 echo   4. Dashboard auto-creates logs and database
 echo   5. Access dashboard at http://localhost:8787
 echo.
