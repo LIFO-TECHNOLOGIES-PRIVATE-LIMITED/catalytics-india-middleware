@@ -2903,6 +2903,145 @@ def maybe_register_windows_startup():
         logger.warning(f"Could not register Windows startup: {exc}")
 
 
+# ==================== OFFLINE DC PRINT ====================
+
+@app.route('/print/dc/<path:voucher_no>')
+def print_dc(voucher_no):
+    """Offline DC print page — renders a printable DC from local SQLite data."""
+    import json as _json
+
+    db_path = cfg.get_env("TALLY_DB_PATH") or config.SQLITE_DB_PATH
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # CO_middleware schema: delivery_notes table
+    cursor.execute(
+        'SELECT * FROM delivery_notes WHERE dc_no = ? ORDER BY updated_at DESC LIMIT 1',
+        (voucher_no,)
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return f'<h3>DC not found: {voucher_no}</h3><p>No local record for this voucher number.</p>', 404
+
+    dn = dict(row)
+
+    try:
+        raw_voucher = _json.loads(dn.get('data_json') or '{}') or {}
+    except Exception:
+        raw_voucher = {}
+
+    # Fetch line items from delivery_note_items
+    cursor.execute(
+        'SELECT stock_name, qty, rate, amount, godown_name, data_json FROM delivery_note_items WHERE delivery_note_id = ? ORDER BY line_no',
+        (dn['id'],)
+    )
+    item_rows = cursor.fetchall()
+    items = []
+    for ir in item_rows:
+        item_data = {}
+        try:
+            item_data = _json.loads(ir['data_json'] or '{}') or {}
+        except Exception:
+            pass
+        items.append({
+            'item_name': ir['stock_name'] or '',
+            'quantity': ir['qty'] or 0,
+            'rate': ir['rate'] or 0,
+            'amount': ir['amount'] or 0,
+            'hsn_code': item_data.get('HSNCODE') or item_data.get('hsn_code') or '',
+        })
+
+    vehicle_no = (
+        raw_voucher.get('DISPATCHEDTHROUGH') or
+        raw_voucher.get('MOTORVEHICLENO') or
+        raw_voucher.get('vehicle_no') or ''
+    ).strip()
+    driver_name = (
+        raw_voucher.get('DRIVERNAME') or
+        raw_voucher.get('BASICSHIPDOCUMENTNO') or
+        raw_voucher.get('driver_name') or ''
+    ).strip()
+    filling_station = (
+        raw_voucher.get('GODOWNNAME') or
+        raw_voucher.get('godown_name') or ''
+    ).strip()
+
+    customer_name = dn.get('party_ledger_name') or raw_voucher.get('PARTYLEDGERNAME') or ''
+    customer_gstin = ''
+    customer_phone = ''
+    customer_address = ''
+    customer_city = ''
+    customer_state = ''
+    customer_pincode = ''
+
+    # Look up customer details from ledgers table
+    cursor.execute(
+        'SELECT data_json FROM ledgers WHERE name = ? LIMIT 1',
+        (customer_name,)
+    )
+    ledger_row = cursor.fetchone()
+    if ledger_row:
+        try:
+            ledger = _json.loads(ledger_row['data_json'] or '{}') or {}
+            customer_gstin = (ledger.get('GSTIN') or ledger.get('PARTYGSTIN') or ledger.get('gstin') or '').lstrip(':')
+            customer_phone = ledger.get('LEDGERMOBILE') or ledger.get('MOBILE') or ledger.get('phone') or ''
+            addr_list = ledger.get('ADDRESSES') or ledger.get('addresses') or []
+            customer_address = ', '.join(addr_list) if isinstance(addr_list, list) else str(addr_list or '')
+            customer_state = ledger.get('STATENAME') or ledger.get('state') or ''
+            customer_pincode = ledger.get('PINCODE') or ledger.get('pincode') or ''
+        except Exception:
+            pass
+
+    tally_company = cfg.get_env("TALLY_COMPANY", "")
+    conn.close()
+
+    raw_date = str(dn.get('voucher_date') or '').replace('-', '').strip()
+    if len(raw_date) == 8:
+        voucher_date = f"{raw_date[6:8]}-{raw_date[4:6]}-{raw_date[:4]}"
+    else:
+        voucher_date = dn.get('voucher_date') or '-'
+
+    total_quantity = sum(float(item.get('quantity') or 0) for item in items)
+
+    qr_data_uri = ''
+    try:
+        import qrcode
+        import io as _io
+        import base64 as _b64
+        qr = qrcode.QRCode(version=1, box_size=4, border=2)
+        qr.add_data(voucher_no)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color='black', back_color='white')
+        buf = _io.BytesIO()
+        qr_img.save(buf, format='PNG')
+        qr_data_uri = 'data:image/png;base64,' + _b64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass
+
+    return render_template(
+        'dc_print.html',
+        voucher_no=voucher_no,
+        voucher_date=voucher_date,
+        entity_name=config.ENTITY_NAME,
+        tally_company=tally_company,
+        filling_station=filling_station,
+        customer_name=customer_name,
+        customer_address=customer_address,
+        customer_city=customer_city,
+        customer_state=customer_state,
+        customer_pincode=customer_pincode,
+        customer_gstin=customer_gstin,
+        customer_phone=customer_phone,
+        vehicle_no=vehicle_no,
+        driver_name=driver_name,
+        items=items,
+        total_quantity=total_quantity,
+        qr_data_uri=qr_data_uri,
+    )
+
+
 if __name__ == '__main__':
     ensure_runtime_support_files()
 

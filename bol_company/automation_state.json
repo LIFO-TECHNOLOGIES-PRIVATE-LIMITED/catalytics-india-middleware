@@ -1,5 +1,5 @@
 {
-  "status": "running",
+  "status": "stopped",
   "intervals": {
     "fetch_master": 600,
     "fetch_invoices": 30,

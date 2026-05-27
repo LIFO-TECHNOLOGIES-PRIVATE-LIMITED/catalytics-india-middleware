@@ -7,7 +7,10 @@ import logging
 import json
 import hashlib
 import time
-import msvcrt
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 from pathlib import Path
 from datetime import datetime
 
@@ -51,6 +54,8 @@ class Database:
 
     def _acquire_write_lock(self, timeout=30.0, poll=0.1):
         """Acquire cross-process write lock to serialize SQLite writes."""
+        if msvcrt is None:
+            return  # Skip locking on non-Windows
         if self._lock_file is None:
             self._lock_file = open(self._lock_path, 'a+b')
         end = time.time() + timeout
@@ -65,7 +70,7 @@ class Database:
 
     def _release_write_lock(self):
         """Release cross-process write lock."""
-        if not self._lock_file:
+        if msvcrt is None or not self._lock_file:
             return
         try:
             self._lock_file.seek(0)
