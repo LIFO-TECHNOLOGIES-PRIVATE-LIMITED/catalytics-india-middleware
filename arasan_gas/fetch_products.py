@@ -1,15 +1,18 @@
 """
-Fetch products from multiple Tally companies
-Parses stock item names to extract product master, unit, variant, and product type.
+Fetch products from multiple Tally companies.
 
-Tally stock item name format:
-    INDUSTRIAL OXYGEN 4 CUM (CYL)
-    └─ product ─────┘ │ └┘  └─┘
-                      qty unit  type_code
+If a size is embedded in the Tally stock item name, only that variant row is created.
+If no size is found, the first (default) variant for the type is used.
 
-Only stock items with a recognized type code in parentheses are fetched.
-Type codes configured via PRODUCT_TYPE_MAP in .env:
-    CYL:CYLINDER, PLT:PALLET, TNK:TANK, CON:CONTAINER
+    CO2           → 30/27/9/6 kg (CYL)          default: 30kg
+    LPG           → 21/33 kg (CYL)               default: 21kg
+    NITROUS OXIDE → 17000/3700/1854 ltr (CYL)    default: 17000ltr
+    LIQUID N2     → 30/10/50 ltr (CON)           default: 30ltr
+    PALLET        → 105cum (PLT)
+    CYLINDER      → 7cum (CYL)  [all others]
+
+Name format: "{clean_base} {size}{unit} ({type_code})"
+  e.g. "ARGON D BULK 7cum (CYL)", "CO2 D BULK 30kg (CYL)"
 """
 import re
 import json
@@ -46,71 +49,154 @@ def _attach_product_fetch_file_handler():
 
 _attach_product_fetch_file_handler()
 
-# Regex: <PRODUCT NAME> <QTY> <UNIT> (<TYPE_CODE>)
-# Examples:
-#   INDUSTRIAL OXYGEN 4 CUM (CYL)  -> ("INDUSTRIAL OXYGEN", "4", "CUM", "CYL")
-#   LIQUID NITROGEN 210 LTR (CON)  -> ("LIQUID NITROGEN", "210", "LTR", "CON")
-STOCK_NAME_PATTERN = re.compile(
-    r'^(.+?)\s+(\d+(?:\.\d+)?)\s*(\w+)\s+\((\w+)\)$'
-)
+
+def _product_changed(existing_row, product_data):
+    """Return True only when meaningful product fields changed."""
+    fields = (
+        'tally_guid', 'name', 'name_canonical', 'tally_company', 'hsn_code',
+        'unit', 'rate', 'description', 'data_json', 'product_master_name',
+        'variant_name', 'unit_name', 'product_type_code', 'product_type_name',
+        'gst_applicable', 'gst_rate', 'igst_rate', 'cgst_rate', 'sgst_rate'
+    )
+    for f in fields:
+        old_val = existing_row[f] if existing_row and f in existing_row.keys() else None
+        new_val = product_data.get(f)
+        if str(old_val or '') != str(new_val or ''):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Variant definitions
+# Each entry: (size_str, unit_abbr, type_code, type_name)
+# ---------------------------------------------------------------------------
+_PRODUCT_VARIANTS = {
+    'CO2': [
+        ('30',    'kg',  'CYL', 'CYLINDER'),   # default
+        ('27',    'kg',  'CYL', 'CYLINDER'),
+        ('9',     'kg',  'CYL', 'CYLINDER'),
+        ('6',     'kg',  'CYL', 'CYLINDER'),
+    ],
+    'LPG': [
+        ('21',    'kg',  'CYL', 'CYLINDER'),   # default
+        ('33',    'kg',  'CYL', 'CYLINDER'),
+    ],
+    'NITROUS_OXIDE': [
+        ('17000', 'ltr', 'CYL', 'CYLINDER'),   # default
+        ('3700',  'ltr', 'CYL', 'CYLINDER'),
+        ('1854',  'ltr', 'CYL', 'CYLINDER'),
+    ],
+    'LIQUID_N2': [
+        ('30',  'ltr',   'CON', 'CONTAINER'),   # default
+        ('10',  'ltr',   'CON', 'CONTAINER'),
+        ('50',  'ltr',   'CON', 'CONTAINER'),
+    ],
+    'PALLET': [
+        ('105', 'cum',   'PLT', 'PALLET'),
+    ],
+    'CYLINDER': [
+        ('7',   'cum',   'CYL', 'CYLINDER'),
+    ],
+}
+
+# Patterns to strip junk from raw Tally stock item names:
+#   - "@ 18%", "18%", stray "%", "=" characters
+_NAME_JUNK = re.compile(r'@\s*\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?\s*%|=|%')
+
+# For cylinders: strip embedded size (+ optional cum/kg/ltr unit) from the name
+_CYL_VARIANT_WITH_UNIT = re.compile(r'\b(\d+(?:\.\d+)?)\s*(?:cum|cub|cm|cubic)\b', re.IGNORECASE)
+_LPG_VARIANT_WITH_UNIT = re.compile(r'\b(\d+(?:\.\d+)?)\s*kg\b', re.IGNORECASE)
+_LTR_VARIANT_WITH_UNIT = re.compile(r'\b(\d+(?:\.\d+)?)\s*(?:ltr|litre|lit)\b', re.IGNORECASE)
+_VARIANT_BARE          = re.compile(r'\b(\d+(?:\.\d+)?)\b')
+
+
+def _detect_product_type(base_name: str) -> str:
+    """Classify a cleaned stock item name into a product type key."""
+    nl = base_name.lower()
+    if 'co2' in nl or 'carbon dioxide' in nl or 'carbondioxide' in nl:
+        return 'CO2'
+    if 'lpg' in nl or 'liquefied petroleum' in nl or 'liquid petroleum' in nl:
+        return 'LPG'
+    if 'nitrous oxide' in nl or 'n2o' in nl:
+        return 'NITROUS_OXIDE'
+    if 'liquid' in nl and ('oxygen' in nl or ' o2' in nl):
+        return 'LIQUID_O2'
+    if 'liquid' in nl and ('nitrogen' in nl or ' n2' in nl):
+        return 'LIQUID_N2'
+    if 'pallet' in nl or ' plt' in nl:
+        return 'PALLET'
+    return 'CYLINDER'
 
 
 def parse_stock_item_name(name):
     """
-    Parse a Tally stock item name into product components.
-    Handles spacing variations in quantity/unit (e.g., "1.5CUM" vs "1.5 CUM").
+    Clean a raw Tally stock item name and return its base name + product type.
+    The caller iterates _PRODUCT_VARIANTS[product_type] to create all variant rows.
 
-    Args:
-        name: e.g. "INDUSTRIAL OXYGEN 4 CUM (CYL)" or "ARGON B TYPE 1.5CUM (CYL)"
+    Cleaning steps:
+      1. Remove junk: =, @XX%, XX%, stray %
+      2. For CYLINDER type: strip embedded "7"/"10" (+ optional unit suffix)
+         so the base name doesn't already contain the variant size
 
-    Returns:
-        dict with keys: product_master_name, quantity, unit_name, variant_name,
-                        product_type_code, product_type_name
-        or None if name doesn't match the expected pattern or type code is unknown.
+    Returns dict with 'product_master_name', 'product_type', 'extracted_variant',
+    or None for empty names.
     """
     if not name:
         return None
 
-    # Normalize: collapse multiple spaces into single space
-    normalized_name = ' '.join(name.strip().split())
-    
-    match = STOCK_NAME_PATTERN.match(normalized_name)
-    if not match:
+    # Strip junk and normalise whitespace
+    clean = _NAME_JUNK.sub(' ', name)
+    clean = ' '.join(clean.strip().split())
+    if not clean:
         return None
 
-    product_master_name = match.group(1).strip()
-    quantity = match.group(2).strip()
-    unit_name = match.group(3).strip()
-    type_code = match.group(4).strip().upper()
+    product_type      = _detect_product_type(clean)
+    extracted_variant = None   # variant size found inside the name
 
-    # Check if type code is in configured map
-    type_map = config.PRODUCT_TYPE_MAP
-    if type_code not in type_map:
-        return None
+    # Strip embedded size from name so base name is just the gas name.
+    if product_type == 'CYLINDER':
+        m = _CYL_VARIANT_WITH_UNIT.search(clean) or _VARIANT_BARE.search(clean)
+        if m:
+            extracted_variant = m.group(1)
+            clean = _CYL_VARIANT_WITH_UNIT.sub('', clean)
+            clean = _VARIANT_BARE.sub('', clean)
+            clean = ' '.join(clean.split())
+    elif product_type in ('LPG', 'CO2'):
+        m = _LPG_VARIANT_WITH_UNIT.search(clean) or _VARIANT_BARE.search(clean)
+        if m:
+            extracted_variant = m.group(1)
+            clean = _LPG_VARIANT_WITH_UNIT.sub('', clean)
+            clean = _VARIANT_BARE.sub('', clean)
+            clean = ' '.join(clean.split())
+    elif product_type in ('NITROUS_OXIDE', 'LIQUID_N2', 'LIQUID_O2'):
+        m = _LTR_VARIANT_WITH_UNIT.search(clean) or _VARIANT_BARE.search(clean)
+        if m:
+            extracted_variant = m.group(1)
+            clean = _LTR_VARIANT_WITH_UNIT.sub('', clean)
+            clean = _VARIANT_BARE.sub('', clean)
+            clean = ' '.join(clean.split())
 
-    # Create canonical variant name (always with space between quantity and unit)
-    canonical_variant = f"{quantity} {unit_name}"
-    
-    # Create canonical product name for uniqueness checking
-    # This ensures "ARGON B TYPE 1.5CUM (CYL)" and "ARGON B TYPE 1.5 CUM (CYL)" 
-    # are treated as the same product
-    canonical_name = f"{product_master_name} {canonical_variant} ({type_code})"
+    # Strip middleware-added type-code suffix "(CYL)", "(PLT)", "(TNK)"
+    clean = re.sub(r'\s*\(\s*(?:CYL|PLT|TNK|CON)\s*\)\s*$', '', clean, flags=re.IGNORECASE).strip()
+    clean = ' '.join(clean.split())
 
     return {
-        'product_master_name': product_master_name,
-        'unit_name': unit_name,
-        'variant_name': canonical_variant,
-        'product_type_code': type_code,
-        'product_type_name': type_map[type_code],
-        'canonical_name': canonical_name,  # For uniqueness checking
+        'product_master_name': clean,
+        'product_type':        product_type,
+        'extracted_variant':   extracted_variant,
     }
 
 
 def fetch_products_from_all_companies():
     """
     Fetch products from all active Tally companies.
-    Only keeps stock items with recognized type codes in parentheses.
-    Parses name into: product_master_name, unit_name, variant_name, product_type.
+    Determines product type by keyword detection in the stock item name:
+      - 'co2' / 'carbon dioxide' → CO2
+      - 'liquid' + 'oxygen'      → LIQUID_O2
+      - 'liquid' + 'nitrogen'    → LIQUID_N2
+      - 'pallet'                 → PALLET
+      - default                  → CYLINDER (7cum + 10cum variants)
+    All stock items are accepted; no format restriction.
     First-come-first-served duplicate prevention.
     """
     db = Database(config.SQLITE_DB_PATH)
@@ -158,140 +244,118 @@ def fetch_products_from_all_companies():
 
             logger.info(f"Fetched {len(products)} stock items from Tally")
 
-            # Step 2: Filter and parse each stock item
+            # Step 2: Parse each stock item
             for product in products:
                 product_name = product['name']
 
+                # Use GUID as fallback if name is empty
                 if not product_name:
-                    logger.warning("Skipping product with empty name")
-                    continue
+                    product_name = product.get('guid', '')
+                    if product_name:
+                        logger.warning(f"Product name is empty, using GUID as name: {product_name}")
+                    else:
+                        logger.warning("Skipping product with empty name and no GUID")
+                        continue
 
-                # Parse stock item name
                 parsed = parse_stock_item_name(product_name)
 
                 if not parsed:
-                    # Not a recognized product type — skip
-                    logger.debug(
-                        f"[SKIPPED] '{product_name}' — no matching type code "
-                        f"(expected one of: {list(config.PRODUCT_TYPE_MAP.keys())})"
-                    )
+                    logger.debug(f"[SKIPPED] '{product_name}' — empty name")
                     overall_stats['skipped_no_type'] += 1
                     continue
 
                 overall_stats['matched'] += 1
+                base_name         = parsed['product_master_name']
+                product_type      = parsed['product_type']
+                extracted_variant = parsed.get('extracted_variant')
+                tally_guid        = product.get('guid', '')
+                variants = _PRODUCT_VARIANTS.get(product_type, _PRODUCT_VARIANTS['CYLINDER'])
+
+                if extracted_variant:
+                    try:
+                        ev_f = float(extracted_variant)
+                        # 7.5 cum → 10 cum business rule (CYLINDER only)
+                        if product_type == 'CYLINDER' and abs(ev_f - 7.5) < 0.01:
+                            ev_f = 10.0
+                        ev_str = str(int(ev_f)) if ev_f == int(ev_f) else str(ev_f)
+                        filtered = [v for v in variants if str(v[0]) == ev_str]
+                        if filtered:
+                            variants = filtered
+                        else:
+                            # Non-standard size — create a custom variant using the
+                            # unit/type from the predefined list for this product type
+                            _, default_unit, default_type_code, default_type_name = variants[0]
+                            variants = [(ev_str, default_unit, default_type_code, default_type_name)]
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    # No size found in name — use the first (default) variant only
+                    variants = variants[:1]
+
                 logger.info(
-                    f"[PARSED] '{product_name}' -> "
-                    f"product={parsed['product_master_name']}, "
-                    f"variant={parsed['variant_name']}, "
-                    f"unit={parsed['unit_name']}, "
-                    f"type={parsed['product_type_code']}({parsed['product_type_name']}), "
-                    f"HSN={product.get('hsn_code', '')}, "
-                    f"GST={product.get('gst_rate', 0)}%"
+                    f"[PARSED] '{product_name}' -> base='{base_name}', "
+                    f"type={product_type}, variants={len(variants)}, "
+                    f"HSN={product.get('hsn_code', '')}, GST={product.get('gst_rate', 0)}%"
                 )
 
-                # Step 3: Check duplicate using canonical name
-                # Canonical name normalizes spacing in quantity/unit
-                canonical_name = parsed['canonical_name']
-                
-                existing = db.product_exists_normalized(canonical_name)
+                # Save one row per variant
+                for size, unit, type_code, type_name in variants:
+                    variant_label = f"{size}{unit}"
+                    display_name  = f"{base_name} {variant_label} ({type_code})"
+                    # Synthetic GUID: stock-item GUID + variant suffix → unique per row
+                    variant_guid  = f"{tally_guid}|{type_code}_{size}{unit}" if tally_guid else ''
 
-                if existing:
-                    existing_id = existing['id']
-                    owner_company = existing['tally_company']
-                    if owner_company != company_name:
-                        # Different company owns this name — skip
-                        logger.warning(
-                            f"[DUPLICATE SKIPPED] '{product_name}' "
-                            f"(canonical: '{canonical_name}') "
-                            f"(owned by {owner_company}, attempted by {company_name})"
-                        )
-                        db.log_duplicate(
-                            entity_type='product',
-                            entity_name=canonical_name,
-                            tally_company=company_name,
-                            owned_by_company=owner_company,
-                            details=f"HSN: {product.get('hsn_code', 'N/A')}, Original: {product_name}"
-                        )
-                        overall_stats['duplicates_skipped'] += 1
-                        continue
-
-                    # Same company — update with full Tally data
-                    # (enriches DC-driven auto-created records with GUID, HSN, GST rates)
-                    try:
-                        product_data = {
-                            'tally_guid': product['guid'],
-                            'hsn_code': product.get('hsn_code', ''),
-                            'unit': product.get('unit', ''),
-                            'rate': product.get('rate', 0.0),
-                            'description': product.get('description', ''),
-                            'data_json': json.dumps(product),
-                            'product_master_name': parsed['product_master_name'],
-                            'variant_name': parsed['variant_name'],
-                            'unit_name': parsed['unit_name'],
-                            'product_type_code': parsed['product_type_code'],
-                            'product_type_name': parsed['product_type_name'],
-                            'gst_applicable': product.get('gst_applicable', ''),
-                            'gst_rate': product.get('gst_rate', 0.0),
-                            'igst_rate': product.get('igst_rate', 0.0),
-                            'cgst_rate': product.get('cgst_rate', 0.0),
-                            'sgst_rate': product.get('sgst_rate', 0.0),
-                        }
-                        db.update_product(existing_id, product_data)
-                        overall_stats.setdefault('updated', 0)
-                        overall_stats['updated'] += 1
-                        logger.info(
-                            f"[UPDATED PRODUCT] '{product_name}' refreshed with Tally data "
-                            f"(company: {company_name}, GUID: {product.get('guid', 'N/A')}, "
-                            f"HSN: {product.get('hsn_code', 'N/A')})"
-                        )
-                    except Exception as e:
-                        logger.error(f"[ERROR] Failed to update product '{product_name}': {e}", exc_info=True)
-                        overall_stats['errors'] += 1
-                    continue
-
-                # Step 4: Save to SQLite with parsed fields
-                try:
                     product_data = {
-                        'tally_guid': product['guid'],
-                        'name': product_name,
-                        'name_canonical': canonical_name,
-                        'tally_company': company_name,
-                        'hsn_code': product.get('hsn_code', ''),
-                        'unit': product.get('unit', ''),
-                        'rate': product.get('rate', 0.0),
-                        'description': product.get('description', ''),
-                        'data_json': json.dumps(product),
-                        'product_master_name': parsed['product_master_name'],
-                        'variant_name': parsed['variant_name'],
-                        'unit_name': parsed['unit_name'],
-                        'product_type_code': parsed['product_type_code'],
-                        'product_type_name': parsed['product_type_name'],
-                        'gst_applicable': product.get('gst_applicable', ''),
-                        'gst_rate': product.get('gst_rate', 0.0),
-                        'igst_rate': product.get('igst_rate', 0.0),
-                        'cgst_rate': product.get('cgst_rate', 0.0),
-                        'sgst_rate': product.get('sgst_rate', 0.0),
+                        'tally_guid':          variant_guid,
+                        'name':                display_name,
+                        'name_canonical':      display_name,
+                        'tally_company':       company_name,
+                        'hsn_code':            product.get('hsn_code', ''),
+                        'unit':                unit,
+                        'rate':                product.get('rate', 0.0),
+                        'description':         product.get('description', ''),
+                        'data_json':           json.dumps(product),
+                        'product_master_name': base_name,
+                        'variant_name':        variant_label,
+                        'unit_name':           unit,
+                        'product_type_code':   type_code,
+                        'product_type_name':   type_name,
+                        'gst_applicable':      product.get('gst_applicable', ''),
+                        'gst_rate':            product.get('gst_rate', 0.0),
+                        'igst_rate':           product.get('igst_rate', 0.0),
+                        'cgst_rate':           product.get('cgst_rate', 0.0),
+                        'sgst_rate':           product.get('sgst_rate', 0.0),
                     }
 
-                    db.insert_product(product_data)
+                    try:
+                        # Primary dedup: variant GUID
+                        existing = db.product_exists_by_guid(variant_guid) if variant_guid else None
+                        # Secondary dedup: same display name already saved
+                        if not existing:
+                            existing = db.product_exists_by_canonical(display_name)
 
-                    logger.info(
-                        f"[NEW PRODUCT] '{product_name}' saved "
-                        f"(company: {company_name}, "
-                        f"product={parsed['product_master_name']}, "
-                        f"variant={parsed['variant_name']}, "
-                        f"type={parsed['product_type_name']}, "
-                        f"HSN={product.get('hsn_code', '')}, "
-                        f"GST={product.get('gst_rate', 0)}%)"
-                    )
-                    overall_stats['new_saved'] += 1
+                        if existing:
+                            if _product_changed(existing, product_data):
+                                db.update_product(existing['id'], product_data)
+                                logger.info(
+                                    f"  [UPDATED] '{display_name}' (SQLite ID: {existing['id']})"
+                                )
+                                overall_stats['duplicates_skipped'] += 1
+                            else:
+                                logger.info(
+                                    f"  [UNCHANGED] '{display_name}' (SQLite ID: {existing['id']})"
+                                )
+                        else:
+                            db.insert_product(product_data)
+                            logger.info(f"  [NEW] '{display_name}'")
+                            overall_stats['new_saved'] += 1
 
-                except Exception as e:
-                    logger.error(
-                        f"[ERROR] Failed to save product '{product_name}': {e}",
-                        exc_info=True
-                    )
-                    overall_stats['errors'] += 1
+                    except Exception as e:
+                        logger.error(
+                            f"  [ERROR] Failed to save '{display_name}': {e}",
+                            exc_info=True,
+                        )
+                        overall_stats['errors'] += 1
 
         except Exception as e:
             logger.error(
@@ -304,12 +368,12 @@ def fetch_products_from_all_companies():
     logger.info(f"\n{'='*60}")
     logger.info("PRODUCT FETCH SUMMARY")
     logger.info(f"{'='*60}")
-    logger.info(f"Total Stock Items from Tally: {overall_stats['total_fetched']}")
-    logger.info(f"Matched (with type code):     {overall_stats['matched']}")
-    logger.info(f"Skipped (no type code):        {overall_stats['skipped_no_type']}")
-    logger.info(f"New Products Saved:            {overall_stats['new_saved']}")
-    logger.info(f"Duplicates Skipped:            {overall_stats['duplicates_skipped']}")
-    logger.info(f"Errors:                        {overall_stats['errors']}")
+    logger.info(f"Stock items fetched from Tally: {overall_stats['total_fetched']}")
+    logger.info(f"Stock items parsed:             {overall_stats['matched']}")
+    logger.info(f"Skipped (empty name):           {overall_stats['skipped_no_type']}")
+    logger.info(f"Variant rows — New:             {overall_stats['new_saved']}")
+    logger.info(f"Variant rows — Updated/Dedup:   {overall_stats['duplicates_skipped']}")
+    logger.info(f"Errors:                         {overall_stats['errors']}")
     logger.info(f"{'='*60}")
 
     db_stats = db.get_statistics()

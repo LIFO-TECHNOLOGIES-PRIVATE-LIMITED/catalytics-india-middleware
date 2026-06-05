@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from config import config, BASE_DIR
 from db import Database, json_dumps, json_loads, sha256_text
 from tally_client import TallyClient
-from fetch_products import parse_stock_item_name
+from fetch_products import parse_stock_item_name, _PRODUCT_VARIANTS
 
 # Try to import dashboard logger (optional - may not be available)
 try:
@@ -311,27 +311,6 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                     overall_stats['skipped_date'] += 1
                     continue
 
-                # --- Delivery filter: only invoices with delivery information ---
-                if not _has_delivery_info(invoice):
-                    overall_stats['skipped_no_delivery'] += 1
-                    raw = invoice.get('raw_voucher', {}) or {}
-                    basic_ref = (raw.get('BASICORDERREF') or '').strip()
-                    other_ref_raw = (raw.get('OTHERREFERENCE') or '').strip()
-                    if basic_ref:
-                        other_ref = basic_ref
-                        other_ref_source = 'BASICORDERREF'
-                    elif other_ref_raw:
-                        other_ref = other_ref_raw
-                        other_ref_source = 'OTHERREFERENCE'
-                    else:
-                        other_ref = ''
-                        other_ref_source = '<none>'
-                    other_ref_disp = other_ref if other_ref else '<empty>'
-                    logger.info(
-                        f"[SKIP NO OTHER REF] #{voucher_no} ({customer_name}) - "
-                        f"Other References not set to delivery/pickup/self (source: {other_ref_source}, value: {other_ref_disp})"
-                    )
-                    continue
 
                 # --- Customer: lookup or auto-create from voucher ---
                 # Invoice is NEVER skipped. ledger_data_json in invoices table
@@ -484,16 +463,11 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                                     _rate = 0.0
                                 break
 
-                        parsed = parse_stock_item_name(mp_name)
-                        if not parsed:
-                            parsed = {
-                                'product_master_name': mp_name,
-                                'unit_name': 'CUM',
-                                'variant_name': '7',
-                                'product_type_code': 'CYL',
-                                'product_type_name': 'CYLINDER',
-                                'canonical_name': f'{mp_name} (CYL)',
-                            }
+                        parsed = parse_stock_item_name(mp_name) or {
+                            'product_master_name': mp_name,
+                            'product_type': 'CYLINDER',
+                            'extracted_variant': None,
+                        }
 
                         # stock_items_map entry for invoice's stock_items_json column
                         _prod_json = {
@@ -502,44 +476,75 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                         }
                         stock_items_map[mp_name] = _prod_json
 
-                        # Auto-create product in SQLite (is_synced=0, synced in combined loop)
-                        _prod_data = {
-                            'tally_guid': None,
-                            'name': mp_name,
-                            'name_canonical': parsed['canonical_name'],
-                            'tally_company': company_name,
-                            'hsn_code': _hsn,
-                            'unit': parsed.get('unit_name', ''),
-                            'rate': _rate,
-                            'description': '',
-                            'data_json': json_dumps(_prod_json),
-                            'product_master_name': parsed['product_master_name'],
-                            'variant_name': parsed['variant_name'],
-                            'unit_name': parsed['unit_name'],
-                            'product_type_code': parsed['product_type_code'],
-                            'product_type_name': parsed['product_type_name'],
-                            'gst_applicable': '',
-                            'gst_rate': 0.0,
-                            'igst_rate': 0.0,
-                            'cgst_rate': 0.0,
-                            'sgst_rate': 0.0,
-                        }
+                        # Auto-create one DB row per variant (BHOX pattern)
+                        base_name    = parsed['product_master_name']
+                        product_type = parsed['product_type']
+                        ev           = parsed.get('extracted_variant')
+                        variants     = _PRODUCT_VARIANTS.get(product_type, _PRODUCT_VARIANTS['CYLINDER'])
+
+                        # If Tally name has a specific size, only create that variant.
+                        # If size not in predefined variants, create a custom single variant for it.
+                        if ev:
+                            try:
+                                ev_f = float(ev)
+                                if product_type == 'CYLINDER' and abs(ev_f - 7.5) < 0.01:
+                                    ev_f = 10.0
+                                ev_str = str(int(ev_f)) if ev_f == int(ev_f) else str(ev_f)
+                                filtered = [v for v in variants if str(v[0]) == ev_str]
+                                if filtered:
+                                    variants = filtered
+                                else:
+                                    # Non-standard size — create a custom variant using the
+                                    # unit/type from the predefined list for this product type
+                                    _, default_unit, default_type_code, default_type_name = variants[0]
+                                    variants = [(ev_str, default_unit, default_type_code, default_type_name)]
+                            except (ValueError, TypeError):
+                                pass
+                        else:
+                            # No size found in name — use the first (default) variant only
+                            variants = variants[:1]
+
                         try:
-                            existing_product = db.query(
-                                "SELECT id FROM products WHERE name = ? AND tally_company = ? LIMIT 1",
-                                (mp_name, company_name),
-                            )
-                            if existing_product:
-                                db.update_product(existing_product['id'], _prod_data)
-                            else:
-                                db.insert_product(_prod_data)
+                            for size, unit, type_code, type_name in variants:
+                                variant_label = f"{size}{unit}"
+                                display_name  = f"{base_name} {variant_label} ({type_code})"
+                                variant_guid  = f"|{type_code}_{size}{unit}"  # no tally_guid yet
+
+                                _prod_data = {
+                                    'tally_guid':          variant_guid,
+                                    'name':                display_name,
+                                    'name_canonical':      display_name,
+                                    'tally_company':       company_name,
+                                    'hsn_code':            _hsn,
+                                    'unit':                unit,
+                                    'rate':                _rate,
+                                    'description':         '',
+                                    'data_json':           json_dumps(_prod_json),
+                                    'product_master_name': base_name,
+                                    'variant_name':        variant_label,
+                                    'unit_name':           unit,
+                                    'product_type_code':   type_code,
+                                    'product_type_name':   type_name,
+                                    'gst_applicable':      '',
+                                    'gst_rate':            0.0,
+                                    'igst_rate':           0.0,
+                                    'cgst_rate':           0.0,
+                                    'sgst_rate':           0.0,
+                                }
+                                existing_product = db.product_exists_by_canonical(display_name)
+                                if existing_product:
+                                    db.update_product(existing_product['id'], _prod_data)
+                                else:
+                                    db.insert_product(_prod_data)
+
                             normalized_mp = _normalize_name_key(mp_name)
                             stock_cache[f"{company_name}::{normalized_mp}"] = _prod_json
                             overall_stats.setdefault('auto_fetched_products', 0)
                             overall_stats['auto_fetched_products'] += 1
                             logger.info(
-                                f"[DC-DRIVEN:PRODUCT] #{voucher_no} | '{mp_name}' "
-                                f"created from voucher data (HSN: {_hsn or 'N/A'})"
+                                f"[DC-DRIVEN:PRODUCT] #{voucher_no} | '{mp_name}' -> "
+                                f"base='{base_name}', type={product_type}, "
+                                f"variants={len(variants)} (HSN: {_hsn or 'N/A'})"
                             )
                         except Exception as exc:
                             # Product insert failed but invoice still proceeds -

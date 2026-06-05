@@ -348,6 +348,14 @@ class Database:
     # CUSTOMER OPERATIONS
     # ========================================================================
 
+    def customer_exists_by_guid(self, tally_guid):
+        """Check if customer exists by Tally GUID (primary lookup key)."""
+        result = self.query(
+            "SELECT * FROM customers WHERE tally_guid = ?",
+            (tally_guid,)
+        )
+        return result if result else None
+
     def customer_exists(self, name):
         """Check if customer name already exists (ignores whitespace differences)"""
         normalized = ''.join((name or '').split())
@@ -459,25 +467,32 @@ class Database:
         return result if result else None
 
     def product_exists_normalized(self, canonical_name):
-        """
-        Check if product exists using canonical (normalized) name.
-        Canonical name handles spacing variations like "1.5CUM" vs "1.5 CUM".
-        
-        Args:
-            canonical_name: Normalized product name (e.g., "ARGON B TYPE 1.5 CUM (CYL)")
-            
-        Returns:
-            Product record if exists, None otherwise
-        """
+        """Check if product exists using canonical (normalized) name."""
         result = self.query(
             "SELECT id, tally_company, name FROM products WHERE name_canonical = ?",
             (canonical_name,)
         )
         return result if result else None
 
+    def product_exists_by_guid(self, tally_guid):
+        """Check if product exists by Tally GUID (primary lookup key)."""
+        result = self.query(
+            "SELECT * FROM products WHERE tally_guid = ?",
+            (tally_guid,)
+        )
+        return result if result else None
+
+    def product_exists_by_canonical(self, canonical_name):
+        """Check if product exists by canonical name (secondary dedup guard)."""
+        result = self.query(
+            "SELECT * FROM products WHERE name_canonical = ?",
+            (canonical_name,)
+        )
+        return result if result else None
+
     def insert_product(self, product_data):
         """Insert new product with canonical name for uniqueness checking"""
-        self.execute("""
+        cursor = self.execute("""
             INSERT INTO products (
                 tally_guid, name, name_canonical, tally_company, hsn_code, unit,
                 rate, description, data_json,
@@ -489,7 +504,7 @@ class Database:
         """, (
             product_data.get('tally_guid'),
             product_data.get('name'),
-            product_data.get('name_canonical'),  # ← Canonical name for uniqueness
+            product_data.get('name_canonical'),
             product_data.get('tally_company'),
             product_data.get('hsn_code'),
             product_data.get('unit'),
@@ -507,6 +522,7 @@ class Database:
             product_data.get('cgst_rate', 0.0),
             product_data.get('sgst_rate', 0.0),
         ))
+        return cursor.lastrowid if cursor else None
 
     def update_product(self, product_id, product_data):
         """Update existing product with fresh data and mark for re-sync"""
