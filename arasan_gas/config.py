@@ -167,6 +167,7 @@ class Config:
 
     # Invoice Fetch Configuration
     INVOICE_FETCH_START_DATE = os.getenv('INVOICE_FETCH_START_DATE', '')
+    REQUIRE_DELIVERY_REF = os.getenv('REQUIRE_DELIVERY_REF', 'false').lower() == 'true'
 
     @classmethod
     def reload_from_env(cls):
@@ -188,6 +189,7 @@ class Config:
         cls.TALLY_DB_PATH = tally_path
 
         cls.INVOICE_FETCH_START_DATE = os.getenv('INVOICE_FETCH_START_DATE', '')
+        cls.REQUIRE_DELIVERY_REF = os.getenv('REQUIRE_DELIVERY_REF', 'false').lower() == 'true'
         cls.FETCH_SYNC_INTERVAL_SECONDS = int(os.getenv('FETCH_SYNC_INTERVAL_SECONDS', '10'))
         cls.CUSTOMER_SYNC_WORKERS = int(os.getenv('CUSTOMER_SYNC_WORKERS', '10'))
         cls.DEFAULT_ADMIN_USER_ID = int(os.getenv('DEFAULT_ADMIN_USER_ID', '55'))

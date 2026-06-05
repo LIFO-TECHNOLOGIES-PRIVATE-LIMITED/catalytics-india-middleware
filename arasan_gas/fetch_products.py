@@ -289,8 +289,9 @@ def fetch_products_from_all_companies():
                     except (ValueError, TypeError):
                         pass
                 else:
-                    # No size found in name — use the first (default) variant only
-                    variants = variants[:1]
+                    # No size found in name — default to size 7 with this type's unit
+                    _, default_unit, default_type_code, default_type_name = variants[0]
+                    variants = [('7', default_unit, default_type_code, default_type_name)]
 
                 logger.info(
                     f"[PARSED] '{product_name}' -> base='{base_name}', "

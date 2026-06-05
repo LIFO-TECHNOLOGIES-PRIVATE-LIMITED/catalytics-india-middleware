@@ -311,6 +311,16 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                     overall_stats['skipped_date'] += 1
                     continue
 
+                # --- Delivery ref filter (only when REQUIRE_DELIVERY_REF=true) ---
+                if config.REQUIRE_DELIVERY_REF and not _has_delivery_info(invoice):
+                    overall_stats['skipped_no_delivery'] += 1
+                    raw = invoice.get('raw_voucher', {}) or {}
+                    other_ref = (raw.get('BASICORDERREF') or raw.get('OTHERREFERENCE') or '').strip()
+                    logger.info(
+                        f"[SKIP NO OTHER REF] #{voucher_no} ({customer_name}) - "
+                        f"Other Reference: '{other_ref or '<empty>'}'"
+                    )
+                    continue
 
                 # --- Customer: lookup or auto-create from voucher ---
                 # Invoice is NEVER skipped. ledger_data_json in invoices table
@@ -427,8 +437,16 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                             )
                             row_dict = dict(row) if row else {}
                             if row_dict.get('data_json'):
-                                stock_cache[stock_cache_key] = json_loads(row_dict.get('data_json'))
+                                parsed_data = json_loads(row_dict.get('data_json')) or {}
                                 db_name = str(row_dict.get('name') or '').strip()
+                                if isinstance(parsed_data, dict):
+                                    parsed_data = dict(parsed_data)
+                                    # Override NAME with display_name so backend uses formatted name
+                                    if db_name:
+                                        parsed_data['NAME'] = db_name
+                                        parsed_data['stock_item_name'] = db_name
+                                        parsed_data['_display_name'] = db_name
+                                stock_cache[stock_cache_key] = parsed_data
                                 if db_name and db_name != item_name:
                                     logger.info(
                                         f"[PRODUCT MATCH NORMALIZED] Invoice='{item_name}' matched DB='{db_name}'"
@@ -440,7 +458,13 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                             stock_cache[stock_cache_key] = None
 
                     if stock_cache.get(stock_cache_key):
-                        stock_items_map[item_name] = stock_cache[stock_cache_key]
+                        product_data = stock_cache[stock_cache_key]
+                        display_name = (
+                            product_data.get('_display_name') if isinstance(product_data, dict) else None
+                        ) or item_name
+                        stock_items_map[display_name] = product_data   # formatted name key
+                        if display_name != item_name:
+                            stock_items_map[item_name] = product_data  # raw key for INVENTORY lookup
                     else:
                         missing_products.append(item_name)
 
@@ -470,11 +494,12 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                         }
 
                         # stock_items_map entry for invoice's stock_items_json column
+                        # (NAME and key will be updated to display_name after variant resolution)
                         _prod_json = {
                             'NAME': mp_name, 'HSNCODE': _hsn,
                             '_source': 'dc_voucher', '_dc_no': voucher_no,
                         }
-                        stock_items_map[mp_name] = _prod_json
+                        stock_items_map[mp_name] = _prod_json  # raw key for INVENTORY lookup
 
                         # Auto-create one DB row per variant (BHOX pattern)
                         base_name    = parsed['product_master_name']
@@ -501,14 +526,21 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                             except (ValueError, TypeError):
                                 pass
                         else:
-                            # No size found in name — use the first (default) variant only
-                            variants = variants[:1]
+                            # No size found in name — default to size 7 with this type's unit
+                            _, default_unit, default_type_code, default_type_name = variants[0]
+                            variants = [('7', default_unit, default_type_code, default_type_name)]
 
                         try:
                             for size, unit, type_code, type_name in variants:
                                 variant_label = f"{size}{unit}"
                                 display_name  = f"{base_name} {variant_label} ({type_code})"
                                 variant_guid  = f"|{type_code}_{size}{unit}"  # no tally_guid yet
+
+                                # Update stock_items_map to use formatted display_name
+                                # so the backend receives "ARGON D BULK 7cum (CYL)" not "ARGON D BULK 7 CUM"
+                                _prod_json['NAME'] = display_name
+                                _prod_json['stock_item_name'] = display_name
+                                stock_items_map[display_name] = _prod_json
 
                                 _prod_data = {
                                     'tally_guid':          variant_guid,
