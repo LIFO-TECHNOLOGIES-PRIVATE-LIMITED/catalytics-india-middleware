@@ -462,9 +462,15 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                         display_name = (
                             product_data.get('_display_name') if isinstance(product_data, dict) else None
                         ) or item_name
-                        stock_items_map[display_name] = product_data   # formatted name key
                         if display_name != item_name:
-                            stock_items_map[item_name] = product_data  # raw key for INVENTORY lookup
+                            logger.info(f"[NAME-NORMALIZE] #{voucher_no} | '{item_name}' -> '{display_name}'")
+                            item['item_name'] = display_name
+                            # Update raw_voucher INVENTORY STOCKITEMNAME to match display_name
+                            for raw_inv in (invoice.get('raw_voucher', {}).get('INVENTORY') or []):
+                                if (raw_inv.get('STOCKITEMNAME') or '').strip() == item_name:
+                                    raw_inv['STOCKITEMNAME'] = display_name
+                                    break
+                        stock_items_map[display_name] = product_data
                     else:
                         missing_products.append(item_name)
 
@@ -536,11 +542,16 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                                 display_name  = f"{base_name} {variant_label} ({type_code})"
                                 variant_guid  = f"|{type_code}_{size}{unit}"  # no tally_guid yet
 
-                                # Update stock_items_map to use formatted display_name
-                                # so the backend receives "ARGON D BULK 7cum (CYL)" not "ARGON D BULK 7 CUM"
+                                # Update stock_items_map and raw INVENTORY to use formatted display_name
                                 _prod_json['NAME'] = display_name
                                 _prod_json['stock_item_name'] = display_name
+                                _prod_json['_display_name'] = display_name
                                 stock_items_map[display_name] = _prod_json
+                                # Update raw_voucher INVENTORY STOCKITEMNAME to match display_name
+                                for raw_inv in (invoice.get('raw_voucher', {}).get('INVENTORY') or []):
+                                    if (raw_inv.get('STOCKITEMNAME') or '').strip() == mp_name:
+                                        raw_inv['STOCKITEMNAME'] = display_name
+                                        break
 
                                 _prod_data = {
                                     'tally_guid':          variant_guid,
