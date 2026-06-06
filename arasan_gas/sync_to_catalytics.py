@@ -93,9 +93,6 @@ class CatalyticsSyncer:
         headers = kwargs.pop('headers', {})
         timeout = kwargs.pop('timeout', 30)
 
-        # Note: Payload endpoints use AllowAny permission
-        # They only check TALLY_MIDDLEWARE_API_KEY if it's configured in Django settings
-        # Since it's not configured, we don't send authentication headers
         headers['Content-Type'] = 'application/json'
 
         try:
@@ -693,7 +690,7 @@ class CatalyticsSyncer:
             try:
                 response = self._api_request(
                     'POST',
-                    '/import/tally-customer-payload/',
+                    '/import/tally-customer-name-payload/',
                     json=request_payload,
                     timeout=120,
                 )
@@ -1032,7 +1029,7 @@ class CatalyticsSyncer:
             try:
                 response = self._api_request(
                     'POST',
-                    '/import/tally-product-payload/',
+                    '/import/tally-product_name-payload/',
                     json=request_payload,
                     timeout=120,
                 )
