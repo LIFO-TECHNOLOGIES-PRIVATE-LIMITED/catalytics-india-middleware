@@ -973,9 +973,9 @@ class CatalyticsSyncer:
         return stock_item, None
 
     def sync_products(self):
-        """Sync products to Catalytics in batches via /import/tally-product-payload/."""
+        """Sync products to Catalytics one at a time via /import/tally-product_name-payload/."""
         logger.info("\n" + "="*60)
-        logger.info("PRODUCT SYNC (tally-product-payload, batch mode)")
+        logger.info("PRODUCT SYNC (tally-product_name-payload, per-product mode)")
         logger.info("="*60)
 
         products = self.db.get_unsynced_products(None)
@@ -992,118 +992,105 @@ class CatalyticsSyncer:
             'failed': 0
         }
 
-        batch_size = self.PRODUCT_BATCH_SIZE
-        total_batches = (len(products) + batch_size - 1) // batch_size
-
-        for batch_idx in range(total_batches):
-            batch_start = batch_idx * batch_size
-            batch = products[batch_start:batch_start + batch_size]
-            logger.info(f"\n--- Batch {batch_idx + 1}/{total_batches} ({len(batch)} products) ---")
-
-            # Step 1: Prepare stock items for this batch
-            batch_items = []
-            batch_products = []
-
-            for product in batch:
-                name = (product['name'] or '').strip()
-                stock_item, error = self._prepare_stock_item(product)
-                if not stock_item:
-                    logger.error(f"[SKIP] '{name}': {error}")
-                    err_json = json.dumps({'prepare_error': error, 'product_name': name})
-                    self.db.mark_product_sync_failed(product['id'], error, err_json)
-                    stats['failed'] += 1
-                    continue
-                batch_items.append(stock_item)
-                batch_products.append(product)
-
-            if not batch_items:
-                continue
-
-            # Step 2: Send batch to API
-            request_payload = {
-                'entity_id': self.entity_id,
-                'stock_items': batch_items,
-                'created_by': config.DEFAULT_ADMIN_USER_ID,
-            }
+        for product in products:
+            prod_name = (product['name'] or '').strip()
+            prod_id = product['id']
 
             try:
+                payload = {
+                    'entity_id': self.entity_id,
+                    'stock_item_name': prod_name,
+                    'product_master_name': product['product_master_name'] or '',
+                    'unit_master_name': product['unit_name'] or '',
+                    'variant_name': product['variant_name'] or '',
+                    'product_type_code': product['product_type_code'] or '',
+                    'product_type_name': product['product_type_name'] or '',
+                    'hsn_code': product['hsn_code'] or '',
+                    'rate': product['rate'] or 0.0,
+                    'gst_applicable': product['gst_applicable'] or '',
+                    'gst_rate': product['gst_rate'] or 0.0,
+                    'igst_rate': product['igst_rate'] or 0.0,
+                    'cgst_rate': product['cgst_rate'] or 0.0,
+                    'sgst_rate': product['sgst_rate'] or 0.0,
+                    'tally_company': product['tally_company'] or '',
+                }
+
                 response = self._api_request(
                     'POST',
                     '/import/tally-product_name-payload/',
-                    json=request_payload,
-                    timeout=120,
+                    json=payload,
+                    timeout=30,
                 )
-            except Exception as e:
-                logger.error(f"Batch {batch_idx + 1} API request failed: {e}")
-                err_json = json.dumps({'batch_error': 'network/timeout', 'detail': str(e)})
-                for product in batch_products:
-                    self.db.mark_product_sync_failed(product['id'], f"Batch request failed: {e}", err_json)
-                    stats['failed'] += 1
-                continue
 
-            # Step 3: Parse response and match results to products
-            raw_response_text = (response.text or '')[:5000]
+                raw_response_text = (response.text or '')[:5000]
 
-            if response.status_code not in [200, 201]:
-                error_msg = f"HTTP {response.status_code}"
-                try:
-                    error_msg += f" - {response.json().get('message', raw_response_text[:300])}"
-                except Exception:
-                    pass
-                logger.error(f"Batch {batch_idx + 1} failed: {error_msg}")
-                err_json = json.dumps({'batch_error': f'HTTP {response.status_code}', 'response': raw_response_text})
-                for product in batch_products:
-                    self.db.mark_product_sync_failed(product['id'], error_msg, err_json)
-                    stats['failed'] += 1
-                continue
-
-            try:
-                result = response.json()
-            except Exception:
-                logger.error(f"Batch {batch_idx + 1}: invalid JSON response")
-                err_json = json.dumps({'batch_error': 'invalid_json', 'response': raw_response_text})
-                for product in batch_products:
-                    self.db.mark_product_sync_failed(product['id'], "Invalid JSON response", err_json)
-                    stats['failed'] += 1
-                continue
-
-            data = result.get('data', result)
-            results_list = data.get('results', [])
-
-            batch_created = data.get('created', 0)
-            batch_updated = data.get('updated', 0)
-            batch_errors = data.get('errors', 0)
-            logger.info(
-                f"Batch {batch_idx + 1} response: "
-                f"created={batch_created}, updated={batch_updated}, errors={batch_errors}"
-            )
-
-            # Match each result back to its product (same order as input)
-            for i, product in enumerate(batch_products):
-                prod_name = (product['name'] or '').strip()
-                prod_id = product['id']
-
-                if i < len(results_list):
-                    res = results_list[i]
-                else:
-                    res = {'status': 'error', 'message': 'No result returned for this product'}
-
-                res_status = res.get('status', 'error')
-                catalytics_id = res.get('product_id') or res.get('id')
-
-                if res_status in ('created', 'updated'):
-                    self.db.mark_product_synced(prod_id, catalytics_id, json.dumps(res))
-                    stats['synced'] += 1
-                    stats['verified'] += 1
-                    logger.info(
-                        f"  [{res_status.upper()}] '{prod_name}' "
-                        f"(SQLite={prod_id}, Catalytics={catalytics_id})"
-                    )
-                else:
-                    error_msg = res.get('message', 'Unknown error')
-                    self.db.mark_product_sync_failed(prod_id, error_msg, json.dumps(res))
-                    stats['failed'] += 1
+                if response.status_code not in [200, 201]:
+                    error_msg = f"HTTP {response.status_code}"
+                    try:
+                        error_msg += f" - {response.json().get('message', raw_response_text[:300])}"
+                    except Exception:
+                        pass
                     logger.error(f"  [FAILED] '{prod_name}': {error_msg}")
+                    self.db.mark_product_sync_failed(prod_id, error_msg, raw_response_text)
+                    stats['failed'] += 1
+                    continue
+
+                try:
+                    result = response.json()
+                except Exception:
+                    logger.error(f"  [FAILED] '{prod_name}': invalid JSON response")
+                    self.db.mark_product_sync_failed(prod_id, "Invalid JSON response", raw_response_text)
+                    stats['failed'] += 1
+                    continue
+
+                if result.get('status') != 'success':
+                    error_msg = result.get('message', 'API returned non-success')
+                    logger.error(f"  [FAILED] '{prod_name}': {error_msg}")
+                    self.db.mark_product_sync_failed(prod_id, error_msg, json.dumps(result))
+                    stats['failed'] += 1
+                    continue
+
+                data = result.get('data', {})
+                created = data.get('created', 0)
+                updated = data.get('updated', 0)
+                errors = data.get('errors', 0)
+
+                item_results = data.get('results', [])
+                item_result = item_results[0] if item_results else {}
+                item_status = item_result.get('status', '')
+
+                if item_status == 'error':
+                    error_msg = item_result.get('message', 'Backend returned error')
+                    logger.error(f"  [FAILED] '{prod_name}': {error_msg}")
+                    self.db.mark_product_sync_failed(prod_id, error_msg, json.dumps(result))
+                    stats['failed'] += 1
+                    continue
+
+                if errors > 0 and created == 0 and updated == 0:
+                    error_msg = item_result.get('message', 'API reported errors')
+                    logger.error(f"  [FAILED] '{prod_name}': {error_msg}")
+                    self.db.mark_product_sync_failed(prod_id, error_msg, json.dumps(result))
+                    stats['failed'] += 1
+                    continue
+
+                catalytics_id = (
+                    item_result.get('product_id') or item_result.get('id')
+                    or data.get('product_id') or data.get('id')
+                )
+
+                self.db.mark_product_synced(prod_id, catalytics_id, json.dumps(result))
+                stats['synced'] += 1
+                stats['verified'] += 1
+                status_label = 'CREATED' if created else ('UPDATED' if updated else 'SYNCED')
+                logger.info(
+                    f"  [{status_label}] '{prod_name}' "
+                    f"(SQLite={prod_id}, Catalytics={catalytics_id})"
+                )
+
+            except Exception as e:
+                logger.error(f"  [ERROR] '{prod_name}': {e}", exc_info=True)
+                self.db.mark_product_sync_failed(prod_id, str(e))
+                stats['failed'] += 1
 
         # Summary
         logger.info(f"\n{'-'*60}")
@@ -1420,10 +1407,15 @@ class CatalyticsSyncer:
         if not voucher_payload.get('FILLINGSTATION') and filling_station:
             voucher_payload['FILLINGSTATION'] = filling_station
 
-        # Map Other Reference -> Terms of Delivery for challan type detection
-        other_ref = str(voucher_payload.get('BASICORDERREF') or '').strip().lower()
-        if 'customer pickup' in other_ref or 'pickup' in other_ref:
-            voucher_payload.setdefault('TERMSOFDELIVERY', 'Customer Pickup')
+        # Map Other Reference -> Terms of Delivery for challan type detection.
+        # 'D' = Delivery, 'C' = Customer Pickup (Arasan Gas convention).
+        # Always assign (not setdefault) — raw Tally data may have TERMSOFDELIVERY=""
+        # which would make setdefault a no-op and break challan_type detection.
+        other_ref = str(voucher_payload.get('BASICORDERREF') or voucher_payload.get('OTHERREFERENCE') or '').strip().lower()
+        if other_ref == 'c' or 'customer pickup' in other_ref or 'pickup' in other_ref or 'self' in other_ref:
+            voucher_payload['TERMSOFDELIVERY'] = 'Customer Pickup'
+        elif other_ref == 'd' or 'delivery' in other_ref:
+            voucher_payload['TERMSOFDELIVERY'] = 'Delivery'
 
         # Clean up and extract PO number (filter out "Delivery" and other non-PO values)
         po_number = self._extract_po_number(invoice)
@@ -1433,10 +1425,10 @@ class CatalyticsSyncer:
             voucher_payload['PONUMBER'] = po_number  # Keep for backward compatibility
             logger.info(f"PO Number: {po_number}")
         else:
-            # If no valid PO found, set to empty
+            # If no valid PO found, clear PO fields only.
+            # Keep BASICORDERREF — backend uses it for challan_type detection (D=Delivery, C=Customer Pickup).
             voucher_payload.pop('PARTYORDERNO', None)
             voucher_payload.pop('PONUMBER', None)
-            voucher_payload.pop('BASICORDERREF', None)
 
         # Clean up and extract PO date
         po_date = self._extract_po_date(invoice)
@@ -1568,19 +1560,24 @@ class CatalyticsSyncer:
         if not voucher.get('FILLINGSTATION') and filling_station:
             voucher['FILLINGSTATION'] = filling_station
 
-        # Map Other Reference -> Terms of Delivery for challan type detection
+        # Map Other Reference -> Terms of Delivery for challan type detection.
+        # 'D' = Delivery, 'C' = Customer Pickup (Arasan Gas convention).
+        # Always assign (not setdefault) — raw Tally data may have TERMSOFDELIVERY=""
+        # which would make setdefault a no-op and break challan_type detection.
         other_ref = str(voucher.get('BASICORDERREF') or voucher.get('OTHERREFERENCE') or '').strip().lower()
-        if 'customer pickup' in other_ref or 'pickup' in other_ref or other_ref == 'c':
-            voucher.setdefault('TERMSOFDELIVERY', 'Customer Pickup')
+        if other_ref == 'c' or 'customer pickup' in other_ref or 'pickup' in other_ref or 'self' in other_ref:
+            voucher['TERMSOFDELIVERY'] = 'Customer Pickup'
+        elif other_ref == 'd' or 'delivery' in other_ref:
+            voucher['TERMSOFDELIVERY'] = 'Delivery'
 
         # Extract and clean PO number
         po_number = self._extract_po_number(invoice)
         if po_number:
             voucher['PARTYORDERNO'] = po_number
         else:
+            # Keep BASICORDERREF — backend uses it for challan_type detection.
             voucher.pop('PARTYORDERNO', None)
             voucher.pop('PONUMBER', None)
-            voucher.pop('BASICORDERREF', None)
 
         po_date = self._extract_po_date(invoice)
         if not po_number:

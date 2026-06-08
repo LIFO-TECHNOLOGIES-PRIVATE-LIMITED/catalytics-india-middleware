@@ -85,6 +85,38 @@ def _compute_payload_hash(voucher, inventory_items, ledger_data, stock_items_map
     return sha256_text(payload_json)
 
 
+# CO2 cylinder weights to try (in priority order) when Tally records qty in kg.
+# Whichever weight divides the kg qty exactly (zero remainder) wins.
+_CO2_CYL_WEIGHTS = [30, 27]
+
+
+def _is_co2_item(item_name: str) -> bool:
+    """Return True if item_name identifies a CO2 / Carbon-Di-Oxide product."""
+    nl = item_name.lower().replace('-', ' ').replace('_', ' ')
+    return (
+        'co2' in nl
+        or 'carbon dioxide' in nl
+        or 'carbondioxide' in nl
+        or 'carbon di oxide' in nl
+    )
+
+
+def _parse_tally_qty_unit(raw_qty_str: str):
+    """
+    Extract (qty_float, unit_lower) from a Tally qty string.
+    Examples: '60.00 Kgs' -> (60.0, 'kgs'),  '2.00 Nos' -> (2.0, 'nos')
+    """
+    parts = str(raw_qty_str or '').strip().split()
+    if not parts:
+        return 0.0, ''
+    try:
+        qty = abs(float(parts[0].replace(',', '')))
+    except (ValueError, IndexError):
+        qty = 0.0
+    unit = parts[1].lower() if len(parts) > 1 else ''
+    return qty, unit
+
+
 def _build_fallback_voucher(invoice):
     """Build a minimal voucher payload when full raw voucher is unavailable."""
     voucher = {
@@ -423,17 +455,75 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                 inventory_items = invoice.get('items', [])
                 stock_items_map = {}
                 missing_products = []
+                # weight hints built during CO2 conversion: {item_name: weight_kg}
+                # used later in auto-create to pick the correct CO2 variant
+                _co2_weight_hints = {}
+
                 for item in inventory_items:
                     item_name = (item.get('item_name') or '').strip()
                     if not item_name:
                         continue
+
+                    # CO2 qty conversion: Tally may record qty in kg instead of cylinders.
+                    # Try _CO2_CYL_WEIGHTS in order; use the weight that divides evenly.
+                    # e.g. 54 kg ÷ 27 = 2.0 (whole) → variant=27kg, qty=2
+                    #      60 kg ÷ 30 = 2.0 (whole) → variant=30kg, qty=2
+                    if _is_co2_item(item_name):
+                        raw_inv_lines = (invoice.get('raw_voucher') or {}).get('INVENTORY') or []
+                        for _raw_inv in raw_inv_lines:
+                            if (_raw_inv.get('STOCKITEMNAME') or '').strip() == item_name:
+                                raw_qty_str = str(
+                                    _raw_inv.get('ACTUALQTY') or _raw_inv.get('BILLEDQTY') or ''
+                                )
+                                _, _unit = _parse_tally_qty_unit(raw_qty_str)
+                                if _unit in ('kg', 'kgs', 'kilogram', 'kilograms'):
+                                    _orig_qty = item.get('quantity', 0.0)
+                                    # Determine cylinder weight: pick whichever divides evenly
+                                    _det_weight = _CO2_CYL_WEIGHTS[0]  # fallback
+                                    for _w in _CO2_CYL_WEIGHTS:
+                                        if _orig_qty > 0:
+                                            _ratio = _orig_qty / _w
+                                            if abs(_ratio - round(_ratio)) < 0.001:
+                                                _det_weight = _w
+                                                break
+                                    _cyl_qty = float(round(_orig_qty / _det_weight))
+                                    item['quantity'] = _cyl_qty
+                                    _co2_weight_hints[item_name] = _det_weight
+                                    # Patch raw INVENTORY so data_json stores corrected qty
+                                    _raw_inv['ACTUALQTY'] = str(_cyl_qty)
+                                    _raw_inv['BILLEDQTY'] = str(_cyl_qty)
+                                    logger.info(
+                                        f"[CO2 QTY] #{voucher_no} | '{item_name}': "
+                                        f"{_orig_qty} kg ÷ {_det_weight} "
+                                        f"= {_cyl_qty} cylinders ({_det_weight}kg variant)"
+                                    )
+                                    # Rename item to the correct variant so product lookup
+                                    # uses the right name (e.g. "...30kg" → "...27kg")
+                                    _parsed_co2 = parse_stock_item_name(item_name)
+                                    if _parsed_co2:
+                                        _correct_name = f"{_parsed_co2['product_master_name']} {_det_weight}kg (CYL)"
+                                        if _correct_name != item_name:
+                                            item['item_name'] = _correct_name
+                                            _raw_inv['STOCKITEMNAME'] = _correct_name
+                                            _co2_weight_hints[_correct_name] = _det_weight
+                                            item_name = _correct_name
+                                            logger.info(
+                                                f"[CO2 RENAME] #{voucher_no} | renamed to '{_correct_name}'"
+                                            )
+                                break
+
                     normalized_item_name = _normalize_name_key(item_name)
                     stock_cache_key = f"{company_name}::{normalized_item_name}"
                     if stock_cache_key not in stock_cache:
                         try:
+                            # Try exact name match first, then fall back to product_master_name match
+                            # so "Carbon-Di-Oxide" finds "Carbon-Di-Oxide 30kg (CYL)" already in DB
                             row = db.query(
-                                "SELECT name, data_json FROM products WHERE lower(replace(name, ' ', '')) = ?",
-                                (normalized_item_name,)
+                                "SELECT name, data_json FROM products "
+                                "WHERE lower(replace(name, ' ', '')) = ? "
+                                "OR lower(replace(product_master_name, ' ', '')) = ? "
+                                "ORDER BY (lower(replace(name, ' ', '')) = ?) DESC LIMIT 1",
+                                (normalized_item_name, normalized_item_name, normalized_item_name)
                             )
                             row_dict = dict(row) if row else {}
                             if row_dict.get('data_json'):
@@ -532,9 +622,21 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                             except (ValueError, TypeError):
                                 pass
                         else:
-                            # No size found in name — default to size 7 with this type's unit
-                            _, default_unit, default_type_code, default_type_name = variants[0]
-                            variants = [('7', default_unit, default_type_code, default_type_name)]
+                            # No size in name:
+                            #   CO2 → use weight hint from qty conversion (30kg or 27kg),
+                            #          fall back to default 30kg
+                            #   everything else → 7cum (CYL)
+                            if product_type == 'CO2':
+                                _hint_w = _co2_weight_hints.get(mp_name)
+                                if _hint_w:
+                                    # qty was in kg — use the specific variant determined
+                                    filtered = [v for v in variants if str(v[0]) == str(_hint_w)]
+                                    variants = filtered if filtered else [variants[0]]
+                                else:
+                                    # qty was in Nos — default to 30kg
+                                    variants = [variants[0]]
+                            else:
+                                variants = [('7', 'cum', 'CYL', 'CYLINDER')]
 
                         try:
                             for size, unit, type_code, type_name in variants:
@@ -547,6 +649,11 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                                 _prod_json['stock_item_name'] = display_name
                                 _prod_json['_display_name'] = display_name
                                 stock_items_map[display_name] = _prod_json
+                                # Update item['item_name'] so items_json stores the variant name
+                                for _inv_item in inventory_items:
+                                    if (_inv_item.get('item_name') or '').strip() == mp_name:
+                                        _inv_item['item_name'] = display_name
+                                        break
                                 # Update raw_voucher INVENTORY STOCKITEMNAME to match display_name
                                 for raw_inv in (invoice.get('raw_voucher', {}).get('INVENTORY') or []):
                                     if (raw_inv.get('STOCKITEMNAME') or '').strip() == mp_name:

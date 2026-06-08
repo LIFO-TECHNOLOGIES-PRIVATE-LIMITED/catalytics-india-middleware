@@ -113,7 +113,8 @@ _VARIANT_BARE          = re.compile(r'\b(\d+(?:\.\d+)?)\b')
 def _detect_product_type(base_name: str) -> str:
     """Classify a cleaned stock item name into a product type key."""
     nl = base_name.lower()
-    if 'co2' in nl or 'carbon dioxide' in nl or 'carbondioxide' in nl:
+    if ('co2' in nl or 'carbon dioxide' in nl or 'carbondioxide' in nl
+            or 'carbon-di-oxide' in nl or 'carbon di oxide' in nl):
         return 'CO2'
     if 'lpg' in nl or 'liquefied petroleum' in nl or 'liquid petroleum' in nl:
         return 'LPG'
@@ -289,9 +290,13 @@ def fetch_products_from_all_companies():
                     except (ValueError, TypeError):
                         pass
                 else:
-                    # No size found in name — default to size 7 with this type's unit
-                    _, default_unit, default_type_code, default_type_name = variants[0]
-                    variants = [('7', default_unit, default_type_code, default_type_name)]
+                    # No size in name:
+                    #   CO2 → both 30kg and 27kg (CYL)
+                    #   everything else → 7cum (CYL)
+                    if product_type == 'CO2':
+                        variants = [v for v in variants if v[0] in ('30', '27')]
+                    else:
+                        variants = [('7', 'cum', 'CYL', 'CYLINDER')]
 
                 logger.info(
                     f"[PARSED] '{product_name}' -> base='{base_name}', "
