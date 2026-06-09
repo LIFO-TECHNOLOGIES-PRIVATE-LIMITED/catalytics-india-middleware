@@ -118,7 +118,7 @@ def _detect_product_type(base_name: str) -> str:
         return 'CO2'
     if 'lpg' in nl or 'liquefied petroleum' in nl or 'liquid petroleum' in nl:
         return 'LPG'
-    if 'nitrous oxide' in nl or 'n2o' in nl:
+    if 'nitrous' in nl or 'n2o' in nl:
         return 'NITROUS_OXIDE'
     if 'liquid' in nl and ('oxygen' in nl or ' o2' in nl):
         return 'LIQUID_O2'
@@ -306,6 +306,9 @@ def fetch_products_from_all_companies():
 
                 # Save one row per variant
                 for size, unit, type_code, type_name in variants:
+                    # ltr unit always means container (liquid/bulk storage)
+                    if unit == 'ltr':
+                        type_code, type_name = 'CON', 'CONTAINER'
                     variant_label = f"{size}{unit}"
                     display_name  = f"{base_name} {variant_label} ({type_code})"
                     # Synthetic GUID: stock-item GUID + variant suffix → unique per row

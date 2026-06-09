@@ -650,6 +650,9 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
 
                         try:
                             for size, unit, type_code, type_name in variants:
+                                # ltr unit always means container (liquid/bulk storage)
+                                if unit == 'ltr':
+                                    type_code, type_name = 'CON', 'CONTAINER'
                                 variant_label = f"{size}{unit}"
                                 display_name  = f"{base_name} {variant_label} ({type_code})"
                                 variant_guid  = f"|{type_code}_{size}{unit}"  # no tally_guid yet
