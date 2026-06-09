@@ -1443,12 +1443,12 @@ def resync_invoice(invoice_id):
 
         message = f'Invoice #{voucher_no} marked for resync'
 
-        # If sync_now is requested, trigger sync immediately
+        # If sync_now is requested, trigger sync immediately (only this invoice)
         if sync_now:
             try:
                 from sync_to_catalytics import CatalyticsSyncer
                 syncer = CatalyticsSyncer()
-                result = syncer.sync_invoices_to_dc()
+                result = syncer.sync_invoices_to_dc(invoice_id=invoice_id)
 
                 if result.get('synced', 0) > 0:
                     message = f'Invoice #{voucher_no} resynced successfully! DC: {result.get("synced")} created/updated'

@@ -1590,16 +1590,20 @@ class CatalyticsSyncer:
 
         return voucher, ledgers_map, stock_items_map, None
 
-    def sync_invoices_to_dc(self):
+    def sync_invoices_to_dc(self, invoice_id=None):
         """Sync invoices as DCs in batches via /import/tally-dc-name-payload/ (name-based).
         All data comes from SQLite (enriched during fetch) — no Tally calls at sync time.
         Uses tally_dc_simple.py backend: name matching, auto-creates, instant DC,
-        cancellation, batch support — all features from tally_dc_payload.py."""
+        cancellation, batch support — all features from tally_dc_payload.py.
+        Pass invoice_id to sync a single specific invoice only."""
         logger.info("\n" + "="*60)
         logger.info("INVOICE TO DC SYNC (name-based, batch mode)")
         logger.info("="*60)
 
-        invoices = self.db.get_unsynced_invoices(self.batch_size)
+        if invoice_id:
+            invoices = self.db.get_unsynced_invoices(self.batch_size, invoice_id=invoice_id)
+        else:
+            invoices = self.db.get_unsynced_invoices(self.batch_size)
         logger.info(f"Found {len(invoices)} unsynced invoices")
 
         if not invoices:

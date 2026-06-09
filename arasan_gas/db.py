@@ -691,9 +691,17 @@ class Database:
             invoice_id
         ))
 
-    def get_unsynced_invoices(self, limit=50, max_attempts=10):
+    def get_unsynced_invoices(self, limit=50, max_attempts=10, invoice_id=None):
         """Get invoices that haven't been synced.
-        Excludes deleted invoices and invoices that failed too many times."""
+        Excludes deleted invoices and invoices that failed too many times.
+        Pass invoice_id to fetch a single specific invoice only."""
+        if invoice_id:
+            return self.query_all("""
+                SELECT * FROM invoices
+                WHERE id = ?
+                  AND is_synced = 0
+                  AND COALESCE(is_deleted, 0) = 0
+            """, (invoice_id,))
         return self.query_all("""
             SELECT * FROM invoices
             WHERE is_synced = 0
