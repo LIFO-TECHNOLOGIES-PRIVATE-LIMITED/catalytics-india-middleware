@@ -519,7 +519,8 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                             # Try exact name match first, then fall back to product_master_name match
                             # so "Carbon-Di-Oxide" finds "Carbon-Di-Oxide 30kg (CYL)" already in DB
                             row = db.query(
-                                "SELECT name, data_json FROM products "
+                                "SELECT name, data_json, product_type_code, product_type_name, "
+                                "variant_name, unit_name FROM products "
                                 "WHERE lower(replace(name, ' ', '')) = ? "
                                 "OR lower(replace(product_master_name, ' ', '')) = ? "
                                 "ORDER BY (lower(replace(name, ' ', '')) = ?) DESC LIMIT 1",
@@ -536,6 +537,15 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                                         parsed_data['NAME'] = db_name
                                         parsed_data['stock_item_name'] = db_name
                                         parsed_data['_display_name'] = db_name
+                                    # Enrich with product type info from DB columns
+                                    if row_dict.get('product_type_code'):
+                                        parsed_data['product_type_code'] = row_dict['product_type_code']
+                                    if row_dict.get('product_type_name'):
+                                        parsed_data['product_type_name'] = row_dict['product_type_name']
+                                    if row_dict.get('variant_name'):
+                                        parsed_data['variant_name'] = row_dict['variant_name']
+                                    if row_dict.get('unit_name'):
+                                        parsed_data['unit_name'] = row_dict['unit_name']
                                 stock_cache[stock_cache_key] = parsed_data
                                 if db_name and db_name != item_name:
                                     logger.info(
@@ -648,6 +658,10 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                                 _prod_json['NAME'] = display_name
                                 _prod_json['stock_item_name'] = display_name
                                 _prod_json['_display_name'] = display_name
+                                _prod_json['product_type_code'] = type_code
+                                _prod_json['product_type_name'] = type_name
+                                _prod_json['variant_name'] = variant_label
+                                _prod_json['unit_name'] = unit
                                 stock_items_map[display_name] = _prod_json
                                 # Update item['item_name'] so items_json stores the variant name
                                 for _inv_item in inventory_items:
@@ -682,6 +696,8 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
                                     'sgst_rate':           0.0,
                                 }
                                 existing_product = db.product_exists_by_canonical(display_name)
+                                if not existing_product:
+                                    existing_product = db.product_exists_by_master_variant(base_name, variant_label)
                                 if existing_product:
                                     db.update_product(existing_product['id'], _prod_data)
                                 else:

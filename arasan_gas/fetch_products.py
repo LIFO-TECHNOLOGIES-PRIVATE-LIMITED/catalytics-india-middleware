@@ -82,9 +82,9 @@ _PRODUCT_VARIANTS = {
         ('33',    'kg',  'CYL', 'CYLINDER'),
     ],
     'NITROUS_OXIDE': [
-        ('17000', 'ltr', 'CYL', 'CYLINDER'),   # default
-        ('3700',  'ltr', 'CYL', 'CYLINDER'),
-        ('1854',  'ltr', 'CYL', 'CYLINDER'),
+        ('17000', 'ltr', 'CON', 'CONTAINER'),   # default
+        ('3700',  'ltr', 'CON', 'CONTAINER'),
+        ('1854',  'ltr', 'CON', 'CONTAINER'),
     ],
     'LIQUID_N2': [
         ('30',  'ltr',   'CON', 'CONTAINER'),   # default
@@ -339,6 +339,9 @@ def fetch_products_from_all_companies():
                         # Secondary dedup: same display name already saved
                         if not existing:
                             existing = db.product_exists_by_canonical(display_name)
+                        # Tertiary dedup: same master+variant but wrong type_code (e.g. CYL→CON rename)
+                        if not existing:
+                            existing = db.product_exists_by_master_variant(base_name, variant_label)
 
                         if existing:
                             if _product_changed(existing, product_data):
@@ -350,6 +353,15 @@ def fetch_products_from_all_companies():
                             else:
                                 logger.info(
                                     f"  [UNCHANGED] '{display_name}' (SQLite ID: {existing['id']})"
+                                )
+                            # Remove any stale duplicate with same master+variant but different name
+                            # (e.g. old CYL row lingering after type was corrected to CON)
+                            stale = db.product_exists_by_master_variant(base_name, variant_label)
+                            if stale and stale['id'] != existing['id']:
+                                db.delete_product(stale['id'])
+                                logger.info(
+                                    f"  [DEDUP-REMOVED] stale '{dict(stale).get('name')}' "
+                                    f"(ID {stale['id']}) — kept ID {existing['id']}"
                                 )
                         else:
                             db.insert_product(product_data)

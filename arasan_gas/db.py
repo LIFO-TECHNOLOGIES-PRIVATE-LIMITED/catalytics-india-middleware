@@ -490,6 +490,15 @@ class Database:
         )
         return result if result else None
 
+    def product_exists_by_master_variant(self, product_master_name, variant_name):
+        """Find a product by master name + variant regardless of product_type_code.
+        Used to detect same product saved with wrong type (e.g. CYL→CON rename)."""
+        result = self.query(
+            "SELECT * FROM products WHERE product_master_name = ? AND variant_name = ? LIMIT 1",
+            (product_master_name, variant_name)
+        )
+        return result if result else None
+
     def insert_product(self, product_data):
         """Insert new product with canonical name for uniqueness checking"""
         cursor = self.execute("""
@@ -555,6 +564,10 @@ class Database:
             product_data.get('sgst_rate', 0.0),
             product_id,
         ))
+
+    def delete_product(self, product_id):
+        """Delete a product row by ID."""
+        self.execute("DELETE FROM products WHERE id = ?", (product_id,))
 
     def get_unsynced_products(self, limit=None):
         """Get products that haven't been synced"""

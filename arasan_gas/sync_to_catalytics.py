@@ -1550,6 +1550,35 @@ class CatalyticsSyncer:
             if isinstance(si_json, dict):
                 stock_items_map = si_json
 
+        # Enrich stock_items_map with product type info from DB (for old invoices or missing fields)
+        for _sname, _sdata in list(stock_items_map.items()):
+            if not isinstance(_sdata, dict):
+                continue
+            if _sdata.get('product_type_code') and _sdata.get('variant_name'):
+                continue  # already enriched
+            _lookup_name = (_sdata.get('NAME') or _sdata.get('stock_item_name') or _sname or '').strip()
+            if not _lookup_name:
+                continue
+            try:
+                _norm = _lookup_name.lower().replace(' ', '')
+                _db_row = self.db.query(
+                    "SELECT product_type_code, product_type_name, variant_name, unit_name "
+                    "FROM products WHERE lower(replace(name, ' ', '')) = ? LIMIT 1",
+                    (_norm,)
+                )
+                if _db_row:
+                    _db = dict(_db_row)
+                    if _db.get('product_type_code'):
+                        _sdata['product_type_code'] = _db['product_type_code']
+                    if _db.get('product_type_name'):
+                        _sdata['product_type_name'] = _db['product_type_name']
+                    if _db.get('variant_name'):
+                        _sdata['variant_name'] = _db['variant_name']
+                    if _db.get('unit_name'):
+                        _sdata['unit_name'] = _db['unit_name']
+            except Exception:
+                pass
+
         # Set filling station ID in voucher
         filling_station_id = self._get_filling_station_id(invoice)
         if filling_station_id:
