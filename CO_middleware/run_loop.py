@@ -9,7 +9,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import config as cfg
-from fetch_tally import build_config as build_fetch_config, run_once as fetch_once
+from fetch_invoices import build_config as build_fetch_config, run_once as fetch_once
 from sync_catalytics import build_config as build_sync_config, run_once as sync_once
 from logging_utils import setup_logging
 

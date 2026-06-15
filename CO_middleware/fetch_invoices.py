@@ -122,20 +122,22 @@ def _extract_tally_guid(voucher: Dict[str, Any]) -> str:
     return ""
 
 
-DEFAULT_DC_PAST_DAYS = 1
+DEFAULT_DC_PAST_DAYS = 3
 DEFAULT_DC_FUTURE_DAYS = 1
 
 
 def _default_date_range(days_back: Optional[int] = None) -> Tuple[str, str]:
     now = datetime.now()
-    # Dynamic 3-day window: yesterday to tomorrow.
-    # Tally Day Book only returns data for the currently open date.
-    # By covering yesterday+today+tomorrow, whichever date is open in
-    # Tally will match and its DCs will be fetched.
-    # days_back > 1 expands the past side further.
-    effective_days_back = max(days_back, DEFAULT_DC_PAST_DAYS) if days_back is not None else DEFAULT_DC_PAST_DAYS
-    from_dt = now - timedelta(days=effective_days_back)
-    to_dt = now + timedelta(days=DEFAULT_DC_FUTURE_DAYS)
+    # DC_PAST_DAYS / DC_FUTURE_DAYS control the fetch window.
+    # TALLY_DAYS_BACK (days_back param) overrides DC_PAST_DAYS if set.
+    from config import get_env_int
+    if days_back is not None and days_back > 0:
+        past = days_back
+    else:
+        past = get_env_int("DC_PAST_DAYS", DEFAULT_DC_PAST_DAYS)
+    future = get_env_int("DC_FUTURE_DAYS", DEFAULT_DC_FUTURE_DAYS)
+    from_dt = now - timedelta(days=past)
+    to_dt = now + timedelta(days=future)
     return from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")
 
 def _normalize_name_key(value: str) -> str:
@@ -341,7 +343,8 @@ def _ensure_liquid_product(
         )
 
         # --- 3. Sync to Catalytics server ---
-        endpoint = api_base_url.rstrip('/') + '/tally-product_name-payload/'
+        _base = api_base_url.rstrip('/')
+        endpoint = (_base + '/tally-product_name-payload/') if _base.endswith('/import') else (_base + '/import/tally-product_name-payload/')
         payload = {
             'entity_id': entity_id,
             'stock_item_name': canonical_name,
@@ -567,7 +570,8 @@ def _ensure_product(
         )
 
         # Sync to Catalytics server
-        endpoint = api_base_url.rstrip('/') + '/tally-product_name-payload/'
+        _base = api_base_url.rstrip('/')
+        endpoint = (_base + '/tally-product_name-payload/') if _base.endswith('/import') else (_base + '/import/tally-product_name-payload/')
         payload = {
             'entity_id': entity_id,
             'stock_item_name': canonical_name,
@@ -669,7 +673,8 @@ def _sync_customer_now(
     """Try immediate customer sync; returns (ok, response_json, error_msg)."""
     if not api_base_url:
         return False, None, "CATALYTICS_API_BASE_URL not set"
-    endpoint = api_base_url.rstrip('/') + '/tally-customer-payload/'
+    _base = api_base_url.rstrip('/')
+    endpoint = (_base + '/tally-customer-payload/') if _base.endswith('/import') else (_base + '/import/tally-customer-payload/')
     payload = {"entity_id": entity_id, "ledger": ledger}
     if company_name:
         payload["company_name"] = company_name
@@ -978,19 +983,18 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
 
         voucher_date = voucher.get("DATE") or ""
         party_name = voucher.get("PARTYLEDGERNAME") or voucher.get("PARTYNAME") or ""
+        # Only process DCs that have OTHERREFERENCE set.
+        # PONUMBER / REFERENCE / VOUCHERREFERENCE are NOT accepted as substitutes.
         reference = (
             voucher.get("OTHERREFERENCE")
-            or voucher.get("PONUMBER")
-            or voucher.get("REFERENCE")
-            or voucher.get("VOUCHERREFERENCE")
+            or voucher.get("BASICORDERREF")
             or ""
         ).strip()
 
-        # Restrict to vouchers that carry a usable other/reference value.
         if not reference:
             skipped += 1
             skipped_ref_filter += 1
-            logger.info("Skipping DC %s (%s): empty OTHERREFERENCE/REFERENCE", dc_no, party_name or "?")
+            logger.info("Skipping DC %s (%s): OTHERREFERENCE is empty", dc_no, party_name or "?")
             continue
 
         # --- Liquid product pre-creation (BEFORE any validation so it always runs) ---
@@ -1489,7 +1493,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
 
 
