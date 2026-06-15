@@ -46,6 +46,40 @@ def _attach_invoice_fetch_file_handler():
 
 _attach_invoice_fetch_file_handler()
 
+# Default date range constants (same as CO_middleware)
+DEFAULT_DC_PAST_DAYS = 3
+DEFAULT_DC_FUTURE_DAYS = 1
+
+
+def _get_env_int(name, default):
+    """Read an environment variable as int, falling back to *default*."""
+    import os
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def _default_date_range(days_back=None):
+    """Return (from_date, to_date) as YYYYMMDD strings.
+
+    Uses DC_PAST_DAYS / DC_FUTURE_DAYS env vars (same logic as CO_middleware).
+    ``days_back`` parameter overrides DC_PAST_DAYS when provided.
+    """
+    now = datetime.now()
+    if days_back is not None and days_back > 0:
+        past = days_back
+    else:
+        past = _get_env_int("DC_PAST_DAYS", DEFAULT_DC_PAST_DAYS)
+    future = _get_env_int("DC_FUTURE_DAYS", DEFAULT_DC_FUTURE_DAYS)
+    from_dt = now - timedelta(days=past)
+    to_dt = now + timedelta(days=future)
+    return from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")
+
+
 def _attach_invoice_fetch_error_handler():
     """Log invoice fetch errors to a dedicated file."""
     log_path = Path(BASE_DIR) / 'logs' / 'invoice_fetch_errors.log'
@@ -1195,19 +1229,17 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
     except AttributeError:
         pass
 
-    # If no dates provided, use Day Book logic (Yesterday to Tomorrow) as requested
-    if not from_date and not to_date:
-        today_dt = datetime.now()
-        from_date = (today_dt - timedelta(days=1)).strftime('%Y%m%d')
-        to_date = (today_dt + timedelta(days=1)).strftime('%Y%m%d')
-        logger.info(f"Using Day Book fetch logic (Reference: {today_dt.strftime('%Y%m%d')})")
-        logger.info(f" -> From Date: {from_date} (Yesterday)")
-        logger.info(f" -> To Date:   {to_date} (Tomorrow)")
+    # Date range logic (same as CO_middleware):
+    #   - If both from_date & to_date supplied → use them (user-specified range)
+    #   - Otherwise → use _default_date_range() with DC_PAST_DAYS / DC_FUTURE_DAYS
+    user_specified_range = bool(from_date and to_date)
+    if user_specified_range:
+        logger.info(f"Using user-specified date range {from_date} to {to_date}")
     else:
-        if not from_date:
-            from_date = config.INVOICE_FETCH_START_DATE or datetime.now().strftime('%Y%m%d')
-        if not to_date:
-            to_date = '20991231'
+        from_date, to_date = _default_date_range()
+        logger.info(f"Using default date range {from_date} to {to_date} "
+                     f"(DC_PAST_DAYS={_get_env_int('DC_PAST_DAYS', DEFAULT_DC_PAST_DAYS)}, "
+                     f"DC_FUTURE_DAYS={_get_env_int('DC_FUTURE_DAYS', DEFAULT_DC_FUTURE_DAYS)})")
 
     db = Database(config.SQLITE_DB_PATH)
     tally = TallyClient(config.TALLY_URL)

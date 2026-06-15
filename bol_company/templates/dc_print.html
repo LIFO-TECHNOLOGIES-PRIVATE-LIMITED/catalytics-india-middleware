@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Delivery Challan - {{ voucher_no }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            font-size: 14px;
+            background: #f0f0f0;
+            color: #111;
+        }
+
+        .page {
+            background: #fff;
+            max-width: 850px;
+            margin: 20px auto;
+            padding: 32px;
+            position: relative;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+        }
+
+        /* ── QR code ── */
+        .qr-section {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            text-align: center;
+            width: 110px;
+        }
+        .qr-section img {
+            width: 100px;
+            height: 100px;
+            display: block;
+        }
+        .qr-section small {
+            display: block;
+            font-size: 9px;
+            color: #555;
+            margin-top: 3px;
+            word-break: break-all;
+        }
+
+        /* ── offline badge ── */
+        .offline-badge {
+            position: absolute;
+            top: 126px;
+            right: 16px;
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            color: #856404;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 700;
+        }
+
+        /* ── print button bar ── */
+        .no-print {
+            display: flex;
+            justify-content: flex-start;
+            gap: 8px;
+            margin-bottom: 20px;
+        }
+        .no-print button {
+            padding: 7px 18px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .btn-print { background: #2563eb; color: #fff; }
+        .btn-close  { background: #6b7280; color: #fff; }
+
+        /* ── title ── */
+        .challan-title { margin-bottom: 20px; }
+        .challan-title h2 { font-size: 26px; font-weight: 700; }
+        .challan-title h5 { font-size: 14px; font-weight: 600; margin-top: 2px; }
+
+        /* ── two-column address block ── */
+        .address-row {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .address-col { flex: 1; }
+        .address-col.right { text-align: right; }
+        .address-col h3 {
+            font-size: 15px;
+            font-weight: 700;
+            text-transform: uppercase;
+            margin-bottom: 2px;
+        }
+        .address-col p { margin-bottom: 2px; font-size: 13px; }
+        .address-col .label { font-size: 12px; color: #555; margin-bottom: 4px; }
+
+        /* ── info rows ── */
+        .info-row {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+        .info-row .cell { flex: 1; }
+        .info-label { font-weight: 600; }
+
+        /* ── divider ── */
+        hr { border: none; border-top: 1px solid #ccc; margin: 14px 0; }
+
+        /* ── table ── */
+        .dc-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 16px;
+            font-size: 13px;
+        }
+        .dc-table th, .dc-table td {
+            border: 1px solid #ccc;
+            padding: 8px 10px;
+            vertical-align: middle;
+        }
+        .dc-table thead th {
+            background: #f3f4f6;
+            font-weight: 700;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+        .dc-table .text-center { text-align: center; }
+        .dc-table .text-right  { text-align: right; }
+
+        /* ── signatures ── */
+        .signature-row {
+            display: flex;
+            gap: 32px;
+            margin-top: 48px;
+        }
+        .signature-cell {
+            flex: 1;
+            text-align: center;
+        }
+        .signature-cell .sig-label { font-weight: 600; font-size: 13px; }
+        .signature-box {
+            height: 70px;
+            border: 1px solid #ccc;
+            margin-top: 10px;
+        }
+
+        /* ── print styles ── */
+        @media print {
+            body { background: #fff; }
+            .page { margin: 0; box-shadow: none; padding: 24px; }
+            .no-print { display: none !important; }
+            .offline-badge { display: none; }
+        }
+    </style>
+</head>
+<body onload="window.print()">
+<div class="page">
+
+    <!-- QR Code -->
+    {% if qr_data_uri %}
+    <div class="qr-section">
+        <img src="{{ qr_data_uri }}" alt="QR Code">
+        <small>{{ voucher_no }}</small>
+    </div>
+    {% endif %}
+    <div class="offline-badge">OFFLINE PRINT</div>
+
+    <!-- Print / Close buttons -->
+    <div class="no-print">
+        <button class="btn-print" onclick="window.print()">&#128438; Print</button>
+        <button class="btn-close"  onclick="window.close()">Close</button>
+    </div>
+
+    <!-- Title -->
+    <div class="challan-title">
+        <h2>Delivery Challan</h2>
+        <h5>DC No: {{ voucher_no }}</h5>
+    </div>
+
+    <hr>
+
+    <!-- From / To -->
+    <div class="address-row">
+        <div class="address-col">
+            <h3>{{ entity_name }}</h3>
+            {% if filling_station %}<p>Filling Station: <strong>{{ filling_station }}</strong></p>{% endif %}
+            {% if tally_company %}<p>{{ tally_company }}</p>{% endif %}
+        </div>
+        <div class="address-col right">
+            <p class="label">Deliver To</p>
+            <h3>{{ customer_name }}</h3>
+            {% if customer_address %}<p>{{ customer_address }}</p>{% endif %}
+            {% if customer_city or customer_state %}
+            <p>{{ customer_city }}{% if customer_city and customer_state %}, {% endif %}{{ customer_state }}{% if customer_pincode %} - {{ customer_pincode }}{% endif %}</p>
+            {% endif %}
+            {% if customer_gstin %}<p>GSTIN: {{ customer_gstin }}</p>{% endif %}
+            {% if customer_phone %}<p>Phone: {{ customer_phone }}</p>{% endif %}
+        </div>
+    </div>
+
+    <hr>
+
+    <!-- DC info -->
+    <div class="info-row">
+        <div class="cell"><span class="info-label">DC No:</span> {{ voucher_no }}</div>
+        <div class="cell"><span class="info-label">Delivery Date:</span> {{ voucher_date }}</div>
+    </div>
+    {% if vehicle_no or driver_name %}
+    <div class="info-row">
+        {% if vehicle_no %}<div class="cell"><span class="info-label">Vehicle No:</span> {{ vehicle_no }}</div>{% endif %}
+        {% if driver_name %}<div class="cell"><span class="info-label">Driver Name:</span> {{ driver_name }}</div>{% endif %}
+    </div>
+    {% endif %}
+
+    <!-- Items table -->
+    <table class="dc-table">
+        <thead>
+            <tr>
+                <th style="width:50px">S.No.</th>
+                <th>Product Details</th>
+                <th style="width:110px">HSN / SAC</th>
+                <th style="width:90px" class="text-center">Quantity</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in items %}
+            <tr>
+                <td class="text-center">{{ loop.index }}</td>
+                <td>{{ item.item_name }}</td>
+                <td class="text-center">{{ item.hsn_code or '-' }}</td>
+                <td class="text-center">{{ item.quantity | int }}</td>
+            </tr>
+            {% endfor %}
+            <tr>
+                <td colspan="3" class="text-right"><strong>Total Quantity</strong></td>
+                <td class="text-center"><strong>{{ total_quantity | int }}</strong></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- Signatures -->
+    <div class="signature-row">
+        <div class="signature-cell">
+            <div class="sig-label">Authorized Signature</div>
+            <div class="signature-box"></div>
+        </div>
+        <div class="signature-cell">
+            <div class="sig-label">Customer Signature</div>
+            <div class="signature-box"></div>
+        </div>
+    </div>
+
+</div>
+</body>
+</html>

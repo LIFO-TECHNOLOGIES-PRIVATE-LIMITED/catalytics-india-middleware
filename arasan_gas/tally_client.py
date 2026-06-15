@@ -377,24 +377,59 @@ def get_sundry_debtors(company_name: str, url: Optional[str] = None, group_name:
     resp = send_request(xml, url)
     return parse_ledgers(resp)
 
+def get_all_customer_ledgers(company_name: str, url: Optional[str] = None):
+    """Fetch ALL ledgers from Tally (no group filter).
+    Returns every ledger with full fields (GUID, address, GST, etc.)."""
+    from xml.sax.saxutils import escape as xml_escape
+    safe_company = xml_escape(company_name)
+    xml = f"""
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>AllCustomerLedgers</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVCURRENTCOMPANY>{safe_company}</SVCURRENTCOMPANY>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION ISMODIFY="No" ISFIXED="No" ISINITIALIZE="Yes" ISOPTION="No" ISINTERNAL="No" NAME="AllCustomerLedgers">
+            <TYPE>Ledger</TYPE>
+            <NATIVEMETHOD>Name</NATIVEMETHOD>
+            <NATIVEMETHOD>GUID</NATIVEMETHOD>
+            <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>Parent</NATIVEMETHOD>
+            <NATIVEMETHOD>Mobile</NATIVEMETHOD>
+            <NATIVEMETHOD>Email</NATIVEMETHOD>
+            <NATIVEMETHOD>PANNumber</NATIVEMETHOD>
+            <NATIVEMETHOD>IncomeTaxNumber</NATIVEMETHOD>
+            <NATIVEMETHOD>GSTRegistration</NATIVEMETHOD>
+            <NATIVEMETHOD>PartyGSTIN</NATIVEMETHOD>
+            <NATIVEMETHOD>GSTIN</NATIVEMETHOD>
+            <NATIVEMETHOD>Address</NATIVEMETHOD>
+            <NATIVEMETHOD>StateName</NATIVEMETHOD>
+            <NATIVEMETHOD>PinCode</NATIVEMETHOD>
+            <NATIVEMETHOD>CountryName</NATIVEMETHOD>
+            <NATIVEMETHOD>LedgerMobile</NATIVEMETHOD>
+            <NATIVEMETHOD>LedgerEmail</NATIVEMETHOD>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>
+"""
+    resp = send_request(xml, url)
+    return parse_ledgers(resp)
+
+
 def get_customer_ledgers(company_name: str, url: Optional[str] = None, group_names: Optional[List[str]] = None):
-    """Fetch customer ledgers from one or more Tally groups."""
-    groups = [g.strip() for g in (group_names or []) if g and g.strip()]
-    if not groups:
-        groups = ["Sundry Debtors"]
-
-    seen = {}
-    for group in groups:
-        ledgers = get_sundry_debtors(company_name, url, group_name=group)
-        for ledger in ledgers:
-            key = ledger.get("GUID") or ledger.get("NAME") or ""
-            if not key:
-                continue
-            if key in seen:
-                continue
-            seen[key] = ledger
-
-    return list(seen.values())
+    """Fetch customer ledgers from Tally — all groups, no filter."""
+    return get_all_customer_ledgers(company_name, url)
 
 
 def get_ledgers(company_name: str, url: Optional[str] = None):
@@ -1462,9 +1497,8 @@ def get_delivery_notes(company_name: str, url: Optional[str] = None, from_date: 
 
 def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: str = "20240101", to_date: str = "20991231") -> List[Dict]:
     """
-    Fetch sales/invoice vouchers (including custom types like IO-) via a broad Voucher
-    Collection, then normalize to middleware invoice schema. This bypasses prior
-    parse issues with Voucher Register exports.
+    Fetch all sales and delivery invoices for a company within a date range.
+    Uses Day Book report (not Voucher Register) for reliable date filtering.
     """
     def _pqty(val):
         try:
@@ -1483,29 +1517,14 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
         except Exception:
             return 0.0
 
-    # Dynamically fetch all voucher types whose parent type is "Sales" from
-    # Tally master data.  This is a lightweight master query (not a voucher
-    # data collection) so it won't crash Tally.  It ensures custom Sales
-    # sub-types (DA-, IO, MO-, LPG-, CO2-, IOP-, NIT-, ARG-, etc.) are
-    # automatically included without hardcoding each name.
-    allowed_sales_types: set = set()
-    try:
-        sales_types = get_sales_voucher_types(company_name, url)
-        allowed_sales_types = {t.lower() for t in sales_types}
-        logger.info("[get_sales_invoices] Company='%s' Sales voucher types from Tally: %s", company_name, sales_types)
-    except Exception:
-        logger.warning("[get_sales_invoices] Could not fetch voucher types for '%s', falling back to name-pattern matching", company_name)
-
-    # Fallback exact names in case the dynamic query fails
-    allowed_exact = {'sales'}
-    logger.info("[get_sales_invoices] Company='%s' filtering by Sales parent type + name patterns (sale/invoice/delivery/challan)", company_name)
-
     from xml.sax.saxutils import escape as xml_escape
     safe_company = xml_escape(company_name)
-    # Use Voucher Register export — Tally's native report that reliably
-    # respects SVFROMDATE/SVTODATE date ranges. Collection queries ignore
-    # these dates and return ALL vouchers, which crashes Tally.
-    report_xml = f"""
+
+    # Fetch all vouchers from Day Book (no VOUCHERTYPENAME filter).
+    # Arasan companies use many custom voucher types under Sales parent
+    # (IOP-, IO-, ARG-, CO2-, DA, LPG, MO-, NIT-, etc.) — filtering by
+    # VOUCHERTYPENAME=Sales misses them all.  Filter in Python instead.
+    xml = f"""
 <ENVELOPE>
   <HEADER>
     <TALLYREQUEST>Export Data</TALLYREQUEST>
@@ -1513,76 +1532,48 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
   <BODY>
     <EXPORTDATA>
       <REQUESTDESC>
-        <REPORTNAME>Voucher Register</REPORTNAME>
         <STATICVARIABLES>
           <SVCURRENTCOMPANY>{safe_company}</SVCURRENTCOMPANY>
           <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
           <SVFROMDATE>{from_date}</SVFROMDATE>
           <SVTODATE>{to_date}</SVTODATE>
         </STATICVARIABLES>
+        <REPORTNAME>Day Book</REPORTNAME>
       </REQUESTDESC>
     </EXPORTDATA>
   </BODY>
 </ENVELOPE>
 """
     try:
-        resp = send_request(report_xml, url, timeout=120)
-        logger.info("[get_sales_invoices] Got response for '%s' (%d chars)", company_name, len(resp or ''))
-        # Re-use parse_delivery_notes which handles all voucher fields
-        all_vouchers = parse_delivery_notes(resp)
-        logger.info("[get_sales_invoices] Found %d raw vouchers for '%s'", len(all_vouchers), company_name)
+        resp = send_request(xml, url, timeout=300)
+        raw_vouchers = parse_delivery_notes(resp)
+        logger.info("[get_sales_invoices] Company='%s' got %d vouchers from Day Book", company_name, len(raw_vouchers))
 
-        # Log all voucher types found (for debugging missing invoices)
-        type_counts = {}
-        for data in all_vouchers:
-            vt = (data.get('VOUCHERTYPENAME') or data.get('VOUCHERTYPE')
-                  or data.get('VCHTYPE') or '').strip()
-            type_counts[vt] = type_counts.get(vt, 0) + 1
-        if type_counts:
-            logger.info("[get_sales_invoices] Voucher types found for '%s': %s", company_name, dict(type_counts))
-        else:
-            logger.warning("[get_sales_invoices] No voucher types found for '%s' — company may not be loaded in Tally", company_name)
+        normalized = []
+        for v in raw_vouchers:
+            # Filter: accept Sales type, invoice-flagged vouchers (IOP-, IO-, etc.),
+            # or any voucher with inventory items (all sales-parent types have stock entries)
+            vtype = (v.get('VOUCHERTYPENAME') or v.get('VOUCHERTYPE') or v.get('VCHTYPE') or '').strip().lower()
+            is_invoice = (v.get('ISINVOICE') or '').strip().lower() == 'yes'
+            has_inventory = bool(v.get('INVENTORY'))
 
-        # Filter to sales and delivery type vouchers
-        vouchers: List[Dict] = []
-        for data in all_vouchers:
-            vt = (data.get('VOUCHERTYPENAME') or data.get('VOUCHERTYPE')
-                  or data.get('VCHTYPE') or '').strip()
-            vt_lower = vt.lower()
-            if not (
-                ('sale' in vt_lower)
-                or ('invoice' in vt_lower)
-                or ('delivery' in vt_lower)
-                or ('challan' in vt_lower)
-                or (vt_lower in allowed_exact)
-                or (allowed_sales_types and vt_lower in allowed_sales_types)
-            ):
+            if 'sale' not in vtype and not is_invoice and not has_inventory:
                 continue
-            vouchers.append(data)
 
-        normalized: List[Dict] = []
-        for v in vouchers:
-            vno = (v.get('VOUCHERNUMBER') or v.get('VOUCHERNO') or v.get('VCHNUMBER') or v.get('DSPVCHNUMBER') or v.get('DSPVCHNO') or v.get('NUMBER') or '').strip()
+            vno = (v.get('VOUCHERNUMBER') or v.get('VCHNUMBER') or v.get('VOUCHERNO') or v.get('DSPVCHNUMBER') or v.get('DSPVCHNO') or v.get('NUMBER') or '').strip()
             if not vno:
-                vno = (v.get('VCHKEY') or v.get('GUID') or f"VCH-{len(normalized)+1}")
+                vno = (v.get('VCHKEY') or v.get('GUID') or f"AUTO-{len(normalized)+1}")
+
+            # Party detection - handle entries if top-level party name is missing
             cust = (v.get('PARTYLEDGERNAME') or v.get('PARTYNAME') or v.get('BASICBUYERNAME') or v.get('BASICBUYERPARTYNAME') or '').strip()
             if not cust and v.get('LEDGERENTRIES'):
-                # Find the customer ledger (skip tax ledgers like CGST, SGST, IGST, GST, Output GST, etc.)
-                for ledger_entry in v.get('LEDGERENTRIES', []):
-                    ledger_name = (ledger_entry.get('LEDGERNAME') or '').strip()
-                    ledger_name_upper = ledger_name.upper()
-                    # Skip tax-related ledgers
-                    if any(tax_keyword in ledger_name_upper for tax_keyword in ['CGST', 'SGST', 'IGST', 'GST', 'TAX', 'CESS', 'DUTY', 'OUTPUT', 'INPUT']):
-                        continue
-                    # Skip numeric-only names (like "7")
-                    if ledger_name.isdigit():
-                        continue
-                    # This is likely the customer ledger
-                    cust = ledger_name
-                    break
-                if not cust:
-                    cust = 'UNKNOWN'
-            inv: Dict[str, any] = {
+                for le in v.get('LEDGERENTRIES'):
+                    l_name = (le.get('LEDGERNAME') or '').upper()
+                    if not any(x in l_name for x in ['CGST', 'SGST', 'IGST', 'GST', 'TAX', 'CESS', 'DUTY', 'CASH', 'ROUND', 'OUTPUT', 'INPUT']):
+                        cust = le.get('LEDGERNAME')
+                        break
+
+            inv = {
                 'guid': v.get('GUID', ''),
                 'voucher_no': vno,
                 'voucher_date': v.get('DATE', '') or v.get('VOUCHERDATE', ''),
@@ -1595,6 +1586,7 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
                 'items': [],
                 'raw_voucher': dict(v),
             }
+
             for it in v.get('INVENTORY', []) or []:
                 inv['items'].append({
                     'item_name': it.get('STOCKITEMNAME', ''),
@@ -1602,6 +1594,7 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
                     'rate': _prate(it.get('RATE', '0')),
                     'amount': _prate(it.get('AMOUNT', '0')),
                 })
+
             for le in v.get('LEDGERENTRIES', []) or []:
                 name = (le.get('LEDGERNAME') or '').upper()
                 amt = _prate(le.get('AMOUNT', '0'))
@@ -1609,13 +1602,16 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
                     inv['tax_amount'] += abs(amt)
                 elif amt:
                     inv['total_amount'] = max(inv['total_amount'], abs(amt))
+
             if inv['total_amount'] == 0.0 and inv['items']:
-                inv['total_amount'] = sum(abs(x.get('amount',0)) for x in inv['items'])
+                inv['total_amount'] = sum(abs(x.get('amount', 0)) for x in inv['items'])
+
             normalized.append(inv)
-        logger.info("[get_sales_invoices] Returning %d normalized invoices for '%s'", len(normalized), company_name)
+
+        logger.info("[get_sales_invoices] Normalized %d Sales/Delivery invoices for '%s'", len(normalized), company_name)
         return normalized
     except Exception:
-        logger.exception("[get_sales_invoices] FAILED for company '%s' — this usually means the company is not loaded in Tally or Tally timed out", company_name)
+        logger.exception("[get_sales_invoices] FAILED for company '%s'", company_name)
         return []
 
 # ============================================================================
@@ -1633,9 +1629,7 @@ class TallyClient:
     
     def get_customers(self, company_name: str) -> List[Dict]:
         """
-        Fetch customers from Tally company.
-        Defaults to Sundry Debtors, but can include multiple groups via
-        CUSTOMER_LEDGER_GROUPS env var (comma-separated).
+        Fetch ALL customers (all ledger groups) from Tally company.
 
         Args:
             company_name: Tally company name
@@ -1643,10 +1637,7 @@ class TallyClient:
         Returns:
             List of customer dictionaries with normalized fields
         """
-        import os
-        groups_env = os.getenv("CUSTOMER_LEDGER_GROUPS", "Sundry Debtors")
-        group_names = [g.strip() for g in groups_env.replace(";", ",").split(",") if g.strip()]
-        ledgers = get_customer_ledgers(company_name, self.url, group_names)
+        ledgers = get_all_customer_ledgers(company_name, self.url)
 
         customers = []
         for ledger in ledgers:

@@ -1607,12 +1607,13 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
                 vno = (v.get('GUID') or f"AUTO-{len(normalized)+1}")
             
             # Party detection - handle entries if top-level party name is missing
-            cust = (v.get('PARTYLEDGERNAME') or v.get('PARTYNAME') or '').strip()
+            # Collapse multiple spaces so names match fetch_customers normalisation.
+            cust = ' '.join((v.get('PARTYLEDGERNAME') or v.get('PARTYNAME') or '').split())
             if not cust and v.get('LEDGERENTRIES'):
                 for le in v.get('LEDGERENTRIES'):
                     l_name = (le.get('LEDGERNAME') or '').upper()
                     if not any(x in l_name for x in ['GST', 'TAX', 'CESS', 'DUTY', 'CASH', 'ROUND']):
-                        cust = le.get('LEDGERNAME')
+                        cust = ' '.join((le.get('LEDGERNAME') or '').split())
                         break
             
             inv = {
@@ -1823,7 +1824,7 @@ class TallyClient:
                 'guid': voucher.get("GUID", ""),
                 'voucher_no': voucher.get("VOUCHERNUMBER", "") or voucher.get("VOUCHERNO", "") or voucher.get("VCHNUMBER", "") or voucher.get("VCHNO", "") or voucher.get("NUMBER", ""),
                 'voucher_date': voucher.get("DATE", "") or voucher.get("VOUCHERDATE", "") or voucher.get("DSPVCHDATE", ""),
-                'customer_name': voucher.get("PARTYLEDGERNAME", "") or voucher.get("PARTYNAME", ""),
+                'customer_name': ' '.join((voucher.get("PARTYLEDGERNAME", "") or voucher.get("PARTYNAME", "")).split()),
                 'customer_guid': "",  # Not in voucher data
                 'billing_address': ", ".join(voucher.get("ADDRESSES", [])) if voucher.get("ADDRESSES") else "",
                 'delivery_address': voucher.get("CONSIGNEE", {}).get("ADDRESS", "") if voucher.get("CONSIGNEE") else "",

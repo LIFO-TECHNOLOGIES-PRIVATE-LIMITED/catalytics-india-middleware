@@ -1146,6 +1146,15 @@
             background: #d1fae5;
         }
 
+        .row-action-btn.print {
+            border-color: #f59e0b;
+            color: #f59e0b;
+        }
+
+        .row-action-btn.print:hover {
+            background: #fef3c7;
+        }
+
         .row-action-btn:disabled {
             opacity: 0.4;
             cursor: not-allowed;
@@ -1766,7 +1775,7 @@
                     <div class="progress-fill" id="invoices-progress" style="width: 0%"></div>
                 </div>
                 <div style="font-size: 11px; color: #999; margin-top: 8px;" id="invoices-last-sync">Last sync: -</div>
-                <div id="invoices-by-company" style="margin-top: 8px; font-size: 11px; color: #666; line-height: 1.8;">
+                <div id="invoices-by-company" style="display:none;">
                 </div>
             </div>
 
@@ -4071,6 +4080,7 @@
                         <button class="row-action-btn view" onclick="showInvoiceDetail(${inv.id})">View</button>
                           <button class="row-action-btn refetch" onclick="refetchRecord('invoices', ${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Refetch</button>
                           <button class="row-action-btn resync" onclick="resyncRecord('invoices', ${inv.id}, '${inv.voucher_no.replace(/'/g, "\\'")}')">Resync</button>
+                          <button class="row-action-btn print" onclick="window.open('/print/dc/${encodeURIComponent(inv.voucher_no)}', '_blank')" title="Print DC offline">Print DC</button>
                     </td>
                 </tr>
             `).join('');

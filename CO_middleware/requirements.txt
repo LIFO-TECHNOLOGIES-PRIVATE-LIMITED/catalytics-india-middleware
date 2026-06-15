@@ -4,3 +4,6 @@ requests==2.32.3
 python-dotenv==1.0.0
 psycopg2-binary==2.9.9
 
+# QR code generation (offline DC print)
+qrcode[pil]==7.4.2
+

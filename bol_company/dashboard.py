@@ -1413,17 +1413,6 @@ def resync_invoice(invoice_id):
         customer_name = row[3]
         catalytics_dc_id = row[4]
 
-        # Check if DC is accepted in Catalytics (order_status 1 or 2 = accepted)
-        if catalytics_dc_id:
-            order_status, pg_err = _check_dc_order_status(catalytics_dc_id)
-            if order_status is not None and order_status in (1, 2):
-                conn.close()
-                status_name = 'Accepted' if order_status == 1 else 'Processed'
-                return jsonify({
-                    'success': False,
-                    'error': f'Cannot resync Invoice #{voucher_no} Ã¢â‚¬â€ DC #{catalytics_dc_id} is already {status_name} (order_status={order_status}) in Catalytics.'
-                }), 400
-
         # Reset invoice for resync (including enhanced fields)
         cursor.execute('''
             UPDATE invoices
@@ -1565,11 +1554,19 @@ def refetch_customer(customer_id):
                 conn.close()
                 return jsonify({'success': False, 'error': f'Customer "{customer_name}" not found in Tally'}), 404
 
+            # Normalize name from Tally (collapse spaces)
+            refreshed_name = ' '.join((ledger_data.get('name') or customer_name).split())
+
             # Prepare update data with all customer fields
             customer_data = {
-                'tally_guid': ledger_data.get('guid'),
-                'gstin': ledger_data.get('gstin', ''),
-                'pan': ledger_data.get('pan', ''),
+                'name': refreshed_name,
+                'tally_company': company_name,
+                'tally_guid': (
+                    ledger_data.get('GUID') or ledger_data.get('guid')
+                    or ledger_data.get('MASTERID') or ''
+                ).strip() or None,
+                'gstin': (ledger_data.get('gstin') or ledger_data.get('GSTIN') or '').lstrip(':'),
+                'pan': ledger_data.get('pan') or ledger_data.get('INCOMETAXNUMBER') or '',
                 'address': ledger_data.get('address', ''),
                 'state': ledger_data.get('state', ''),
                 'city': ledger_data.get('city', ''),
@@ -1805,17 +1802,6 @@ def refetch_invoice(invoice_id):
 
         invoice_id, voucher_no, company_name, catalytics_dc_id = row
 
-        # Check if DC is accepted in Catalytics (order_status 1 or 2 = accepted)
-        if catalytics_dc_id:
-            order_status, pg_err = _check_dc_order_status(catalytics_dc_id)
-            if order_status is not None and order_status in (1, 2):
-                conn.close()
-                status_name = 'Accepted' if order_status == 1 else 'Processed'
-                return jsonify({
-                    'success': False,
-                    'error': f'Cannot refetch Invoice #{voucher_no} Ã¢â‚¬â€ DC #{catalytics_dc_id} is already {status_name} (order_status={order_status}) in Catalytics.'
-                }), 400
-
         # Fetch invoices from Tally using the correct TallyClient method
         try:
             from tally_client import TallyClient
@@ -1842,15 +1828,26 @@ def refetch_invoice(invoice_id):
 
             # Update local DB with fresh Tally data
             from db import json_dumps
+
+            # Normalize customer name (collapse spaces) to match fetch_customers
+            customer_name = ' '.join(matched_invoice.get('customer_name', '').split())
             items_json = json_dumps(matched_invoice.get('items', []))
 
             # Build data_json from raw voucher if available
             raw_voucher = matched_invoice.get('raw_voucher', {})
             data_json = json_dumps(raw_voucher) if raw_voucher else None
 
+            # Extract customer GUID from raw voucher LEDGERDATA
+            _ledger_block = raw_voucher.get('LEDGERDATA') or {}
+            customer_guid = ''
+            if isinstance(_ledger_block, dict):
+                customer_guid = (
+                    _ledger_block.get('guid') or _ledger_block.get('GUID')
+                    or _ledger_block.get('MASTERID') or ''
+                ).strip()
+
             # Fetch ledger data for customer
             ledger_data_json = None
-            customer_name = matched_invoice.get('customer_name', '')
             if customer_name:
                 try:
                     from tally_client import get_ledger_by_name
@@ -1860,30 +1857,52 @@ def refetch_invoice(invoice_id):
                 except Exception:
                     pass
 
+            # Build stock_items_json from raw voucher STOCKITEMS
+            stock_items_json = None
+            _stock_block = raw_voucher.get('STOCKITEMS')
+            if _stock_block and isinstance(_stock_block, dict):
+                stock_items_json = json_dumps(_stock_block)
+
+            # Extract godown/filling station from inventory
+            g_name = ''
+            for _inv in (raw_voucher.get('INVENTORY') or []):
+                if isinstance(_inv, dict):
+                    g_name = _inv.get('GODOWNNAME') or ''
+                    if g_name:
+                        break
+
             cursor.execute('''
                 UPDATE invoices
                 SET customer_name = ?,
+                    customer_guid = ?,
                     voucher_date = ?,
                     total_amount = ?,
                     tax_amount = ?,
                     items_json = ?,
                     data_json = ?,
                     ledger_data_json = ?,
+                    stock_items_json = ?,
                     billing_address = ?,
                     delivery_address = ?,
+                    godown_name = ?,
                     is_synced = 0,
+                    sync_attempts = 0,
+                    last_sync_error = NULL,
                     last_updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             ''', (
                 customer_name,
+                customer_guid,
                 matched_invoice.get('voucher_date', ''),
                 matched_invoice.get('total_amount', 0),
                 matched_invoice.get('tax_amount', 0),
                 items_json,
                 data_json,
                 ledger_data_json,
+                stock_items_json,
                 matched_invoice.get('billing_address', ''),
                 matched_invoice.get('delivery_address', ''),
+                g_name,
                 invoice_id
             ))
             conn.commit()
@@ -2595,6 +2614,146 @@ def maybe_register_windows_startup():
         logger.info(f"Windows startup registration ensured for: {app_name}")
     except Exception as exc:
         logger.warning(f"Could not register Windows startup: {exc}")
+
+
+# ==================== OFFLINE DC PRINT ====================
+
+@app.route('/print/dc/<path:voucher_no>')
+def print_dc(voucher_no):
+    """Offline DC print page — renders a printable DC from local SQLite data."""
+    import json as _json
+
+    conn = sqlite3.connect(config.SQLITE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT * FROM invoices WHERE tally_voucher_no = ? ORDER BY first_fetched_at DESC LIMIT 1',
+        (voucher_no,)
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return f'<h3>DC not found: {voucher_no}</h3><p>No local record for this voucher number.</p>', 404
+
+    invoice = dict(row)
+
+    try:
+        items = _json.loads(invoice.get('items_json') or '[]') or []
+    except Exception:
+        items = []
+
+    try:
+        raw_voucher = _json.loads(invoice.get('data_json') or '{}') or {}
+    except Exception:
+        raw_voucher = {}
+
+    vehicle_no = (raw_voucher.get('DISPATCHEDTHROUGH') or raw_voucher.get('MOTORVEHICLENO') or '').strip()
+    driver_name = (raw_voucher.get('BASICSHIPDOCUMENTNO') or raw_voucher.get('DRIVERNAME') or '').strip()
+    filling_station = (invoice.get('filling_station') or invoice.get('godown_name') or invoice.get('location_name') or '').strip()
+
+    customer_gstin = ''
+    customer_phone = ''
+    customer_address = invoice.get('billing_address') or invoice.get('delivery_address') or ''
+    customer_city = ''
+    customer_state = ''
+    customer_pincode = ''
+
+    try:
+        ledger = _json.loads(invoice.get('ledger_data_json') or '{}') or {}
+        customer_gstin = (ledger.get('gstin') or ledger.get('GSTIN') or ledger.get('PARTYGSTIN') or '').lstrip(':')
+        customer_phone = ledger.get('phone') or ledger.get('MOBILE') or ledger.get('LEDGERMOBILE') or ''
+        if not customer_address:
+            addr_list = ledger.get('ADDRESSES') or ledger.get('addresses') or []
+            customer_address = ', '.join(addr_list) if isinstance(addr_list, list) else str(addr_list)
+        customer_state = ledger.get('state') or ledger.get('STATENAME') or ''
+        customer_pincode = ledger.get('pincode') or ledger.get('PINCODE') or ''
+    except Exception:
+        pass
+
+    if not customer_gstin or not customer_phone:
+        cursor.execute(
+            'SELECT gstin, phone, address, city, state, pincode FROM customers WHERE name = ? LIMIT 1',
+            (invoice.get('customer_name', ''),)
+        )
+        cust_row = cursor.fetchone()
+        if cust_row:
+            customer_gstin = customer_gstin or cust_row['gstin'] or ''
+            customer_phone = customer_phone or cust_row['phone'] or ''
+            if not customer_address:
+                customer_address = cust_row['address'] or ''
+            customer_city = customer_city or cust_row['city'] or ''
+            customer_state = customer_state or cust_row['state'] or ''
+            customer_pincode = customer_pincode or cust_row['pincode'] or ''
+
+    conn.close()
+
+    hsn_map = {}
+    try:
+        conn2 = sqlite3.connect(config.SQLITE_DB_PATH)
+        c2 = conn2.cursor()
+        for item in items:
+            nm = (item.get('item_name') or '').strip()
+            if nm and nm not in hsn_map:
+                c2.execute(
+                    'SELECT hsn_code FROM products WHERE lower(replace(name," ","")) = ? LIMIT 1',
+                    (nm.lower().replace(' ', ''),)
+                )
+                r = c2.fetchone()
+                if r and r[0]:
+                    hsn_map[nm] = r[0]
+        conn2.close()
+    except Exception:
+        pass
+
+    for item in items:
+        item['hsn_code'] = hsn_map.get((item.get('item_name') or '').strip(), '')
+
+    raw_date = str(invoice.get('voucher_date') or '').replace('-', '').strip()
+    if len(raw_date) == 8:
+        voucher_date = f"{raw_date[6:8]}-{raw_date[4:6]}-{raw_date[:4]}"
+    else:
+        voucher_date = invoice.get('voucher_date') or '-'
+
+    total_quantity = sum(int(item.get('quantity') or 0) for item in items)
+
+    qr_data_uri = ''
+    try:
+        import qrcode
+        import io as _io
+        import base64 as _b64
+        qr = qrcode.QRCode(version=1, box_size=4, border=2)
+        qr.add_data(voucher_no)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color='black', back_color='white')
+        buf = _io.BytesIO()
+        qr_img.save(buf, format='PNG')
+        qr_data_uri = 'data:image/png;base64,' + _b64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass
+
+    return render_template(
+        'dc_print.html',
+        voucher_no=voucher_no,
+        voucher_date=voucher_date,
+        entity_name=config.ENTITY_NAME,
+        tally_company=invoice.get('tally_company', ''),
+        filling_station=filling_station,
+        customer_name=invoice.get('customer_name', ''),
+        customer_address=customer_address,
+        customer_city=customer_city,
+        customer_state=customer_state,
+        customer_pincode=customer_pincode,
+        customer_gstin=customer_gstin,
+        customer_phone=customer_phone,
+        vehicle_no=vehicle_no,
+        driver_name=driver_name,
+        items=items,
+        total_quantity=total_quantity,
+        qr_data_uri=qr_data_uri,
+    )
+
+
 if __name__ == '__main__':
     # Ensure logs directory exists (next to the exe, not in CWD)
     os.makedirs(str(BASE_DIR / 'logs'), exist_ok=True)

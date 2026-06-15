@@ -2596,6 +2596,171 @@ def maybe_register_windows_startup():
         logger.info(f"Windows startup registration ensured for: {app_name}")
     except Exception as exc:
         logger.warning(f"Could not register Windows startup: {exc}")
+
+
+# ==================== OFFLINE DC PRINT ====================
+
+@app.route('/print/dc/<path:voucher_no>')
+def print_dc(voucher_no):
+    """Offline DC print page — renders a printable DC from local SQLite data."""
+    import json as _json
+
+    conn = sqlite3.connect(config.SQLITE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # Find invoice by voucher number (match across any company)
+    cursor.execute(
+        'SELECT * FROM invoices WHERE tally_voucher_no = ? ORDER BY first_fetched_at DESC LIMIT 1',
+        (voucher_no,)
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return f'<h3>DC not found: {voucher_no}</h3><p>No local record for this voucher number.</p>', 404
+
+    invoice = dict(row)
+
+    # Parse items
+    try:
+        items = _json.loads(invoice.get('items_json') or '[]') or []
+    except Exception:
+        items = []
+
+    # Parse raw voucher data_json for vehicle / driver / filling station
+    try:
+        raw_voucher = _json.loads(invoice.get('data_json') or '{}') or {}
+    except Exception:
+        raw_voucher = {}
+
+    vehicle_no = (
+        raw_voucher.get('DISPATCHEDTHROUGH') or
+        raw_voucher.get('MOTORVEHICLENO') or
+        ''
+    ).strip()
+    driver_name = (
+        raw_voucher.get('BASICSHIPDOCUMENTNO') or
+        raw_voucher.get('DRIVERNAME') or
+        ''
+    ).strip()
+    filling_station = (
+        invoice.get('filling_station') or
+        invoice.get('godown_name') or
+        invoice.get('location_name') or
+        ''
+    ).strip()
+
+    # Parse customer details from ledger_data_json first, fallback to customers table
+    customer_gstin = ''
+    customer_phone = ''
+    customer_address = invoice.get('billing_address') or invoice.get('delivery_address') or ''
+    customer_city = ''
+    customer_state = ''
+    customer_pincode = ''
+
+    try:
+        ledger = _json.loads(invoice.get('ledger_data_json') or '{}') or {}
+        customer_gstin = (ledger.get('gstin') or ledger.get('GSTIN') or ledger.get('PARTYGSTIN') or '').lstrip(':')
+        customer_phone = ledger.get('phone') or ledger.get('MOBILE') or ledger.get('LEDGERMOBILE') or ''
+        if not customer_address:
+            addr_list = ledger.get('ADDRESSES') or ledger.get('addresses') or []
+            customer_address = ', '.join(addr_list) if isinstance(addr_list, list) else str(addr_list)
+        customer_state = ledger.get('state') or ledger.get('STATENAME') or ''
+        customer_pincode = ledger.get('pincode') or ledger.get('PINCODE') or ''
+    except Exception:
+        pass
+
+    # Fall back to customers table
+    if not customer_gstin or not customer_phone:
+        cursor.execute(
+            'SELECT gstin, phone, address, city, state, pincode FROM customers WHERE name = ? LIMIT 1',
+            (invoice.get('customer_name', ''),)
+        )
+        cust_row = cursor.fetchone()
+        if cust_row:
+            customer_gstin = customer_gstin or cust_row['gstin'] or ''
+            customer_phone = customer_phone or cust_row['phone'] or ''
+            if not customer_address:
+                customer_address = cust_row['address'] or ''
+            customer_city = customer_city or cust_row['city'] or ''
+            customer_state = customer_state or cust_row['state'] or ''
+            customer_pincode = customer_pincode or cust_row['pincode'] or ''
+
+    conn.close()
+
+    # Get HSN codes for items from products table (best effort)
+    hsn_map = {}
+    try:
+        conn2 = sqlite3.connect(config.SQLITE_DB_PATH)
+        c2 = conn2.cursor()
+        for item in items:
+            nm = (item.get('item_name') or '').strip()
+            if nm and nm not in hsn_map:
+                c2.execute(
+                    'SELECT hsn_code FROM products WHERE lower(replace(name," ","")) = ? LIMIT 1',
+                    (nm.lower().replace(' ', ''),)
+                )
+                r = c2.fetchone()
+                if r and r[0]:
+                    hsn_map[nm] = r[0]
+        conn2.close()
+    except Exception:
+        pass
+
+    for item in items:
+        nm = (item.get('item_name') or '').strip()
+        item['hsn_code'] = hsn_map.get(nm, '')
+
+    # Format date (YYYYMMDD → DD-MM-YYYY)
+    raw_date = str(invoice.get('voucher_date') or '').replace('-', '').strip()
+    if len(raw_date) == 8:
+        voucher_date = f"{raw_date[6:8]}-{raw_date[4:6]}-{raw_date[:4]}"
+    else:
+        voucher_date = invoice.get('voucher_date') or '-'
+
+    total_quantity = sum(
+        int(item.get('quantity') or 0)
+        for item in items
+    )
+
+    # Generate QR code from voucher_no (works fully offline)
+    qr_data_uri = ''
+    try:
+        import qrcode
+        import io as _io
+        import base64 as _b64
+        qr = qrcode.QRCode(version=1, box_size=4, border=2)
+        qr.add_data(voucher_no)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color='black', back_color='white')
+        buf = _io.BytesIO()
+        qr_img.save(buf, format='PNG')
+        qr_data_uri = 'data:image/png;base64,' + _b64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass  # QR code is optional; print still works without it
+
+    return render_template(
+        'dc_print.html',
+        voucher_no=voucher_no,
+        voucher_date=voucher_date,
+        entity_name=config.ENTITY_NAME,
+        tally_company=invoice.get('tally_company', ''),
+        filling_station=filling_station,
+        customer_name=invoice.get('customer_name', ''),
+        customer_address=customer_address,
+        customer_city=customer_city,
+        customer_state=customer_state,
+        customer_pincode=customer_pincode,
+        customer_gstin=customer_gstin,
+        customer_phone=customer_phone,
+        vehicle_no=vehicle_no,
+        driver_name=driver_name,
+        items=items,
+        total_quantity=total_quantity,
+        qr_data_uri=qr_data_uri,
+    )
+
+
 if __name__ == '__main__':
     # Ensure logs directory exists (next to the exe, not in CWD)
     os.makedirs(str(BASE_DIR / 'logs'), exist_ok=True)

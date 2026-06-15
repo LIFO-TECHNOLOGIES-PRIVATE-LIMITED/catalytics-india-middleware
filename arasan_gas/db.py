@@ -7,7 +7,10 @@ import logging
 import json
 import hashlib
 import time
-import msvcrt
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 from pathlib import Path
 from datetime import datetime
 
@@ -51,6 +54,8 @@ class Database:
 
     def _acquire_write_lock(self, timeout=30.0, poll=0.1):
         """Acquire cross-process write lock to serialize SQLite writes."""
+        if msvcrt is None:
+            return  # Skip locking on non-Windows
         if self._lock_file is None:
             self._lock_file = open(self._lock_path, 'a+b')
         end = time.time() + timeout
@@ -65,7 +70,7 @@ class Database:
 
     def _release_write_lock(self):
         """Release cross-process write lock."""
-        if not self._lock_file:
+        if msvcrt is None or not self._lock_file:
             return
         try:
             self._lock_file.seek(0)
@@ -343,6 +348,14 @@ class Database:
     # CUSTOMER OPERATIONS
     # ========================================================================
 
+    def customer_exists_by_guid(self, tally_guid):
+        """Check if customer exists by Tally GUID (primary lookup key)."""
+        result = self.query(
+            "SELECT * FROM customers WHERE tally_guid = ?",
+            (tally_guid,)
+        )
+        return result if result else None
+
     def customer_exists(self, name):
         """Check if customer name already exists (ignores whitespace differences)"""
         normalized = ''.join((name or '').split())
@@ -454,25 +467,41 @@ class Database:
         return result if result else None
 
     def product_exists_normalized(self, canonical_name):
-        """
-        Check if product exists using canonical (normalized) name.
-        Canonical name handles spacing variations like "1.5CUM" vs "1.5 CUM".
-        
-        Args:
-            canonical_name: Normalized product name (e.g., "ARGON B TYPE 1.5 CUM (CYL)")
-            
-        Returns:
-            Product record if exists, None otherwise
-        """
+        """Check if product exists using canonical (normalized) name."""
         result = self.query(
             "SELECT id, tally_company, name FROM products WHERE name_canonical = ?",
             (canonical_name,)
         )
         return result if result else None
 
+    def product_exists_by_guid(self, tally_guid):
+        """Check if product exists by Tally GUID (primary lookup key)."""
+        result = self.query(
+            "SELECT * FROM products WHERE tally_guid = ?",
+            (tally_guid,)
+        )
+        return result if result else None
+
+    def product_exists_by_canonical(self, canonical_name):
+        """Check if product exists by canonical name (secondary dedup guard)."""
+        result = self.query(
+            "SELECT * FROM products WHERE name_canonical = ?",
+            (canonical_name,)
+        )
+        return result if result else None
+
+    def product_exists_by_master_variant(self, product_master_name, variant_name):
+        """Find a product by master name + variant regardless of product_type_code.
+        Used to detect same product saved with wrong type (e.g. CYL→CON rename)."""
+        result = self.query(
+            "SELECT * FROM products WHERE product_master_name = ? AND variant_name = ? LIMIT 1",
+            (product_master_name, variant_name)
+        )
+        return result if result else None
+
     def insert_product(self, product_data):
         """Insert new product with canonical name for uniqueness checking"""
-        self.execute("""
+        cursor = self.execute("""
             INSERT INTO products (
                 tally_guid, name, name_canonical, tally_company, hsn_code, unit,
                 rate, description, data_json,
@@ -484,7 +513,7 @@ class Database:
         """, (
             product_data.get('tally_guid'),
             product_data.get('name'),
-            product_data.get('name_canonical'),  # ← Canonical name for uniqueness
+            product_data.get('name_canonical'),
             product_data.get('tally_company'),
             product_data.get('hsn_code'),
             product_data.get('unit'),
@@ -502,6 +531,7 @@ class Database:
             product_data.get('cgst_rate', 0.0),
             product_data.get('sgst_rate', 0.0),
         ))
+        return cursor.lastrowid if cursor else None
 
     def update_product(self, product_id, product_data):
         """Update existing product with fresh data and mark for re-sync"""
@@ -535,14 +565,24 @@ class Database:
             product_id,
         ))
 
-    def get_unsynced_products(self, limit=50):
+    def delete_product(self, product_id):
+        """Delete a product row by ID."""
+        self.execute("DELETE FROM products WHERE id = ?", (product_id,))
+
+    def get_unsynced_products(self, limit=None):
         """Get products that haven't been synced"""
+        if limit:
+            return self.query_all("""
+                SELECT * FROM products
+                WHERE is_synced = 0
+                ORDER BY first_fetched_at
+                LIMIT ?
+            """, (limit,))
         return self.query_all("""
             SELECT * FROM products
             WHERE is_synced = 0
             ORDER BY first_fetched_at
-            LIMIT ?
-        """, (limit,))
+        """)
 
     def mark_product_synced(self, product_id, catalytics_id, response_json=None):
         """Mark product as successfully synced"""
@@ -664,9 +704,17 @@ class Database:
             invoice_id
         ))
 
-    def get_unsynced_invoices(self, limit=50, max_attempts=10):
+    def get_unsynced_invoices(self, limit=50, max_attempts=10, invoice_id=None):
         """Get invoices that haven't been synced.
-        Excludes deleted invoices and invoices that failed too many times."""
+        Excludes deleted invoices and invoices that failed too many times.
+        Pass invoice_id to fetch a single specific invoice only."""
+        if invoice_id:
+            return self.query_all("""
+                SELECT * FROM invoices
+                WHERE id = ?
+                  AND is_synced = 0
+                  AND COALESCE(is_deleted, 0) = 0
+            """, (invoice_id,))
         return self.query_all("""
             SELECT * FROM invoices
             WHERE is_synced = 0

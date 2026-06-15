@@ -189,7 +189,7 @@ class CatalyticsSyncer:
     def _customer_exists(self, customer_name):
         """Check if customer exists in synced customers"""
         if not customer_name:
-            return False, "Customer name is empty"
+            return False, "Customer name is missing in this invoice. Refetch the invoice from Tally."
 
         normalized_customer_name = self._normalize_name(customer_name)
         result = self.db.query(
@@ -202,7 +202,7 @@ class CatalyticsSyncer:
         )
         if result:
             return True, None
-        return False, f"Customer '{customer_name}' not found in Catalytics"
+        return False, f"Customer '{customer_name}' not synced yet. Sync customers first or click Refetch on this invoice."
 
     def _products_exist(self, items):
         """Check if all products in invoice items exist in synced products"""
@@ -228,7 +228,7 @@ class CatalyticsSyncer:
                 missing_products.append(item_name)
 
         if missing_products:
-            return False, f"Products not found in Catalytics: {', '.join(missing_products)}"
+            return False, f"Products not synced yet: {', '.join(missing_products)}. Sync products first or click Refetch."
         return True, None
 
     def _fetch_unsynced_instant_dcs(self):
@@ -303,8 +303,38 @@ class CatalyticsSyncer:
 
     @staticmethod
     def _normalize_name(value):
-        """Normalize a name for fuzzy comparison: lowercase, collapse whitespace."""
-        return ' '.join(str(value or '').lower().split())
+        """Normalize a name for fuzzy comparison: lowercase, strip all spaces.
+
+        Must match the SQL expression ``lower(replace(name, ' ', ''))`` used
+        in _customer_exists / _products_exist queries.
+        """
+        return str(value or '').lower().replace(' ', '')
+
+    def _get_customer_row_by_name(self, customer_name):
+        """Lookup a customer row using normalized name matching."""
+        normalized = self._normalize_name(customer_name)
+        return self.db.query(
+            "SELECT * FROM customers WHERE lower(replace(name, ' ', '')) = ? LIMIT 1",
+            (normalized,),
+        )
+
+    def _get_product_row_by_name(self, product_name):
+        """Lookup a product row using normalized name matching."""
+        normalized = self._normalize_name(product_name)
+        return self.db.query(
+            "SELECT * FROM products WHERE lower(replace(name, ' ', '')) = ? LIMIT 1",
+            (normalized,),
+        )
+
+    @staticmethod
+    def _row_get(row, key, default=None):
+        """Safely get a value from a sqlite3.Row or dict."""
+        if row is None:
+            return default
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return default
 
     def _fetch_product_groups(self):
         """Fetch product groups with product names from PostgreSQL. Cached per process."""
@@ -1150,7 +1180,7 @@ class CatalyticsSyncer:
                 if not ledger_data:
                     return {
                         'success': False,
-                        'error': f"Could not fetch ledger '{name}' from Tally",
+                        'error': f"Customer '{name}' not found in Tally. Check if the customer name exists in Tally.",
                         'catalytics_id': None
                     }
             
@@ -1347,31 +1377,51 @@ class CatalyticsSyncer:
 
         customer_ok, customer_msg = self._customer_exists(customer_name)
         if not customer_ok:
+            # Use normalized lookup (matches _customer_exists SQL) instead
+            # of exact name match so double-spaced Tally names still resolve.
+            normalized_customer_name = self._normalize_name(customer_name)
             customer_row = self.db.query(
-                "SELECT * FROM customers WHERE name = ? LIMIT 1",
-                (customer_name,),
+                (
+                    "SELECT * FROM customers "
+                    "WHERE lower(replace(name, ' ', '')) = ? "
+                    "LIMIT 1"
+                ),
+                (normalized_customer_name,),
             )
             if not customer_row:
-                return False, customer_msg or f"Customer '{customer_name}' not found locally"
+                return False, f"Customer '{customer_name}' not found in local database. Fetch customers first."
 
-            customer_result = self.sync_single_customer(dict(customer_row))
-            if not customer_result.get('success'):
-                return False, customer_result.get('error') or customer_msg
+            # If the customer is already synced, no need to re-sync via Tally.
+            if customer_row['is_synced']:
+                logger.info(
+                    f"[AUTO-RECOVER] Customer '{customer_name}' already synced "
+                    f"(local id={customer_row['id']}), skipping Tally re-fetch"
+                )
+            else:
+                customer_result = self.sync_single_customer(dict(customer_row))
+                if not customer_result.get('success'):
+                    return False, customer_result.get('error') or customer_msg
 
-            self.db.mark_customer_synced(
-                customer_row['id'],
-                customer_result.get('catalytics_id'),
-                json.dumps(customer_result),
-            )
+                self.db.mark_customer_synced(
+                    customer_row['id'],
+                    customer_result.get('catalytics_id'),
+                    json.dumps(customer_result),
+                )
 
         missing_products = []
         for item in items or []:
             item_name = (item.get('item_name') or '').strip()
             if not item_name:
                 continue
+            # Use normalized lookup consistent with _products_exist.
+            normalized_item_name = self._normalize_name(item_name)
             result = self.db.query(
-                "SELECT id FROM products WHERE name = ? AND is_synced = 1 LIMIT 1",
-                (item_name,),
+                (
+                    "SELECT id FROM products "
+                    "WHERE lower(replace(name, ' ', '')) = ? "
+                    "AND is_synced = 1 LIMIT 1"
+                ),
+                (normalized_item_name,),
             )
             if not result:
                 missing_products.append(item_name)
@@ -1388,7 +1438,7 @@ class CatalyticsSyncer:
                 (normalized_product_name, company, company),
             )
             if not product_row:
-                return False, f"Product '{product_name}' not found locally"
+                return False, f"Product '{product_name}' not found in local database. Fetch products first."
 
             product_dict = dict(product_row)
             if not product_dict.get('tally_company'):
@@ -2014,7 +2064,7 @@ class CatalyticsSyncer:
         # data_json already contains enriched voucher with LEDGERDATA + STOCKITEMS
         stored = self._safe_json_load(invoice.get('data_json'))
         if not stored:
-            return None, {}, {}, f"No data_json for invoice #{voucher_no}"
+            return None, {}, {}, f"Invoice #{voucher_no} has no Tally data. Click Refetch to reload from Tally."
 
         voucher = dict(stored)
 
@@ -2164,9 +2214,11 @@ class CatalyticsSyncer:
                         )
                         recovered, recover_error = self._ensure_invoice_dependencies_synced(invoice, items)
                         if not recovered:
+                            error_msg = recover_error or validation_error
                             logger.warning(
-                                f"[VALIDATION FAILED] Invoice #{voucher_no}: {recover_error} - SKIPPING"
+                                f"[VALIDATION FAILED] Invoice #{voucher_no}: {error_msg} - SKIPPING"
                             )
+                            self.db.mark_invoice_sync_failed(invoice_id, error_msg)
                             stats['failed'] += 1
                             continue
                         logger.info(
@@ -2361,7 +2413,7 @@ class CatalyticsSyncer:
                     continue
 
                 if not customer_name or customer_name == 'UNKNOWN':
-                    error_msg = f"Customer name is empty or UNKNOWN for invoice #{voucher_no}"
+                    error_msg = f"Invoice #{voucher_no} has no customer name. Refetch this invoice from Tally."
                     logger.error(f"[VALIDATION FAILED] {error_msg}")
                     self.db.mark_invoice_sync_failed(invoice_id, error_msg)
                     stats['failed'] += 1

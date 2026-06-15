@@ -227,8 +227,7 @@ def api_status():
                 for key in config.TALLY_COMPANY_ACTIVE
                 if config.TALLY_COMPANIES.get(key)
             },
-            'sync_batch_size': config.SYNC_BATCH_SIZE,
-            'invoice_fetch_start_date': config.INVOICE_FETCH_START_DATE or 'Today',
+            'invoice_fetch_start_date': config.INVOICE_FETCH_START_DATE or 'Day Book',
             'product_type_map': config.PRODUCT_TYPE_MAP
         }
     })
@@ -757,10 +756,10 @@ def trigger_sync_invoices():
                 'status': 'started'
             })
 
-        dashboard_logger.write_log("=== INVOICE SYNC TO CATALYTICS STARTED (LIGHTWEIGHT API) ===")
+        dashboard_logger.write_log("=== INVOICE SYNC TO CATALYTICS STARTED ===")
 
         syncer = CatalyticsSyncer()
-        success, output = _guarded_run("Sync Invoices", syncer.sync_invoices_simple)
+        success, output = _guarded_run("Sync Invoices", syncer.sync_invoices_to_dc)
 
         dashboard_logger.write_log(
             f"=== INVOICE SYNC TO CATALYTICS {'COMPLETED' if success else 'FAILED'} ==="
@@ -1444,12 +1443,12 @@ def resync_invoice(invoice_id):
 
         message = f'Invoice #{voucher_no} marked for resync'
 
-        # If sync_now is requested, trigger sync immediately
+        # If sync_now is requested, trigger sync immediately (only this invoice)
         if sync_now:
             try:
                 from sync_to_catalytics import CatalyticsSyncer
                 syncer = CatalyticsSyncer()
-                result = syncer.sync_invoices_to_dc()
+                result = syncer.sync_invoices_to_dc(invoice_id=invoice_id)
 
                 if result.get('synced', 0) > 0:
                     message = f'Invoice #{voucher_no} resynced successfully! DC: {result.get("synced")} created/updated'
@@ -2568,37 +2567,193 @@ def maybe_start_automation():
 
 
 def maybe_register_windows_startup():
-    """Register packaged EXE in HKCU Run for auto-start on Windows login."""
+    """Register in HKCU Run for auto-start on Windows login.
+    Works for both frozen EXE and Python script."""
     if os.name != 'nt':
         return
 
     if not _env_flag('AUTO_REGISTER_WINDOWS_STARTUP', 'false'):
         return
 
-    if not getattr(sys, 'frozen', False):
-        logger.info("Skipping Windows startup registration (not running as EXE)")
-        return
-
     try:
         import winreg
 
         app_name = os.getenv('WINDOWS_STARTUP_APP_NAME', 'ArasanGasMiddlewareDashboard').strip() or 'ArasanGasMiddlewareDashboard'
-        exe_path = f'"{sys.executable}"'
+
+        if getattr(sys, 'frozen', False):
+            # Running as PyInstaller EXE
+            exe_path = f'"{sys.executable}"'
+        else:
+            # Running as Python script — register: python.exe dashboard.py
+            script_path = str(BASE_DIR / 'dashboard.py')
+            exe_path = f'"{sys.executable}" "{script_path}"'
 
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
-            r'Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+            r'Software\Microsoft\Windows\CurrentVersion\Run',
             0,
             winreg.KEY_SET_VALUE
         ) as run_key:
             winreg.SetValueEx(run_key, app_name, 0, winreg.REG_SZ, exe_path)
 
-        logger.info(f"Windows startup registration ensured for: {app_name}")
+        logger.info(f"Windows startup registered: {app_name} -> {exe_path}")
     except Exception as exc:
         logger.warning(f"Could not register Windows startup: {exc}")
+
+
+# ==================== OFFLINE DC PRINT ====================
+
+@app.route('/print/dc/<path:voucher_no>')
+def print_dc(voucher_no):
+    """Offline DC print page — renders a printable DC from local SQLite data."""
+    import json as _json
+
+    conn = sqlite3.connect(config.SQLITE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT * FROM invoices WHERE tally_voucher_no = ? ORDER BY first_fetched_at DESC LIMIT 1',
+        (voucher_no,)
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return f'<h3>DC not found: {voucher_no}</h3><p>No local record for this voucher number.</p>', 404
+
+    invoice = dict(row)
+
+    try:
+        items = _json.loads(invoice.get('items_json') or '[]') or []
+    except Exception:
+        items = []
+
+    try:
+        raw_voucher = _json.loads(invoice.get('data_json') or '{}') or {}
+    except Exception:
+        raw_voucher = {}
+
+    vehicle_no = (raw_voucher.get('DISPATCHEDTHROUGH') or raw_voucher.get('MOTORVEHICLENO') or '').strip()
+    driver_name = (raw_voucher.get('BASICSHIPDOCUMENTNO') or raw_voucher.get('DRIVERNAME') or '').strip()
+    filling_station = (invoice.get('filling_station') or invoice.get('godown_name') or invoice.get('location_name') or '').strip()
+
+    customer_gstin = ''
+    customer_phone = ''
+    customer_address = invoice.get('billing_address') or invoice.get('delivery_address') or ''
+    customer_city = ''
+    customer_state = ''
+    customer_pincode = ''
+
+    try:
+        ledger = _json.loads(invoice.get('ledger_data_json') or '{}') or {}
+        customer_gstin = (ledger.get('gstin') or ledger.get('GSTIN') or ledger.get('PARTYGSTIN') or '').lstrip(':')
+        customer_phone = ledger.get('phone') or ledger.get('MOBILE') or ledger.get('LEDGERMOBILE') or ''
+        if not customer_address:
+            addr_list = ledger.get('ADDRESSES') or ledger.get('addresses') or []
+            customer_address = ', '.join(addr_list) if isinstance(addr_list, list) else str(addr_list)
+        customer_state = ledger.get('state') or ledger.get('STATENAME') or ''
+        customer_pincode = ledger.get('pincode') or ledger.get('PINCODE') or ''
+    except Exception:
+        pass
+
+    if not customer_gstin or not customer_phone:
+        cursor.execute(
+            'SELECT gstin, phone, address, city, state, pincode FROM customers WHERE name = ? LIMIT 1',
+            (invoice.get('customer_name', ''),)
+        )
+        cust_row = cursor.fetchone()
+        if cust_row:
+            customer_gstin = customer_gstin or cust_row['gstin'] or ''
+            customer_phone = customer_phone or cust_row['phone'] or ''
+            if not customer_address:
+                customer_address = cust_row['address'] or ''
+            customer_city = customer_city or cust_row['city'] or ''
+            customer_state = customer_state or cust_row['state'] or ''
+            customer_pincode = customer_pincode or cust_row['pincode'] or ''
+
+    conn.close()
+
+    hsn_map = {}
+    try:
+        conn2 = sqlite3.connect(config.SQLITE_DB_PATH)
+        c2 = conn2.cursor()
+        for item in items:
+            nm = (item.get('item_name') or '').strip()
+            if nm and nm not in hsn_map:
+                c2.execute(
+                    'SELECT hsn_code FROM products WHERE lower(replace(name," ","")) = ? LIMIT 1',
+                    (nm.lower().replace(' ', ''),)
+                )
+                r = c2.fetchone()
+                if r and r[0]:
+                    hsn_map[nm] = r[0]
+        conn2.close()
+    except Exception:
+        pass
+
+    for item in items:
+        item['hsn_code'] = hsn_map.get((item.get('item_name') or '').strip(), '')
+
+    raw_date = str(invoice.get('voucher_date') or '').replace('-', '').strip()
+    if len(raw_date) == 8:
+        voucher_date = f"{raw_date[6:8]}-{raw_date[4:6]}-{raw_date[:4]}"
+    else:
+        voucher_date = invoice.get('voucher_date') or '-'
+
+    total_quantity = sum(int(item.get('quantity') or 0) for item in items)
+
+    qr_data_uri = ''
+    try:
+        import qrcode
+        import io as _io
+        import base64 as _b64
+        qr = qrcode.QRCode(version=1, box_size=4, border=2)
+        qr.add_data(voucher_no)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color='black', back_color='white')
+        buf = _io.BytesIO()
+        qr_img.save(buf, format='PNG')
+        qr_data_uri = 'data:image/png;base64,' + _b64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass
+
+    return render_template(
+        'dc_print.html',
+        voucher_no=voucher_no,
+        voucher_date=voucher_date,
+        entity_name=config.ENTITY_NAME,
+        tally_company=invoice.get('tally_company', ''),
+        filling_station=filling_station,
+        customer_name=invoice.get('customer_name', ''),
+        customer_address=customer_address,
+        customer_city=customer_city,
+        customer_state=customer_state,
+        customer_pincode=customer_pincode,
+        customer_gstin=customer_gstin,
+        customer_phone=customer_phone,
+        vehicle_no=vehicle_no,
+        driver_name=driver_name,
+        items=items,
+        total_quantity=total_quantity,
+        qr_data_uri=qr_data_uri,
+    )
+
+
 if __name__ == '__main__':
     # Ensure logs directory exists (next to the exe, not in CWD)
     os.makedirs(str(BASE_DIR / 'logs'), exist_ok=True)
+
+    # Set Windows process/console title so Task Manager shows correct name
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW("Arasan Gas Middleware Dashboard")
+    except Exception:
+        pass
+    try:
+        import multiprocessing
+        multiprocessing.current_process().name = "ArasanGasMiddleware"
+    except Exception:
+        pass
 
     default_debug = 'false' if getattr(sys, 'frozen', False) else 'true'
     dashboard_debug = _env_flag('DASHBOARD_DEBUG', default_debug)
