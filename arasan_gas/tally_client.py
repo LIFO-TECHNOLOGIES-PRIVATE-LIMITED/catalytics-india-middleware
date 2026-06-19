@@ -1562,7 +1562,16 @@ def get_sales_invoices(company_name: str, url: Optional[str] = None, from_date: 
 
             vno = (v.get('VOUCHERNUMBER') or v.get('VCHNUMBER') or v.get('VOUCHERNO') or v.get('DSPVCHNUMBER') or v.get('DSPVCHNO') or v.get('NUMBER') or '').strip()
             if not vno:
-                vno = (v.get('VCHKEY') or v.get('GUID') or f"AUTO-{len(normalized)+1}")
+                # No voucher number means the voucher is still being entered/incomplete
+                # in Tally (draft, manual numbering not yet assigned). Skip it rather than
+                # inventing a fake number from VCHKEY/GUID, which creates phantom invoices
+                # (e.g. dc_no "198380244435008" from VOUCHERKEY) that later duplicate the
+                # real voucher once its number is assigned.
+                logger.info(
+                    "[SKIP NO VOUCHERNUMBER] guid=%s type=%s date=%s - voucher has no number yet, skipping",
+                    v.get('GUID', ''), vtype, v.get('DATE', '')
+                )
+                continue
 
             # Party detection - handle entries if top-level party name is missing
             cust = (v.get('PARTYLEDGERNAME') or v.get('PARTYNAME') or v.get('BASICBUYERNAME') or v.get('BASICBUYERPARTYNAME') or '').strip()
