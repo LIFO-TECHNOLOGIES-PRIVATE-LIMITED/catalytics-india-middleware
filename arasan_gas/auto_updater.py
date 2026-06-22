@@ -40,7 +40,7 @@ except ImportError:
 
 logger = logging.getLogger("auto_updater")
 
-_UPDATE_CHECK_INTERVAL = 300  # seconds (5 minutes)
+_UPDATE_CHECK_INTERVAL = 60  # seconds (1 minute)
 _updater_thread = None
 _stop_event = threading.Event()
 
