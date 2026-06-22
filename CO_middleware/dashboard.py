@@ -30,6 +30,7 @@ import db
 from config import config, BASE_DIR
 from automation_manager import get_manager
 from log_capture import dashboard_logger
+import auto_updater
 
 # Determine template folder â€” inside _MEIPASS when frozen, else default
 if getattr(sys, 'frozen', False):
@@ -3087,6 +3088,7 @@ if __name__ == '__main__':
 
     maybe_register_windows_startup()
     maybe_start_automation()
+    auto_updater.start()
     maybe_open_dashboard_browser()
     app.run(host=config.WEB_UI_HOST, port=config.WEB_UI_PORT, debug=dashboard_debug, use_reloader=False)
 
