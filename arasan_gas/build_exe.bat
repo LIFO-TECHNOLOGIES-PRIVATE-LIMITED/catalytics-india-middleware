@@ -23,6 +23,7 @@ py -m PyInstaller ^
     --noconsole ^
     --name arasan_gas_dashboard ^
     --add-data "templates;templates" ^
+    --add-data "version.json;." ^
     --collect-all psycopg2 ^
     --hidden-import fetch_customers ^
     --hidden-import fetch_products ^
@@ -47,4 +48,3 @@ echo   - arasan_gas.sqlite (optional, auto-created if missing)
 echo   - logs\ folder (optional, auto-created if missing)
 
 endlocal
-

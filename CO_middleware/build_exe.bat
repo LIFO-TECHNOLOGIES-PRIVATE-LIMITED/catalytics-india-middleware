@@ -35,6 +35,7 @@ py -m PyInstaller ^
     --workpath "%PYI_BUILD_DIR%" ^
     --add-data "templates;templates" ^
     --add-data ".env.example;." ^
+    --add-data "version.json;." ^
     --collect-all psycopg2 ^
     --hidden-import config ^
     --hidden-import db ^
