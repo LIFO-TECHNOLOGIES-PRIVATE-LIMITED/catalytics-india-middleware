@@ -469,6 +469,7 @@ class CatalyticsSyncer:
                 f"against {len(instant_dcs)} instant DCs"
             )
 
+        matches = []
         for dc in instant_dcs:
             dc_id = dc.get('id')
 
@@ -546,9 +547,25 @@ class CatalyticsSyncer:
 
             if matched:
                 logger.info(f"  [DC {dc_id}] MATCH FOUND: dc_no={dc.get('dc_no')}")
-                return dc
+                matches.append(dc)
 
-        return None
+        if not matches:
+            return None
+
+        # Multiple instant DCs share this customer + date + product/qty key (e.g. two
+        # same-day orders). Match in CREATION ORDER: return the OLDEST unsynced instant
+        # DC (earliest created_on); it is marked synced after, so the next invoice maps
+        # to the next-oldest, keeping Tally DC numbers aligned with the order sequence.
+        matches.sort(key=lambda d: (str(d.get('created_on') or ''), d.get('id') or 0))
+        chosen = matches[0]
+        if len(matches) > 1:
+            logger.info(
+                "  [INSTANT-DC] %d instant DCs tie on customer='%s' date=%s products=%s; "
+                "matching oldest-first -> id=%s dc_no=%s (created_on=%s)",
+                len(matches), customer_name_norm, invoice_date, invoice_products,
+                chosen.get('id'), chosen.get('dc_no'), chosen.get('created_on'),
+            )
+        return chosen
 
 
     def _validate_invoice_for_sync(self, invoice, items):
