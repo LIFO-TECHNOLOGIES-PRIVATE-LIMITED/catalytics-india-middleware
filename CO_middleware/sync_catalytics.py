@@ -1115,7 +1115,6 @@ def _find_matching_instant_dc(
     if not invoice_products:
         return None
 
-    matches = []
     for dc in instant_dcs:
         is_instant = dc.get("is_instant_dc")
         is_synced = dc.get("dc_synced")
@@ -1158,23 +1157,14 @@ def _find_matching_instant_dc(
                 dc_products[pname] = dc_products.get(pname, 0) + pqty
 
         if dc_products == invoice_products:
-            matches.append(dc)
+            logger.info(
+                "Matched instant DC id=%s dc_no=%s for invoice %s",
+                dc.get("id"), dc.get("dc_no"),
+                note.get("dc_no") or voucher.get("VOUCHERNUMBER"),
+            )
+            return dc
 
-    if not matches:
-        return None
-
-    # Multiple instant DCs tie on (customer + date + product/qty) — match in CREATION
-    # ORDER, oldest first (see backend tally_dc_payload). NOTE: CO matching now runs in
-    # the backend, so this function is currently inactive; kept in sync in case the
-    # middleware path is ever re-enabled.
-    matches.sort(key=lambda d: (str(d.get("created_on") or ""), d.get("id") or 0))
-    dc = matches[0]
-    logger.info(
-        "Matched instant DC id=%s dc_no=%s for invoice %s (oldest-first on %d tie(s))",
-        dc.get("id"), dc.get("dc_no"),
-        note.get("dc_no") or voucher.get("VOUCHERNUMBER"), len(matches),
-    )
-    return dc
+    return None
 
 
 def _mark_instant_dc_synced_on_portal(
