@@ -23,6 +23,7 @@ echo [3/5] Copying client files...
 copy /y "dist\arasan_gas_dashboard.exe" "%RELEASE_DIR%\" >nul
 copy /y ".env.example" "%RELEASE_DIR%\.env.example" >nul
 copy /y ".env.example" "%RELEASE_DIR%\.env" >nul
+copy /y "version.json" "%RELEASE_DIR%\" >nul
 copy /y "README_CLIENT_SETUP.txt" "%RELEASE_DIR%\" >nul
 copy /y "Start_Dashboard.bat" "%RELEASE_DIR%\" >nul
 copy /y "Install_AutoStart.bat" "%RELEASE_DIR%\" >nul

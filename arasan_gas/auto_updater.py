@@ -69,6 +69,40 @@ def _get_version_info() -> dict:
         return {}
 
 
+def _derive_update_server_url(server_url: str | None = None) -> str:
+    """
+    Resolve the update-server base URL.
+
+    Priority:
+      1. Explicit server_url argument
+      2. UPDATE_SERVER_URL env var
+      3. CATALYTICS_API_BASE env var, normalized back to the server root
+
+    Examples:
+      http://host:8000           -> http://host:8000
+      http://host:8000/          -> http://host:8000
+      http://host:8000/api       -> http://host:8000
+      http://host:8000/import    -> http://host:8000
+      http://host:8000/api/import -> http://host:8000
+    """
+    explicit = (server_url or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+
+    env_url = os.environ.get('UPDATE_SERVER_URL', '').strip()
+    if env_url:
+        return env_url.rstrip("/")
+
+    api_base = os.environ.get('CATALYTICS_API_BASE', '').strip().rstrip("/")
+    if not api_base:
+        return ""
+
+    for suffix in ('/api/import', '/import/api', '/import', '/api'):
+        if api_base.endswith(suffix):
+            return api_base[:-len(suffix)].rstrip("/")
+    return api_base
+
+
 def _check_for_update(server_url: str, category: int, version: str):
     """
     Call the update server.
@@ -77,14 +111,24 @@ def _check_for_update(server_url: str, category: int, version: str):
     if _requests is None:
         logger.warning("[auto_updater] 'requests' package not available")
         return None
-    try:
-        url = server_url.rstrip('/') + '/version/middleware/check-update'
-        resp = _requests.get(url, params={'category': category, 'version': version}, timeout=15)
-        if resp.status_code == 200:
-            return resp.json()
-        logger.warning("[auto_updater] Server returned HTTP %s", resp.status_code)
-    except Exception as exc:
-        logger.warning("[auto_updater] Update check failed: %s", exc)
+    base = server_url.rstrip('/')
+    tried = []
+    for url in (
+        base + '/version/middleware/check-update',
+        base + '/api/version/middleware/check-update',
+    ):
+        if url in tried:
+            continue
+        tried.append(url)
+        try:
+            resp = _requests.get(url, params={'category': category, 'version': version}, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+            logger.info("[auto_updater] Update check HTTP %s from %s", resp.status_code, url)
+        except Exception as exc:
+            logger.info("[auto_updater] Update check failed for %s: %s", url, exc)
+
+    logger.warning("[auto_updater] Update check failed for all candidate URLs: %s", ', '.join(tried))
     return None
 
 
@@ -261,9 +305,12 @@ def start(server_url: str = None):
     if _updater_thread and _updater_thread.is_alive():
         return  # Already running
 
-    effective_url = (server_url or os.environ.get('UPDATE_SERVER_URL', '')).strip()
+    effective_url = _derive_update_server_url(server_url)
     if not effective_url:
-        logger.info("[auto_updater] UPDATE_SERVER_URL not configured — auto-update disabled")
+        logger.info(
+            "[auto_updater] No update server configured "
+            "(UPDATE_SERVER_URL / CATALYTICS_API_BASE missing) — auto-update disabled"
+        )
         return
 
     info = _get_version_info()

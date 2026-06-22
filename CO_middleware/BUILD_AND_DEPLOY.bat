@@ -39,6 +39,7 @@ py -m PyInstaller ^
     --name co_middleware_dashboard ^
     --add-data "templates;templates" ^
     --add-data ".env.example;." ^
+    --add-data "version.json;." ^
     --collect-all psycopg2 ^
     --hidden-import config ^
     --hidden-import db ^
@@ -89,6 +90,7 @@ if exist ".env" (
     echo [INFO] .env not found, packaged .env.example as release .env.
 )
 copy /y ".env.example" "%RELEASE_DIR%\.env.example" >nul
+copy /y "version.json" "%RELEASE_DIR%\" >nul
 copy /y "README_CLIENT_SETUP.txt" "%RELEASE_DIR%\" >nul
 if exist "RELEASE_NOTES.md" copy /y "RELEASE_NOTES.md" "%RELEASE_DIR%\" >nul
 copy /y "Start_Dashboard.bat" "%RELEASE_DIR%\" >nul
