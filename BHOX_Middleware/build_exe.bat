@@ -13,7 +13,7 @@ if errorlevel 1 (
 echo [2/4] Cleaning previous build artifacts...
 if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
-if exist "bol_dashboard.spec" del /q "bol_dashboard.spec"
+if exist "bhox_dashboard.spec" del /q "bhox_dashboard.spec"
 
 echo [3/4] Building middleware dashboard EXE...
 py -m PyInstaller ^
@@ -21,7 +21,7 @@ py -m PyInstaller ^
     --clean ^
     --onefile ^
     --noconsole ^
-    --name bol_dashboard ^
+    --name bhox_dashboard ^
     --add-data "templates;templates" ^
     --add-data "version.json;." ^
     --collect-all psycopg2 ^
@@ -40,7 +40,7 @@ if errorlevel 1 (
 )
 
 echo [4/4] Build complete.
-echo EXE generated at: "%cd%\dist\bol_dashboard.exe"
+echo EXE generated at: "%cd%\dist\bhox_dashboard.exe"
 echo.
 echo Place these next to the EXE on client machine:
 echo   - .env
