@@ -78,11 +78,24 @@ _stop_event = threading.Event()
 def _get_version_info() -> dict:
     """
     Read version.json.
-    When frozen (PyInstaller EXE) the file lives in sys._MEIPASS.
+    When frozen (PyInstaller EXE):
+      - First checks an external version.json next to the EXE (written by the
+        auto-updater after each successful update so the version is always current).
+      - Falls back to the one bundled in sys._MEIPASS.
     When running as a plain script it lives next to this file.
     """
     if getattr(sys, 'frozen', False):
-        base = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
+        exe_dir = Path(sys.executable).parent
+        external = exe_dir / 'version.json'
+        if external.exists():
+            try:
+                with open(external, 'r', encoding='utf-8') as fh:
+                    data = _json.load(fh)
+                if data.get('version') and data.get('category'):
+                    return data
+            except Exception:
+                pass
+        base = Path(getattr(sys, '_MEIPASS', exe_dir))
     else:
         base = Path(__file__).parent
 
@@ -93,6 +106,39 @@ def _get_version_info() -> dict:
     except Exception as exc:
         logger.error("[auto_updater] Could not read version.json: %s", exc)
         return {}
+
+
+def _write_version_override(exe_dir: Path, new_version: str):
+    """
+    Write/update version.json next to the EXE with the new version so the
+    freshly-launched process reads the correct version and does not loop.
+    Preserves the 'category' and any other fields from the existing file.
+    """
+    version_file = exe_dir / 'version.json'
+    existing: dict = {}
+    # Try the external file first
+    if version_file.exists():
+        try:
+            with open(version_file, 'r', encoding='utf-8') as fh:
+                existing = _json.load(fh)
+        except Exception:
+            pass
+    # Fall back to _MEIPASS copy for fields like 'category'
+    if 'category' not in existing and getattr(sys, 'frozen', False):
+        meipass_file = Path(getattr(sys, '_MEIPASS', exe_dir)) / 'version.json'
+        if meipass_file.exists():
+            try:
+                with open(meipass_file, 'r', encoding='utf-8') as fh:
+                    existing.update({k: v for k, v in _json.load(fh).items() if k not in existing})
+            except Exception:
+                pass
+    existing['version'] = new_version
+    try:
+        with open(version_file, 'w', encoding='utf-8') as fh:
+            _json.dump(existing, fh, indent=2)
+        logger.info("[auto_updater] version.json written → version=%s at %s", new_version, version_file)
+    except Exception as exc:
+        logger.warning("[auto_updater] Could not write version.json override: %s", exc)
 
 
 def _derive_update_server_url(server_url: str | None = None) -> str:
@@ -292,6 +338,12 @@ def _perform_update(update_info: dict, current_exe: Path):
                 pending_exe.unlink(missing_ok=True)
                 return
             logger.info("[auto_updater] Checksum verified OK")
+
+    # Write the new version to version.json next to the EXE BEFORE launching
+    # the bat script.  This ensures the freshly-started EXE reads the correct
+    # version and does not trigger another update cycle, even if the developer
+    # forgot to update version.json inside the build.
+    _write_version_override(current_exe.parent, new_version)
 
     logger.info("[auto_updater] Applying update → version %s", new_version)
     _apply_update_windows(pending_exe, current_exe, new_version)
