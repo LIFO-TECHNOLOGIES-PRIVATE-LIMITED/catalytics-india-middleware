@@ -21,6 +21,7 @@ Response (200 OK):
 
 import hashlib
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -41,6 +42,31 @@ except ImportError:
 logger = logging.getLogger("auto_updater")
 
 _UPDATE_CHECK_INTERVAL = 300  # seconds (5 minutes)
+
+
+def _setup_log_file(exe_dir: Path):
+    """Add a dedicated rotating log file for the auto_updater logger."""
+    log_dir = exe_dir / 'logs'
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    log_path = log_dir / 'auto_updater.log'
+    for h in logger.handlers:
+        if getattr(h, 'baseFilename', None) == str(log_path):
+            return
+    try:
+        fh = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding='utf-8'
+        )
+        fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(message)s'))
+        fh.name = 'auto_updater_file'
+        logger.addHandler(fh)
+        logger.info("[auto_updater] Log file: %s", log_path)
+    except Exception as exc:
+        logger.warning("[auto_updater] Could not create log file %s: %s", log_path, exc)
+
+
 _updater_thread = None
 _stop_event = threading.Event()
 
@@ -192,8 +218,11 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, new_version: str
         '    exit /b 1',
         ')',
         '',
-        ':: ---- Start the new version ----',
-        f'start "" "{current_exe}"',
+        ':: ---- Wait for file system to settle ----',
+        'timeout /t 2 /nobreak >nul',
+        '',
+        ':: ---- Start the new version (working dir = EXE folder) ----',
+        f'start "" /D "{current_exe.parent}" "{current_exe}"',
         '',
         ':: ---- Clean up this script ----',
         'del "%~f0"',
@@ -228,6 +257,22 @@ def _perform_update(update_info: dict, current_exe: Path):
     pending_exe = current_exe.parent / (current_exe.stem + '_pending.exe')
 
     if not _download_file(download_url, pending_exe):
+        return
+
+    # Validate that the downloaded file is a valid Windows PE executable
+    try:
+        with open(pending_exe, 'rb') as _f:
+            _magic = _f.read(2)
+        if _magic != b'MZ':
+            logger.error(
+                "[auto_updater] Downloaded file is not a valid Windows EXE (bad magic bytes: %r) — aborting update",
+                _magic,
+            )
+            pending_exe.unlink(missing_ok=True)
+            return
+    except Exception as exc:
+        logger.error("[auto_updater] Could not validate downloaded EXE: %s — aborting", exc)
+        pending_exe.unlink(missing_ok=True)
         return
 
     # Optional checksum verification
@@ -302,6 +347,13 @@ def start(server_url: str = None):
         return  # Already running
 
     effective_url = _derive_update_server_url(server_url)
+
+    # Set up dedicated log file early so all subsequent messages land there too
+    if getattr(sys, 'frozen', False):
+        _setup_log_file(Path(sys.executable).parent)
+    else:
+        _setup_log_file(Path(__file__).parent)
+
     if not effective_url:
         logger.info(
             "[auto_updater] No update server configured "
