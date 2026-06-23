@@ -284,39 +284,42 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, new_version: str
     """
     pid = os.getpid()
     ps_path = current_exe.parent / '_mw_updater.ps1'
-    log_file = str(current_exe.parent / 'logs' / 'auto_updater.log').replace('\\', '\\\\')
 
     def ps_log(msg):
-        """Return a PS line that appends msg to the log file with timestamp."""
+        """Return a PS line that appends msg to the log file (path built inside PS)."""
         return (
-            f'[System.IO.File]::AppendAllText("{log_file}", '
+            '[System.IO.File]::AppendAllText($log_file, '
             f'("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] {msg}`r`n"))'
         )
+
+    old_exe = current_exe.parent / (current_exe.stem + '_old' + current_exe.suffix)
 
     lines = [
         f'# Catalytics Middleware auto-updater — upgrading to {new_version}',
         f'$target_pid = {pid}',
         f'$pending    = \'{pending_exe}\'',
         f'$current    = \'{current_exe}\'',
+        f'$old_exe    = \'{old_exe}\'',
         f'$work_dir   = \'{current_exe.parent}\'',
         f'$proc_name  = \'{current_exe.stem}\'',
         f'$ps_self    = $MyInvocation.MyCommand.Path',
-        f'$log_file   = "{log_file}"',
+        '$log_file   = $work_dir + "\\logs\\auto_updater.log"',
         '',
         '# Ensure logs dir exists',
-        'New-Item -ItemType Directory -Force -Path (Split-Path $log_file) | Out-Null',
+        'New-Item -ItemType Directory -Force -Path ($work_dir + "\\logs") | Out-Null',
         '',
-        ps_log(f'PS_UPDATER START — upgrading to {new_version}  PID={pid}  pending=$pending'),
-        ps_log('PS_UPDATER current exe: $current'),
-        ps_log('PS_UPDATER work dir:    $work_dir'),
+        ps_log(f'PS_UPDATER START — upgrading to {new_version}  PID={pid}'),
+        ps_log('PS_UPDATER temp file : $pending'),
+        ps_log('PS_UPDATER current   : $current'),
+        ps_log('PS_UPDATER backup    : $old_exe'),
         '',
-        '# 0. Self-elevate to Administrator if not already — required for Move-Item and Start-Process',
+        '# 0. Self-elevate to Administrator if not already',
         '$isAdmin = ([Security.Principal.WindowsPrincipal]',
         '            [Security.Principal.WindowsIdentity]::GetCurrent()',
         '           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
         ps_log('PS_UPDATER isAdmin=$isAdmin'),
         'if (-not $isAdmin) {',
-        f'    {ps_log("PS_UPDATER not admin — re-launching with RunAs (UAC prompt may appear)")}',
+        f'    {ps_log("PS_UPDATER not admin — re-launching with RunAs")}',
         '    Start-Process powershell -ArgumentList ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ps_self`"") -Verb RunAs',
         '    exit',
         '}',
@@ -329,59 +332,80 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, new_version: str
         '    Start-Sleep -Seconds 1',
         '    $wait_secs++',
         '    if ($wait_secs % 5 -eq 0) {',
-        f'        {ps_log("PS_UPDATER still waiting for PID {pid} to exit (${wait_secs}s elapsed)")}',
+        f'        {ps_log("PS_UPDATER still waiting for PID {pid} to exit ($wait_secs s elapsed)")}',
         '    }',
         '}',
         ps_log('PS_UPDATER old process has exited'),
         '',
-        '# 2. Kill ALL running instances by name (handles autostart relaunches)',
+        '# 2. Kill ALL running instances by name',
         ps_log('PS_UPDATER STEP 2 — killing all instances of $proc_name'),
         '$killed = Get-Process -Name $proc_name -ErrorAction SilentlyContinue',
         'if ($killed) {',
         f'    {ps_log("PS_UPDATER killing $($killed.Count) instance(s) of $proc_name")}',
         '    $killed | Stop-Process -Force -ErrorAction SilentlyContinue',
         '} else {',
-        f'    {ps_log("PS_UPDATER no extra instances of $proc_name running")}',
+        f'    {ps_log("PS_UPDATER no extra instances running")}',
         '}',
         'Start-Sleep -Seconds 2',
         '',
-        '# 3. Check pending file exists before move',
-        ps_log('PS_UPDATER STEP 3 — verifying pending file exists'),
+        '# 3. Verify temp (downloaded) file exists',
+        ps_log('PS_UPDATER STEP 3 — verifying downloaded temp file exists'),
         'if (-not (Test-Path -LiteralPath $pending)) {',
-        f'    {ps_log("PS_UPDATER ERROR — pending file not found: $pending")}',
+        f'    {ps_log("PS_UPDATER ERROR — temp file not found: $pending")}',
         '    exit 1',
         '}',
         '$pending_size = (Get-Item -LiteralPath $pending).Length',
-        ps_log('PS_UPDATER pending file size: $pending_size bytes'),
+        ps_log('PS_UPDATER temp file size: $pending_size bytes'),
         '',
-        '# 4. Move _old -> current with retry (up to 20 attempts)',
-        ps_log('PS_UPDATER STEP 4 — moving pending -> current (up to 20 attempts)'),
-        '$moved = $false',
+        '# 4a. Remove stale _old backup if it already exists',
+        ps_log('PS_UPDATER STEP 4a — removing stale backup if exists: $old_exe'),
+        'if (Test-Path -LiteralPath $old_exe) {',
+        f'    {ps_log("PS_UPDATER stale backup found — removing")}',
+        '    Remove-Item -LiteralPath $old_exe -Force -ErrorAction SilentlyContinue',
+        '}',
+        '',
+        '# 4b. Rename current exe → _old (backup), with retry',
+        ps_log('PS_UPDATER STEP 4b — renaming current EXE → _old backup (up to 20 attempts)'),
+        '$backed_up = $false',
         'for ($i = 0; $i -lt 20; $i++) {',
         '    try {',
-        '        Move-Item -Force -LiteralPath $pending -Destination $current -ErrorAction Stop',
-        '        $moved = $true',
-        f'        {ps_log("PS_UPDATER move succeeded on attempt $($i+1)")}',
+        '        Move-Item -LiteralPath $current -Destination $old_exe -ErrorAction Stop',
+        '        $backed_up = $true',
+        f'        {ps_log("PS_UPDATER backup succeeded on attempt $($i+1)")}',
         '        break',
         '    } catch {',
-        f'        {ps_log("PS_UPDATER move attempt $($i+1) failed: $($_.Exception.Message)")}',
+        f'        {ps_log("PS_UPDATER backup attempt $($i+1) failed: $($_.Exception.Message)")}',
         '        Start-Sleep -Seconds 1',
         '    }',
         '}',
         '',
-        '# 5. Launch new version as Administrator so it starts correctly',
-        'if ($moved) {',
-        ps_log('PS_UPDATER STEP 5 — move succeeded, waiting 2s then launching new EXE'),
-        '    Start-Sleep -Seconds 2',
-        '    if (Test-Path -LiteralPath $current) {',
-        f'        {ps_log("PS_UPDATER launching: $current")}',
-        '        Start-Process -FilePath $current -WorkingDirectory $work_dir -Verb RunAs',
-        f'        {ps_log("PS_UPDATER new EXE launched successfully")}',
-        '    } else {',
-        f'        {ps_log("PS_UPDATER ERROR — current EXE missing after move: $current")}',
+        '# 4c. Rename temp → current exe name',
+        'if ($backed_up) {',
+        ps_log('PS_UPDATER STEP 4c — renaming temp → current EXE name'),
+        '    try {',
+        '        Move-Item -LiteralPath $pending -Destination $current -ErrorAction Stop',
+        f'        {ps_log("PS_UPDATER new EXE is now in place as: $current")}',
+        '    } catch {',
+        f'        {ps_log("PS_UPDATER ERROR — rename temp to current failed: $($_.Exception.Message)")}',
+        f'        {ps_log("PS_UPDATER restoring backup...")}',
+        '        Move-Item -LiteralPath $old_exe -Destination $current -ErrorAction SilentlyContinue',
+        f'        {ps_log("PS_UPDATER backup restored — update failed")}',
+        '        exit 1',
         '    }',
         '} else {',
-        ps_log('PS_UPDATER ERROR — move failed after 20 attempts — old EXE NOT replaced'),
+        ps_log('PS_UPDATER ERROR — could not backup current EXE after 20 attempts — update aborted'),
+        '    exit 1',
+        '}',
+        '',
+        '# 5. Launch the new EXE',
+        ps_log('PS_UPDATER STEP 5 — launching new EXE'),
+        'Start-Sleep -Seconds 2',
+        'if (Test-Path -LiteralPath $current) {',
+        f'    {ps_log("PS_UPDATER launching: $current")}',
+        '    Start-Process -FilePath $current -WorkingDirectory $work_dir -Verb RunAs',
+        f'    {ps_log("PS_UPDATER new EXE launched successfully")}',
+        '} else {',
+        f'    {ps_log("PS_UPDATER ERROR — current EXE missing after rename: $current")}',
         '}',
         '',
         '# 6. Clean up this script',
@@ -430,19 +454,19 @@ def _perform_update(update_info: dict, current_exe: Path, current_version: str =
         logger.error("[auto_updater] update_info has no download_url — skipping")
         return
 
-    # Guard: server must not serve the _pending or _old file as an update
+    # Guard: server must not serve a temp/backup file as an update
     url_filename = Path(download_url.rstrip('/').split('/')[-1]).stem.lower()
-    if '_pending' in url_filename or '_old' in url_filename:
+    if any(x in url_filename for x in ('_pending', '_old', '_new', '_temp')):
         logger.error(
-            "[auto_updater] download_url points to a temp file (_pending/_old) — "
+            "[auto_updater] download_url points to a temp/backup file — "
             "wrong file uploaded on server: %s  Skipping.", download_url
         )
         return
 
-    # Name the download file with current version + _old so it's easy to identify
-    ver_tag = f'_v{current_version}' if current_version else ''
-    pending_exe = current_exe.parent / f'{current_exe.stem}{ver_tag}_old.exe'
-    logger.info("[auto_updater] Download destination: %s", pending_exe)
+    # Download the new EXE to a temp name; PS script will rename it to the final exe name
+    ver_tag = f'_v{new_version}' if new_version != 'unknown' else ''
+    pending_exe = current_exe.parent / f'{current_exe.stem}{ver_tag}_temp.exe'
+    logger.info("[auto_updater] Download destination (temp): %s", pending_exe)
 
     # Remove stale _old file if it already exists
     if pending_exe.exists():
