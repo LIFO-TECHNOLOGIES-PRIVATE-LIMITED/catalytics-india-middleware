@@ -36,6 +36,7 @@ py -m PyInstaller ^
     --clean ^
     --onefile ^
     --noconsole ^
+    --uac-admin ^
     --name co_middleware_dashboard ^
     --add-data "templates;templates" ^
     --add-data ".env.example;." ^

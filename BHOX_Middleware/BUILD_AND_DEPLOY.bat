@@ -37,6 +37,7 @@ py -m PyInstaller ^
     --clean ^
     --onefile ^
     --noconsole ^
+    --uac-admin ^
     --name bhox_dashboard ^
     --add-data "templates;templates" ^
     --add-data "version.json;." ^
