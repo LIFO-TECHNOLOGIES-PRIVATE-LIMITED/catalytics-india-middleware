@@ -23,6 +23,7 @@ import hashlib
 import logging
 import logging.handlers
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -270,14 +271,13 @@ def _download_file(url: str, dest: Path) -> bool:
         return False
 
 
-def _apply_update_windows(pending_exe: Path, current_exe: Path, new_version: str):
+def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: Path, new_version: str):
     """
     Write a self-deleting PowerShell script that:
       1. Waits for this process (by PID) to exit
       2. Kills any other instances of the EXE by name
-      3. Moves pending_exe → current_exe with retry (PowerShell Move-Item is more
-         reliable than cmd move for files that are briefly locked by antivirus)
-      4. Launches the new EXE from the correct working directory
+      3. Renames running EXE → _old, then pending → canonical name
+      4. Launches the new EXE from the correct working directory via Task Scheduler
       5. Deletes itself
 
     Data files (.env, *.sqlite, logs/, automation_state.json) are never touched.
@@ -292,26 +292,28 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, new_version: str
             f'("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] {msg}`r`n"))'
         )
 
-    old_exe = current_exe.parent / (current_exe.stem + '_old' + current_exe.suffix)
+    old_exe = canonical_exe.parent / (canonical_exe.stem + '_old' + canonical_exe.suffix)
 
     lines = [
         f'# Catalytics Middleware auto-updater — upgrading to {new_version}',
-        f'$target_pid = {pid}',
-        f'$pending    = \'{pending_exe}\'',
-        f'$current    = \'{current_exe}\'',
-        f'$old_exe    = \'{old_exe}\'',
-        f'$work_dir   = \'{current_exe.parent}\'',
-        f'$proc_name  = \'{current_exe.stem}\'',
-        f'$ps_self    = $MyInvocation.MyCommand.Path',
-        '$log_file   = $work_dir + "\\logs\\auto_updater.log"',
+        f'$target_pid  = {pid}',
+        f'$pending     = \'{pending_exe}\'',
+        f'$running_exe = \'{current_exe}\'',
+        f'$current     = \'{canonical_exe}\'',
+        f'$old_exe     = \'{old_exe}\'',
+        f'$work_dir    = \'{canonical_exe.parent}\'',
+        f'$proc_name   = \'{canonical_exe.stem}\'',
+        f'$ps_self     = $MyInvocation.MyCommand.Path',
+        '$log_file    = $work_dir + "\\logs\\auto_updater.log"',
         '',
         '# Ensure logs dir exists',
         'New-Item -ItemType Directory -Force -Path ($work_dir + "\\logs") | Out-Null',
         '',
         ps_log(f'PS_UPDATER START — upgrading to {new_version}  PID={pid}'),
-        ps_log('PS_UPDATER temp file : $pending'),
-        ps_log('PS_UPDATER current   : $current'),
-        ps_log('PS_UPDATER backup    : $old_exe'),
+        ps_log('PS_UPDATER temp file  : $pending'),
+        ps_log('PS_UPDATER running    : $running_exe'),
+        ps_log('PS_UPDATER canonical  : $current'),
+        ps_log('PS_UPDATER backup     : $old_exe'),
         '',
         '# 0. Self-elevate to Administrator if not already',
         '$isAdmin = ([Security.Principal.WindowsPrincipal]',
@@ -369,7 +371,7 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, new_version: str
         '$backed_up = $false',
         'for ($i = 0; $i -lt 20; $i++) {',
         '    try {',
-        '        Move-Item -LiteralPath $current -Destination $old_exe -ErrorAction Stop',
+        '        Move-Item -LiteralPath $running_exe -Destination $old_exe -ErrorAction Stop',
         '        $backed_up = $true',
         f'        {ps_log("PS_UPDATER backup succeeded on attempt $($i+1)")}',
         '        break',
@@ -397,15 +399,25 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, new_version: str
         '    exit 1',
         '}',
         '',
-        '# 5. Launch the new EXE',
-        '# Note: no -Verb RunAs — EXE has --uac-admin manifest so it self-elevates.',
-        '# Using -Verb RunAs from an already-elevated PS context causes silent failure.',
-        ps_log('PS_UPDATER STEP 5 — launching new EXE'),
+        '# 5. Launch via Task Scheduler — only reliable way to show a window from a hidden background PS',
+        ps_log('PS_UPDATER STEP 5 — launching new EXE via Task Scheduler'),
         'Start-Sleep -Seconds 2',
         'if (Test-Path -LiteralPath $current) {',
-        f'    {ps_log("PS_UPDATER launching: $current")}',
-        '    Start-Process -FilePath $current -WorkingDirectory $work_dir',
-        f'    {ps_log("PS_UPDATER Start-Process called — EXE launched")}',
+        f'    {ps_log("PS_UPDATER scheduling task for: $current")}',
+        '    try {',
+        '        $action  = New-ScheduledTaskAction -Execute $current -WorkingDirectory $work_dir',
+        '        $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddSeconds(3))',
+        '        Register-ScheduledTask -TaskName "_MW_AutoLaunch" -Action $action -Trigger $trigger -RunLevel Highest -Force | Out-Null',
+        '        Start-ScheduledTask -TaskName "_MW_AutoLaunch"',
+        f'        {ps_log("PS_UPDATER task started — EXE will appear on desktop")}',
+        '        Start-Sleep -Seconds 15',
+        '        Unregister-ScheduledTask -TaskName "_MW_AutoLaunch" -Confirm:$false -ErrorAction SilentlyContinue | Out-Null',
+        f'        {ps_log("PS_UPDATER task cleaned up")}',
+        '    } catch {',
+        f'        {ps_log("PS_UPDATER Task Scheduler failed: $($_.Exception.Message) — falling back to Start-Process")}',
+        '        Start-Process -FilePath $current -WorkingDirectory $work_dir',
+        f'        {ps_log("PS_UPDATER fallback Start-Process called")}',
+        '    }',
         '} else {',
         f'    {ps_log("PS_UPDATER ERROR — current EXE missing after rename: $current")}',
         '}',
@@ -465,9 +477,15 @@ def _perform_update(update_info: dict, current_exe: Path, current_version: str =
         )
         return
 
-    # Download the new EXE to a temp name; PS script will rename it to the final exe name
-    ver_tag = f'_v{new_version}' if new_version != 'unknown' else ''
-    pending_exe = current_exe.parent / f'{current_exe.stem}{ver_tag}_temp.exe'
+    # Compute the canonical (clean) EXE name — strip any _vX.Y.Z_temp / _old / _temp suffixes
+    # that may have snowballed if the client was running a messy-named EXE.
+    # e.g. "bhox_dashboard_v1.0.3_temp" → "bhox_dashboard"
+    clean_stem = re.sub(r'(_v[\d.]+(_temp|_old|_new)?|_temp|_old|_new)$', '', current_exe.stem, flags=re.IGNORECASE)
+    canonical_exe = current_exe.parent / (clean_stem + current_exe.suffix)
+    logger.info("[auto_updater] Running EXE   : %s", current_exe)
+    logger.info("[auto_updater] Canonical EXE : %s", canonical_exe)
+    # Always download to a fixed temp name based on the canonical stem
+    pending_exe = current_exe.parent / (clean_stem + '_temp.exe')
     logger.info("[auto_updater] Download destination (temp): %s", pending_exe)
 
     # Remove stale _old file if it already exists
@@ -526,7 +544,7 @@ def _perform_update(update_info: dict, current_exe: Path, current_version: str =
     _write_version_override(current_exe.parent, new_version)
 
     logger.info("[auto_updater] STEP 4/4 — Launching PowerShell updater script")
-    _apply_update_windows(pending_exe, current_exe, new_version)
+    _apply_update_windows(pending_exe, current_exe, canonical_exe, new_version)
 
 
 # ---------------------------------------------------------------------------
