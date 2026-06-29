@@ -2886,7 +2886,7 @@ def maybe_register_windows_startup():
 
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
-            r'Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+            r'Software\Microsoft\Windows\CurrentVersion\Run',
             0,
             winreg.KEY_SET_VALUE
         ) as run_key:
@@ -3064,8 +3064,6 @@ if __name__ == '__main__':
     _dh = _DashboardLogHandler()
     _dh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logging.getLogger().addHandler(_dh)
-
-    maybe_toggle_existing_instance_on_launch()
 
     try:
         initialize_configured_databases()
