@@ -37,8 +37,10 @@ py -m PyInstaller ^
     --clean ^
     --onefile ^
     --noconsole ^
+    --uac-admin ^
     --name arasan_gas_dashboard ^
     --add-data "templates;templates" ^
+    --add-data "version.json;." ^
     --collect-all psycopg2 ^
     --hidden-import fetch_customers ^
     --hidden-import fetch_products ^
@@ -76,6 +78,7 @@ if errorlevel 1 (
 
 copy /y ".env.example" "%RELEASE_DIR%\.env.example" >nul
 copy /y ".env.example" "%RELEASE_DIR%\.env" >nul
+copy /y "version.json" "%RELEASE_DIR%\" >nul
 copy /y "README_CLIENT_SETUP.txt" "%RELEASE_DIR%\" >nul
 copy /y "RELEASE_NOTES.md" "%RELEASE_DIR%\" >nul
 copy /y "Start_Dashboard.bat" "%RELEASE_DIR%\" >nul
