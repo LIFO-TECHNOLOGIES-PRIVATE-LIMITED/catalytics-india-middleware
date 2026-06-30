@@ -2606,7 +2606,7 @@ def maybe_register_windows_startup():
 
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
-            r'Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+            r'Software\Microsoft\Windows\CurrentVersion\Run',
             0,
             winreg.KEY_SET_VALUE
         ) as run_key:

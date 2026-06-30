@@ -2583,12 +2583,12 @@ def maybe_register_windows_startup():
     try:
         import winreg
 
-        app_name = os.getenv('WINDOWS_STARTUP_APP_NAME', 'BOLMiddlewareDashboard').strip() or 'BOLMiddlewareDashboard'
+        app_name = os.getenv('WINDOWS_STARTUP_APP_NAME', 'BHOXMiddlewareDashboard').strip() or 'BHOXMiddlewareDashboard'
         exe_path = f'"{sys.executable}"'
 
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
-            r'Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+            r'Software\Microsoft\Windows\CurrentVersion\Run',
             0,
             winreg.KEY_SET_VALUE
         ) as run_key:

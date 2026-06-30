@@ -284,16 +284,17 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: P
     """
     pid = os.getpid()
     ps_path = current_exe.parent / '_mw_updater.ps1'
+    backup_dir = canonical_exe.parent / "old_builds"
+    backup_dir.mkdir(exist_ok=True)
 
+    current_version = _get_version_info().get("version", "unknown")
+
+    old_exe = backup_dir / (
+        f"{canonical_exe.stem}_v{current_version}{canonical_exe.suffix}"
+    )
     def ps_log(msg):
-        """Return a PS line that appends msg to the log file (path built inside PS)."""
-        return (
-            '[System.IO.File]::AppendAllText($log_file, '
-            f'("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] {msg}`r`n"))'
-        )
-
-    old_exe = canonical_exe.parent / (canonical_exe.stem + '_old' + canonical_exe.suffix)
-
+        msg = msg.replace("—", "-").replace("→", "->")
+        return f'Add-Content -Path $log_file -Value ("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] {msg}") -ErrorAction SilentlyContinue'
     lines = [
         f'# Catalytics Middleware auto-updater — upgrading to {new_version}',
         f'$target_pid  = {pid}',
@@ -304,152 +305,150 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: P
         f'$work_dir    = \'{canonical_exe.parent}\'',
         f'$proc_name   = \'{canonical_exe.stem}\'',
         f'$ps_self     = $MyInvocation.MyCommand.Path',
-        '$log_file    = $work_dir + "\\logs\\_mw_ps.log"',
+        # Log goes to work_dir root — no subdirectory dependency
+        '$log_file    = $work_dir + "\\_mw_ps.log"',
+        'New-Item -ItemType File -Force -Path $log_file | Out-Null',
+        'Add-Content -Path $log_file -Value "SCRIPT STARTED"',
         '',
-        '# Ensure logs dir exists',
+        '# Ensure logs dir exists for auto_updater.log',
         'New-Item -ItemType Directory -Force -Path ($work_dir + "\\logs") | Out-Null',
         '',
         ps_log(f'PS_UPDATER START — upgrading to {new_version}  PID={pid}'),
-        ps_log('PS_UPDATER temp file  : $pending'),
-        ps_log('PS_UPDATER running    : $running_exe'),
-        ps_log('PS_UPDATER canonical  : $current'),
-        ps_log('PS_UPDATER backup     : $old_exe'),
+        ps_log('PS_UPDATER running_exe : $running_exe'),
+        ps_log('PS_UPDATER canonical   : $current'),
+        ps_log('PS_UPDATER pending     : $pending'),
+        ps_log('PS_UPDATER old_exe     : $old_exe'),
         '',
-        '# 0. Self-elevate to Administrator if not already',
-        '$isAdmin = ([Security.Principal.WindowsPrincipal]',
-        '            [Security.Principal.WindowsIdentity]::GetCurrent()',
-        '           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
+        '# 0. Admin check',
+        '$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
         ps_log('PS_UPDATER isAdmin=$isAdmin'),
         'if (-not $isAdmin) {',
-        f'    {ps_log("PS_UPDATER not admin — re-launching with RunAs")}',
+        f'    {ps_log("PS_UPDATER not admin — re-launching elevated")}',
         '    Start-Process powershell -ArgumentList ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ps_self`"") -Verb RunAs',
         '    exit',
         '}',
         ps_log('PS_UPDATER running as Administrator — proceeding'),
         '',
-        '# 1. Wait for the specific old PID to exit',
-        ps_log(f'PS_UPDATER STEP 1 — waiting for old process PID {pid} to exit'),
-        '$wait_secs = 0',
-        'while (Get-Process -Id $target_pid -ErrorAction SilentlyContinue) {',
-        '    Start-Sleep -Seconds 1',
-        '    $wait_secs++',
-        '    if ($wait_secs % 5 -eq 0) {',
-        f'        {ps_log("PS_UPDATER still waiting for PID {pid} to exit ($wait_secs s elapsed)")}',
-        '    }',
-        '}',
-        ps_log('PS_UPDATER old process has exited'),
-        '',
-        '# 2. Kill ALL running instances by name',
-        ps_log('PS_UPDATER STEP 2 — killing all instances of $proc_name'),
-        '$killed = Get-Process -Name $proc_name -ErrorAction SilentlyContinue',
-        'if ($killed) {',
-        f'    {ps_log("PS_UPDATER killing $($killed.Count) instance(s) of $proc_name")}',
-        '    $killed | Stop-Process -Force -ErrorAction SilentlyContinue',
-        '} else {',
-        f'    {ps_log("PS_UPDATER no extra instances running")}',
-        '}',
-        'Start-Sleep -Seconds 2',
-        '',
-        '# 3. Verify temp (downloaded) file exists',
-        ps_log('PS_UPDATER STEP 3 — verifying downloaded temp file exists'),
+        '# 1. Verify temp (downloaded) file exists',
+        ps_log('PS_UPDATER STEP 1 — verifying downloaded temp file'),
         'if (-not (Test-Path -LiteralPath $pending)) {',
-        f'    {ps_log("PS_UPDATER ERROR — temp file not found: $pending")}',
+        f'    {ps_log("PS_UPDATER ERROR — temp file not found: $pending — aborting")}',
         '    exit 1',
         '}',
         '$pending_size = (Get-Item -LiteralPath $pending).Length',
-        ps_log('PS_UPDATER temp file size: $pending_size bytes'),
+        ps_log('PS_UPDATER temp file OK  size=$pending_size bytes'),
         '',
-        '# 4a. Remove stale _old backup if it already exists',
-        ps_log('PS_UPDATER STEP 4a — removing stale backup if exists: $old_exe'),
+        '# 2. Remove stale backup if exists',
+        ps_log('PS_UPDATER STEP 2 — removing stale backup if exists'),
         'if (Test-Path -LiteralPath $old_exe) {',
-        f'    {ps_log("PS_UPDATER stale backup found — removing")}',
         '    Remove-Item -LiteralPath $old_exe -Force -ErrorAction SilentlyContinue',
+        f'    {ps_log("PS_UPDATER stale backup removed: $old_exe")}',
         '}',
         '',
-        '# 4b. Rename current exe → _old (backup), with retry',
-        ps_log('PS_UPDATER STEP 4b — renaming current EXE → _old backup (up to 20 attempts)'),
+        '# 3. Rename running EXE → _old  (Windows allows renaming a running EXE)',
+        '# Old process is STILL RUNNING here — new EXE will be launched before it stops',
+        ps_log('PS_UPDATER STEP 3 — renaming running EXE to backup (up to 20 attempts)'),
         '$backed_up = $false',
         'for ($i = 0; $i -lt 20; $i++) {',
         '    try {',
         '        Move-Item -LiteralPath $running_exe -Destination $old_exe -ErrorAction Stop',
         '        $backed_up = $true',
-        f'        {ps_log("PS_UPDATER backup succeeded on attempt $($i+1)")}',
+        f'        {ps_log("PS_UPDATER backup OK on attempt $($i+1) : $old_exe")}',
         '        break',
         '    } catch {',
-        f'        {ps_log("PS_UPDATER backup attempt $($i+1) failed: $($_.Exception.Message)")}',
+        f'        {ps_log("PS_UPDATER backup attempt $($i+1) FAILED: $($_.Exception.Message)")}',
         '        Start-Sleep -Seconds 1',
         '    }',
         '}',
-        '',
-        '# 4c. Rename temp → current exe name',
-        'if ($backed_up) {',
-        ps_log('PS_UPDATER STEP 4c — renaming temp → current EXE name'),
-        '    try {',
-        '        Move-Item -LiteralPath $pending -Destination $current -ErrorAction Stop',
-        f'        {ps_log("PS_UPDATER new EXE is now in place as: $current")}',
-        '    } catch {',
-        f'        {ps_log("PS_UPDATER ERROR — rename temp to current failed: $($_.Exception.Message)")}',
-        f'        {ps_log("PS_UPDATER restoring backup...")}',
-        '        Move-Item -LiteralPath $old_exe -Destination $current -ErrorAction SilentlyContinue',
-        f'        {ps_log("PS_UPDATER backup restored — update failed")}',
-        '        exit 1',
-        '    }',
-        '} else {',
-        ps_log('PS_UPDATER ERROR — could not backup current EXE after 20 attempts — update aborted'),
+        'if (-not $backed_up) {',
+        f'    {ps_log("PS_UPDATER ERROR — could not rename running EXE after 20 attempts — aborting")}',
         '    exit 1',
         '}',
         '',
-        '# 5. Launch via schtasks.exe — works on ALL Windows versions (XP+), no PS module needed',
-        ps_log('PS_UPDATER STEP 5 — launching via schtasks.exe'),
-        'Start-Sleep -Seconds 2',
-        'if (Test-Path -LiteralPath $current) {',
-        '    $task_name  = "_MW_" + $proc_name',
-        '    $run_time   = (Get-Date).AddMinutes(1).ToString("HH:mm")',
-        '    $tr_arg     = \'"\' + $current + \'"\'',
-        f'    {ps_log("PS_UPDATER task=$task_name  time=$run_time  exe=$current")}',
-        '    $sched_out  = (& schtasks.exe /Create /TN $task_name /TR $tr_arg /SC ONCE /ST $run_time /F /RL HIGHEST 2>&1) -join " "',
-        f'    {ps_log("PS_UPDATER schtasks /Create exit=$LASTEXITCODE  out=$sched_out")}',
-        '    if ($LASTEXITCODE -eq 0) {',
-        '        $run_out = (& schtasks.exe /Run /TN $task_name 2>&1) -join " "',
-        f'        {ps_log("PS_UPDATER schtasks /Run exit=$LASTEXITCODE  out=$run_out")}',
-        '        Start-Sleep -Seconds 15',
-        '        & schtasks.exe /Delete /TN $task_name /F 2>&1 | Out-Null',
-        f'        {ps_log("PS_UPDATER task deleted")}',
-        '    } else {',
-        f'        {ps_log("PS_UPDATER schtasks /Create failed — trying Start-Process fallback")}',
-        '        Start-Process -FilePath $current -WorkingDirectory $work_dir',
-        f'        {ps_log("PS_UPDATER Start-Process called")}',
-        '    }',
-        '} else {',
-        f'    {ps_log("PS_UPDATER ERROR — current EXE missing after rename: $current")}',
+        '# 4. Rename temp → canonical name (new EXE now in place on disk)',
+        ps_log('PS_UPDATER STEP 4 — renaming temp → canonical EXE name'),
+        'try {',
+        '    Move-Item -LiteralPath $pending -Destination $current -ErrorAction Stop',
+        f'    {ps_log("PS_UPDATER new EXE in place: $current")}',
+        '} catch {',
+        f'    {ps_log("PS_UPDATER ERROR — rename temp failed: $($_.Exception.Message) — restoring backup")}',
+        '    Move-Item -LiteralPath $old_exe -Destination $running_exe -ErrorAction SilentlyContinue',
+        f'    {ps_log("PS_UPDATER backup restored — update failed")}',
+        '    exit 1',
         '}',
         '',
-        '# 6. Clean up this script',
-        ps_log('PS_UPDATER STEP 6 — cleaning up updater script'),
+        '# 5. Launch NEW EXE FIRST via schtasks.exe, THEN let old process exit',
+        '# Old EXE (Python) is still running — it calls os._exit after ~1s automatically',
+        '# Launching new EXE first ensures no dark window if launch succeeds',
+        ps_log('PS_UPDATER STEP 5 — launching new EXE via schtasks.exe (old still running)'),
+        '$task_name  = "_MW_" + $proc_name',
+        '$run_time   = (Get-Date).AddMinutes(1).ToString("HH:mm")',
+        '$tr_arg     = \'"\' + $current + \'"\'',
+        ps_log('PS_UPDATER schtasks /Create — task=$task_name  exe=$current  time=$run_time'),
+        '$sched_out  = (& schtasks.exe /Create /TN $task_name /TR $tr_arg /SC ONCE /ST $run_time /F /RL HIGHEST 2>&1) -join " "',
+        f'{ps_log("PS_UPDATER schtasks /Create  exit=$LASTEXITCODE  out=$sched_out")}',
+        'if ($LASTEXITCODE -eq 0) {',
+        f'    {ps_log("PS_UPDATER schtasks /Create OK — running task now")}',
+        '    $run_out = (& schtasks.exe /Run /TN $task_name 2>&1) -join " "',
+        f'    {ps_log("PS_UPDATER schtasks /Run  exit=$LASTEXITCODE  out=$run_out")}',
+        '} else {',
+        f'    {ps_log("PS_UPDATER schtasks /Create FAILED — falling back to Start-Process")}',
+        '    Start-Process -FilePath $current -WorkingDirectory $work_dir',
+        f'    {ps_log("PS_UPDATER Start-Process fallback called")}',
+        '}',
+        '',
+        '# 6. Wait for old PID to exit (Python calls os._exit(0) after ~1s)',
+        ps_log('PS_UPDATER STEP 6 — waiting for old process (PID=$target_pid) to exit'),
+        '$wait_secs = 0',
+        'while (Get-Process -Id $target_pid -ErrorAction SilentlyContinue) {',
+        '    Start-Sleep -Seconds 1',
+        '    $wait_secs++',
+        '    if ($wait_secs -ge 30) {',
+        f'        {ps_log("PS_UPDATER old process still alive at 30s — force killing")}',
+        '        Stop-Process -Id $target_pid -Force -ErrorAction SilentlyContinue',
+        '        break',
+        '    }',
+        '}',
+        ps_log('PS_UPDATER old process exited — new EXE now owns the port'),
+        '',
+        '# 7. Cleanup: delete schtasks task, old EXE file, this script',
+        ps_log('PS_UPDATER STEP 7 — cleanup (waiting 15s)'),
+        'Start-Sleep -Seconds 15',
+        '& schtasks.exe /Delete /TN $task_name /F 2>&1 | Out-Null',
+        ps_log('PS_UPDATER schtasks task deleted'),
+        # 'Remove-Item -LiteralPath $old_exe -Force -ErrorAction SilentlyContinue',
+        ps_log('PS_UPDATER old EXE file removed'),
         'Start-Sleep -Seconds 1',
         'Remove-Item -LiteralPath $ps_self -Force -ErrorAction SilentlyContinue',
         ps_log('PS_UPDATER DONE'),
     ]
 
-    ps_path.write_text('\n'.join(lines), encoding='utf-8')
-    logger.info("[auto_updater] PS updater script written: %s", ps_path)
-    logger.info("[auto_updater] Spawning PowerShell updater (detached, hidden) then exiting...")
+    logger.info("STEP A - About to write PS script")
 
+    ps_path.write_text('\n'.join(lines), encoding='utf-8-sig')
+
+    logger.info("STEP B - PS script written")
+    logger.info("[auto_updater] PS updater script written: %s", ps_path)
+
+    logger.info("STEP C - Launching PowerShell")
     subprocess.Popen(
         [
             'powershell',
-            '-NoProfile',
+            '-NoExit',
             '-ExecutionPolicy', 'Bypass',
-            '-WindowStyle', 'Hidden',
             '-File', str(ps_path),
         ],
-        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
     )
 
-    # Brief pause so PowerShell has time to start before we disappear
+    logger.info("STEP D - PowerShell launched")
+
     logger.info("[auto_updater] PowerShell spawned — this process will now exit (PID=%d)", os.getpid())
-    time.sleep(1)
+
+    logger.info("STEP E - Waiting before exit")
+    time.sleep(10)
+
+    logger.info("Exiting current middleware")
     os._exit(0)
 
 

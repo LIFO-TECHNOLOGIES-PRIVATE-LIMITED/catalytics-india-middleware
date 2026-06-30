@@ -284,14 +284,17 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: P
     """
     pid = os.getpid()
     ps_path = current_exe.parent / '_mw_updater.ps1'
+    backup_dir = canonical_exe.parent / "old_builds"
+    backup_dir.mkdir(exist_ok=True)
 
+    current_version = _get_version_info().get("version", "unknown")
+
+    old_exe = backup_dir / (
+        f"{canonical_exe.stem}_v{current_version}{canonical_exe.suffix}"
+    )
     def ps_log(msg):
-        """Return a PS line that appends msg to the PS log file. Uses Add-Content so
-        failures are silently ignored — the script never crashes due to a log write."""
+        msg = msg.replace("—", "-").replace("→", "->")
         return f'Add-Content -Path $log_file -Value ("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] {msg}") -ErrorAction SilentlyContinue'
-
-    old_exe = canonical_exe.parent / (canonical_exe.stem + '_old' + canonical_exe.suffix)
-
     lines = [
         f'# Catalytics Middleware auto-updater — upgrading to {new_version}',
         f'$target_pid  = {pid}',
@@ -304,6 +307,8 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: P
         f'$ps_self     = $MyInvocation.MyCommand.Path',
         # Log goes to work_dir root — no subdirectory dependency
         '$log_file    = $work_dir + "\\_mw_ps.log"',
+        'New-Item -ItemType File -Force -Path $log_file | Out-Null',
+        'Add-Content -Path $log_file -Value "SCRIPT STARTED"',
         '',
         '# Ensure logs dir exists for auto_updater.log',
         'New-Item -ItemType Directory -Force -Path ($work_dir + "\\logs") | Out-Null',
@@ -411,32 +416,39 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: P
         'Start-Sleep -Seconds 15',
         '& schtasks.exe /Delete /TN $task_name /F 2>&1 | Out-Null',
         ps_log('PS_UPDATER schtasks task deleted'),
-        'Remove-Item -LiteralPath $old_exe -Force -ErrorAction SilentlyContinue',
+        # 'Remove-Item -LiteralPath $old_exe -Force -ErrorAction SilentlyContinue',
         ps_log('PS_UPDATER old EXE file removed'),
         'Start-Sleep -Seconds 1',
         'Remove-Item -LiteralPath $ps_self -Force -ErrorAction SilentlyContinue',
         ps_log('PS_UPDATER DONE'),
     ]
 
-    ps_path.write_text('\n'.join(lines), encoding='utf-8')
-    logger.info("[auto_updater] PS updater script written: %s", ps_path)
-    logger.info("[auto_updater] Spawning PowerShell updater (detached, hidden) then exiting...")
+    logger.info("STEP A - About to write PS script")
 
+    ps_path.write_text('\n'.join(lines), encoding='utf-8-sig')
+
+    logger.info("STEP B - PS script written")
+    logger.info("[auto_updater] PS updater script written: %s", ps_path)
+
+    logger.info("STEP C - Launching PowerShell")
     subprocess.Popen(
         [
             'powershell',
-            '-NoProfile',
+            '-NoExit',
             '-ExecutionPolicy', 'Bypass',
-            '-WindowStyle', 'Hidden',
             '-File', str(ps_path),
         ],
-        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
     )
 
-    # Brief pause so PowerShell has time to start before we disappear
+    logger.info("STEP D - PowerShell launched")
+
     logger.info("[auto_updater] PowerShell spawned — this process will now exit (PID=%d)", os.getpid())
-    time.sleep(1)
+
+    logger.info("STEP E - Waiting before exit")
+    time.sleep(10)
+
+    logger.info("Exiting current middleware")
     os._exit(0)
 
 
