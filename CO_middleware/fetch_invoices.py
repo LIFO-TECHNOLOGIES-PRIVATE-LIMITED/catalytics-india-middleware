@@ -1,6 +1,7 @@
 ﻿import argparse
 from dataclasses import dataclass
 import logging
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from db import Database as MasterDatabase
 import tally_api
 from logging_utils import setup_logging
 from fetch_products import parse_stock_item_name
+from sync_catalytics import create_auto_ticket
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
 
@@ -866,6 +868,20 @@ def run_once(config: FetchConfig) -> Dict[str, int]:
             break
     if not company_match:
         logger.error("Company '%s' not found in Tally. Available: %s", config.company, available)
+        _auto_url = cfg.get_env("CATALYTICS_API_BASE_URL", "") or cfg.get_env("CATALYTICS_API_BASE", "") or ""
+        create_auto_ticket(
+            api_base_url=_auto_url,
+            subject='DC Fetch: Tally company name mismatch',
+            description=(
+                f'Company "{config.company}" not found in Tally.\n'
+                f'Available companies: {available}\n\n'
+                'Update the TALLY_COMPANY setting in .env to match one of the available companies.'
+            ),
+            entity_id=config.entity_id,
+            priority=1,
+            category=11,
+            error_code='DC_FETCH_COMPANY_MISMATCH',
+        )
         return {"created": 0, "updated": 0, "skipped": 0}
 
     company_name = company_match.get("name") or config.company
@@ -1487,6 +1503,16 @@ def main() -> int:
         run_once(config)
     except Exception:
         logger.exception("Fetch run failed")
+        _auto_url = cfg.get_env("CATALYTICS_API_BASE_URL", "") or cfg.get_env("CATALYTICS_API_BASE", "") or ""
+        create_auto_ticket(
+            api_base_url=_auto_url,
+            subject='DC Fetch: unhandled exception during fetch run',
+            description=traceback.format_exc(),
+            entity_id=config.entity_id,
+            priority=1,
+            category=11,
+            error_code='DC_FETCH_CRASH',
+        )
         return 1
     return 0
 

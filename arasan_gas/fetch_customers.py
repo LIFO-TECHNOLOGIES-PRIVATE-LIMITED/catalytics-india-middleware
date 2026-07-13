@@ -133,6 +133,16 @@ def fetch_customers_from_all_companies():
 
     if not active_companies:
         logger.error("No active Tally companies configured")
+        from sync_to_catalytics import create_auto_ticket as _ticket
+        _ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='Customer Fetch: no active Tally companies configured',
+            description='No active Tally companies are configured. Check TALLY_COMPANIES in .env.',
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='CUSTOMER_FETCH_NO_COMPANIES',
+        )
         return {
             'total_fetched': 0,
             'new_saved': 0,
@@ -236,6 +246,17 @@ def fetch_customers_from_all_companies():
                 exc_info=True
             )
             overall_stats['errors'] += 1
+            import traceback as _tb_fc
+            from sync_to_catalytics import create_auto_ticket as _ticket
+            _ticket(
+                api_base_url=config.CATALYTICS_API_BASE,
+                subject='Customer Fetch: company fetch failed',
+                description=f'Failed to fetch for company "{company_name}".\n\n' + _tb_fc.format_exc(),
+                entity_id=config.ENTITY_ID,
+                priority=2,
+                category=11,
+                error_code='CUSTOMER_FETCH_COMPANY_ERROR',
+            )
 
     logger.info(f"\n{'='*60}")
     logger.info("CUSTOMER FETCH SUMMARY")
@@ -270,4 +291,15 @@ if __name__ == '__main__':
 
     except Exception as e:
         logger.error(f"\n✗ Customer fetch failed: {e}", exc_info=True)
+        import traceback as _tb_fc2
+        from sync_to_catalytics import create_auto_ticket as _ticket
+        _ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='Customer Fetch: unhandled exception during fetch run',
+            description=_tb_fc2.format_exc(),
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='CUSTOMER_FETCH_CRASH',
+        )
         exit(1)

@@ -949,7 +949,6 @@ def trigger_sync():
             config=cfg.resolve_env_path(ROOT_DIR),
             db_path=cfg.get_env("TALLY_DB_PATH"),
             api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
-            api_key=cfg.get_env("CATALYTICS_API_KEY"),
             entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
             company=cfg.get_env("TALLY_COMPANY"),
             batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
@@ -967,7 +966,6 @@ def trigger_sync():
             config=cfg.resolve_env_path(ROOT_DIR),
             db_path=None,
             api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
-            api_key=cfg.get_env("CATALYTICS_API_KEY"),
             entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
             company=cfg.get_env("TALLY_COMPANY"),
             batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
@@ -1018,7 +1016,6 @@ def trigger_sync_customers():
             config=cfg.resolve_env_path(ROOT_DIR),
             db_path=None,
             api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
-            api_key=cfg.get_env("CATALYTICS_API_KEY"),
             entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
             company=cfg.get_env("TALLY_COMPANY"),
             batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
@@ -1072,7 +1069,6 @@ def trigger_sync_products():
             config=cfg.resolve_env_path(ROOT_DIR),
             db_path=None,
             api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
-            api_key=cfg.get_env("CATALYTICS_API_KEY"),
             entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
             company=cfg.get_env("TALLY_COMPANY"),
             batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
@@ -1126,7 +1122,6 @@ def trigger_sync_invoices():
             config=cfg.resolve_env_path(ROOT_DIR),
             db_path=cfg.get_env("TALLY_DB_PATH"),
             api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
-            api_key=cfg.get_env("CATALYTICS_API_KEY"),
             entity_id=cfg.get_env_int("CATALYTICS_ENTITY_ID"),
             company=cfg.get_env("TALLY_COMPANY"),
             batch_size=cfg.get_env_int("SYNC_BATCH_SIZE", 10),
@@ -1987,7 +1982,6 @@ def _sync_one_invoice(invoice_id: int) -> dict:
                     api_base,
                     matched_dc_id,
                     tally_voucher_no=tally_voucher_no,
-                    api_key=api_key,
                 )
             except Exception:
                 pass

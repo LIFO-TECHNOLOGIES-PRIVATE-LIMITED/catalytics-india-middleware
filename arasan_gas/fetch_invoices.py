@@ -254,6 +254,16 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
 
     if not active_companies:
         logger.error("No active Tally companies configured")
+        from sync_to_catalytics import create_auto_ticket as _ticket
+        _ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='DC Fetch: no active Tally companies configured',
+            description='No active Tally companies are configured. Check TALLY_COMPANIES in .env.',
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='DC_FETCH_NO_COMPANIES',
+        )
         return {
             'total_fetched': 0,
             'new_saved': 0,
@@ -884,6 +894,17 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
         except Exception as e:
             logger.error(f"[ERROR] Failed to process company '{company_name}': {e}", exc_info=True)
             overall_stats['errors'] += 1
+            import traceback as _tb_fi
+            from sync_to_catalytics import create_auto_ticket as _ticket
+            _ticket(
+                api_base_url=config.CATALYTICS_API_BASE,
+                subject='DC Fetch: company fetch failed',
+                description=f'Failed to fetch DCs for company "{company_name}".\n\n' + _tb_fi.format_exc(),
+                entity_id=config.ENTITY_ID,
+                priority=2,
+                category=11,
+                error_code='DC_FETCH_COMPANY_ERROR',
+            )
 
     logger.info(f"\n{'='*60}")
     logger.info("INVOICE FETCH SUMMARY")
@@ -942,5 +963,16 @@ if __name__ == '__main__':
 
     except Exception as e:
         logger.error(f"\nInvoice fetch failed: {e}", exc_info=True)
+        import traceback as _tb_fi2
+        from sync_to_catalytics import create_auto_ticket as _ticket
+        _ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='DC Fetch: unhandled exception during fetch run',
+            description=_tb_fi2.format_exc(),
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='DC_FETCH_CRASH',
+        )
         exit(1)
 
