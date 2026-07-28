@@ -4,6 +4,7 @@ from datetime import datetime
 import logging
 import re
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 import os
 import sys
@@ -66,6 +67,57 @@ def _ensure_dc_sync_log_files():
                 log_path.touch()
         except Exception:
             pass
+
+
+def create_auto_ticket(
+    api_base_url: str,
+    subject: str,
+    description: str,
+    entity_id: Optional[int] = None,
+    priority: int = 2,
+    category: int = 11,
+    error_code: str = '',
+) -> bool:
+    """POST to /support-ticket/auto_ticket to create a ticket from middleware on error.
+
+    Returns True on success, False otherwise. Never raises — safe to call from any
+    exception handler without risking a secondary crash.
+
+    Args:
+        api_base_url: Backend base URL (e.g. https://api.catalytics.us/import/...)
+        subject:      Short error title.
+        description:  Full error detail / traceback.
+        entity_id:    Entity the error occurred for (optional).
+        priority:     1=Critical, 2=High, 3=Medium, 4=Low.  Default 2 (High).
+        category:     SupportTicket category id. Default 11 = API/Middleware Issue.
+        error_code:   Short machine-readable code prepended to description.
+    """
+    try:
+        server_base = _server_base_url(api_base_url)
+        url = f"{server_base}/support-ticket/auto_ticket"
+        headers = {'Content-Type': 'application/json'}
+        payload = {
+            'subject':     subject[:255],
+            'description': description,
+            'priority':    priority,
+            'category':    category,
+        }
+        if entity_id:
+            payload['entity_id'] = entity_id
+        if error_code:
+            payload['error_code'] = error_code
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('status') == 1:
+                logger.info('Auto-ticket created: %s', data.get('ticket_number', ''))
+                return True
+            logger.warning('Auto-ticket API returned error: %s', data.get('message', ''))
+        else:
+            logger.warning('Auto-ticket request failed: HTTP %s', resp.status_code)
+    except Exception as exc:
+        logger.warning('Auto-ticket creation failed (non-fatal): %s', exc)
+    return False
 
 
 @dataclass
@@ -1319,7 +1371,6 @@ def build_config(args: argparse.Namespace) -> SyncConfig:
         db_path=args.db_path or cfg.get_env("TALLY_DB_PATH") or "",
         master_db_path=_master_db,
         api_base_url=args.api_base_url or cfg.get_env("CATALYTICS_API_BASE_URL") or "",
-        api_key=args.api_key or cfg.get_env("CATALYTICS_API_KEY"),
         entity_id=args.entity_id or cfg.get_env_int("CATALYTICS_ENTITY_ID"),
         company=args.company or cfg.get_env("TALLY_COMPANY"),
         batch_size=args.batch_size or cfg.get_env_int("SYNC_BATCH_SIZE", 10) or 10,
@@ -1377,6 +1428,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
     total_sent = 0
     total_ok = 0
     total_fail = 0
+    failed_items = []
 
     for note in notes:
         dc_no = _norm_dc_no(note.get("dc_no"))
@@ -1402,6 +1454,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 error_text=f"payload_build_error: {exc}",
             )
             conn.commit()
+            failed_items.append(f"DC #{dc_no}: payload build error: {exc}")
             total_fail += 1
             continue
 
@@ -1425,6 +1478,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 error_text=f"customer_not_found: '{party_name}' not in local DB",
             )
             conn.commit()
+            failed_items.append(f"DC #{dc_no}: customer '{party_name}' not found in local DB")
             total_fail += 1
             continue
 
@@ -1477,6 +1531,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 error_text=str(exc),
             )
             conn.commit()
+            failed_items.append(f"DC #{dc_no}: API request failed: {exc}")
             total_fail += 1
             continue
 
@@ -1499,12 +1554,14 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
                 logger.error("Sync error DC #%s: %s", dc_no, error_msg)
                 _update_sync_status(conn, delivery_note_id=note["id"], success=False,
                                     payload_hash=payload_hash, response_json=response_json, error_text=error_msg)
+                failed_items.append(f"DC #{dc_no}: {error_msg}")
                 total_fail += 1
             elif created == 0 and updated == 0:
                 error_msg = "DC not created or updated"
                 logger.error("Sync failed DC #%s: %s", dc_no, error_msg)
                 _update_sync_status(conn, delivery_note_id=note["id"], success=False,
                                     payload_hash=payload_hash, response_json=response_json, error_text=error_msg)
+                failed_items.append(f"DC #{dc_no}: {error_msg}")
                 total_fail += 1
             else:
                 status_word = "created" if created else "updated"
@@ -1558,6 +1615,7 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
             logger.error("Sync failed DC #%s: %s", dc_no, error_msg)
             _update_sync_status(conn, delivery_note_id=note["id"], success=False,
                                 payload_hash=payload_hash, response_json=response_json, error_text=error_msg)
+            failed_items.append(f"DC #{dc_no}: {error_msg}")
             total_fail += 1
 
         conn.commit()
@@ -1568,6 +1626,22 @@ def run_once(config: SyncConfig) -> Dict[str, int]:
         total_ok,
         total_fail,
     )
+
+    # Auto-ticket: raise a support ticket if all sent DCs failed
+    if total_sent > 0 and total_fail > 0 and total_ok == 0:
+        create_auto_ticket(
+            api_base_url=config.api_base_url,
+            subject='DC Sync: all DCs failed to sync',
+            description=(
+                f'DC sync run completed with {total_sent} DCs sent but 0 succeeded.\n'
+                f'Failed: {total_fail}\n\n'
+                f'Errors:\n' + '\n'.join(failed_items[:20])
+            ),
+            entity_id=config.entity_id,
+            priority=1,
+            category=11,
+            error_code='DC_SYNC_ALL_FAILED',
+        )
 
     return {
         "sent": total_sent,
@@ -1597,8 +1671,17 @@ def main() -> int:
     config = build_config(args)
     try:
         run_once(config)
-    except Exception:
+    except Exception as exc:
         logger.exception("Sync run failed")
+        create_auto_ticket(
+            api_base_url=config.api_base_url,
+            subject='DC Sync: unhandled exception during sync run',
+            description=traceback.format_exc(),
+            entity_id=config.entity_id,
+            priority=1,
+            category=11,
+            error_code='DC_SYNC_CRASH',
+        )
         return 1
     return 0
 

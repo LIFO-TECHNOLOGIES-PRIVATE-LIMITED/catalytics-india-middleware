@@ -206,6 +206,16 @@ def fetch_products_from_all_companies():
 
     if not active_companies:
         logger.error("No active Tally companies configured")
+        from sync_to_catalytics import create_auto_ticket as _ticket
+        _ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='Product Fetch: no active Tally companies configured',
+            description='No active Tally companies are configured. Check TALLY_COMPANIES in .env.',
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='PRODUCT_FETCH_NO_COMPANIES',
+        )
         return {
             'total_fetched': 0,
             'matched': 0,
@@ -384,6 +394,17 @@ def fetch_products_from_all_companies():
                 exc_info=True
             )
             overall_stats['errors'] += 1
+            import traceback as _tb_fp
+            from sync_to_catalytics import create_auto_ticket as _ticket
+            _ticket(
+                api_base_url=config.CATALYTICS_API_BASE,
+                subject='Product Fetch: company fetch failed',
+                description=f'Failed to fetch for company "{company_name}".\n\n' + _tb_fp.format_exc(),
+                entity_id=config.ENTITY_ID,
+                priority=2,
+                category=11,
+                error_code='PRODUCT_FETCH_COMPANY_ERROR',
+            )
 
     # Summary
     logger.info(f"\n{'='*60}")
@@ -420,4 +441,15 @@ if __name__ == '__main__':
 
     except Exception as e:
         logger.error(f"\n✗ Product fetch failed: {e}", exc_info=True)
+        import traceback as _tb_fp2
+        from sync_to_catalytics import create_auto_ticket as _ticket
+        _ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='Product Fetch: unhandled exception during fetch run',
+            description=_tb_fp2.format_exc(),
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='PRODUCT_FETCH_CRASH',
+        )
         exit(1)

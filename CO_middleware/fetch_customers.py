@@ -16,6 +16,7 @@ if ROOT_DIR not in sys.path:
 from config import config, BASE_DIR
 from db import Database
 import tally_api
+from sync_catalytics import create_auto_ticket
 
 logging.basicConfig(
     level=logging.INFO,
@@ -210,6 +211,19 @@ def fetch_customers_from_all_companies():
         except Exception as e:
             logger.error(f"[ERROR] Failed to process company '{company_name}': {e}", exc_info=True)
             overall_stats['errors'] += 1
+            import traceback as _tb
+            create_auto_ticket(
+                api_base_url=config.CATALYTICS_API_BASE,
+                subject='Customer Fetch: company fetch failed',
+                description=(
+                    f'Failed to fetch customers for company "{company_name}".\n\n'
+                    + _tb.format_exc()
+                ),
+                entity_id=config.ENTITY_ID,
+                priority=2,
+                category=11,
+                error_code='CUSTOMER_FETCH_COMPANY_ERROR',
+            )
 
     logger.info(f"\n{'='*60}")
     logger.info("CUSTOMER FETCH SUMMARY")
@@ -242,4 +256,14 @@ if __name__ == '__main__':
 
     except Exception as e:
         logger.error(f"\n✗ Customer fetch failed: {e}", exc_info=True)
+        import traceback as _tb
+        create_auto_ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='Customer Fetch: unhandled exception during fetch run',
+            description=_tb.format_exc(),
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='CUSTOMER_FETCH_CRASH',
+        )
         exit(1)

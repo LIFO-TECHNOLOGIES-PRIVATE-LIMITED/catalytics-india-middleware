@@ -7,6 +7,7 @@ Uses pre-parsed fields (product_master_name, variant_name, unit_name, etc.)
 import argparse
 import json
 import logging
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -22,6 +23,7 @@ import config as cfg
 from config import config, BASE_DIR
 from db import Database
 from logging_utils import setup_logging
+from sync_catalytics import create_auto_ticket
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
 logger = logging.getLogger("tally_sync_products")
@@ -69,7 +71,6 @@ def build_config(args: argparse.Namespace) -> SyncConfig:
     return SyncConfig(
         db_path=db_path,
         api_base_url=args.api_base_url or cfg.get_env("CATALYTICS_API_BASE_URL") or "",
-        api_key=args.api_key or cfg.get_env("CATALYTICS_API_KEY"),
         entity_id=args.entity_id or cfg.get_env_int("CATALYTICS_ENTITY_ID"),
         company=args.company or cfg.get_env("TALLY_COMPANY"),
         batch_size=args.batch_size or cfg.get_env_int("SYNC_BATCH_SIZE", 10) or 10,
@@ -109,6 +110,7 @@ def run_once(sync_config: SyncConfig) -> Dict[str, int]:
     total_sent = 0
     total_ok = 0
     total_fail = 0
+    failed_items = []
 
     for product in products:
         product_id = product['id']
@@ -229,11 +231,13 @@ def run_once(sync_config: SyncConfig) -> Dict[str, int]:
                     pass
                 logger.error(f"Sync failed for '{name}': {error_msg}")
                 db.mark_product_sync_failed(product_id, error_msg, error_response_json)
+                failed_items.append(f"'{name}': {error_msg}")
                 total_fail += 1
 
         except Exception as e:
             logger.error(f"Error syncing '{name}': {e}", exc_info=True)
             db.mark_product_sync_failed(product_id, str(e))
+            failed_items.append(f"'{name}': {e}")
             total_fail += 1
 
     logger.info("-" * 60)
@@ -244,6 +248,23 @@ def run_once(sync_config: SyncConfig) -> Dict[str, int]:
     logger.info("-" * 60)
 
     db.close()
+
+    # Auto-ticket: raise a support ticket if all sent products failed
+    if total_sent > 0 and total_fail > 0 and total_ok == 0:
+        create_auto_ticket(
+            api_base_url=sync_config.api_base_url,
+            subject='Product Sync: all products failed to sync',
+            description=(
+                f'Product sync run completed with {total_sent} products sent but 0 succeeded.\n'
+                f'Failed: {total_fail}\n\n'
+                f'Errors:\n' + '\n'.join(failed_items[:20])
+            ),
+            entity_id=sync_config.entity_id,
+            priority=1,
+            category=11,
+            error_code='PRODUCT_SYNC_ALL_FAILED',
+        )
+
     return {'sent': total_sent, 'ok': total_ok, 'failed': total_fail}
 
 
@@ -267,8 +288,17 @@ def main() -> int:
     sync_config = build_config(args)
     try:
         run_once(sync_config)
-    except Exception:
+    except Exception as exc:
         logger.exception("Product sync run failed")
+        create_auto_ticket(
+            api_base_url=sync_config.api_base_url,
+            subject='Product Sync: unhandled exception during sync run',
+            description=traceback.format_exc(),
+            entity_id=sync_config.entity_id,
+            priority=1,
+            category=11,
+            error_code='PRODUCT_SYNC_CRASH',
+        )
         return 1
     return 0
 

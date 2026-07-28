@@ -23,6 +23,46 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+
+def create_auto_ticket(
+    api_base_url: str,
+    subject: str,
+    description: str,
+    entity_id=None,
+    priority: int = 2,
+    category: int = 11,
+    error_code: str = '',
+) -> bool:
+    """POST to /support-ticket/auto_ticket. Never raises — safe from any exception handler."""
+    try:
+        base = (api_base_url or '').rstrip('/')
+        if '/import' in base:
+            base = base.rsplit('/import', 1)[0]
+        url = f"{base}/support-ticket/auto_ticket"
+        headers = {'Content-Type': 'application/json'}
+        payload = {
+            'subject':     subject[:255],
+            'description': description,
+            'priority':    priority,
+            'category':    category,
+        }
+        if entity_id:
+            payload['entity_id'] = entity_id
+        if error_code:
+            payload['error_code'] = error_code
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('status') == 1:
+                logger.info('Auto-ticket created: %s', data.get('ticket_number', ''))
+                return True
+            logger.warning('Auto-ticket API returned error: %s', data.get('message', ''))
+        else:
+            logger.warning('Auto-ticket request failed: HTTP %s', resp.status_code)
+    except Exception as exc:
+        logger.warning('Auto-ticket creation failed (non-fatal): %s', exc)
+    return False
+
 def _attach_invoice_sync_file_handler():
     """Log invoice sync operations to dedicated file."""
     log_path = Path(BASE_DIR) / 'logs' / 'invoice_sync.log'
@@ -1149,7 +1189,8 @@ class CatalyticsSyncer:
             'total': len(customers),
             'synced': 0,
             'verified': 0,
-            'failed': 0
+            'failed': 0,
+            'error_messages': [],
         }
 
         batch_size = self.CUSTOMER_BATCH_SIZE
@@ -1171,6 +1212,7 @@ class CatalyticsSyncer:
                     logger.error(f"[SKIP] '{name}': {error}")
                     err_json = json.dumps({'prepare_error': error, 'customer_name': name})
                     self.db.mark_customer_sync_failed(customer['id'], error, err_json)
+                    stats['error_messages'].append(f"'{name}': {error}")
                     stats['failed'] += 1
                     continue
                 batch_ledgers.append(ledger)
@@ -1199,6 +1241,7 @@ class CatalyticsSyncer:
                 for customer in batch_customers:
                     self.db.mark_customer_sync_failed(customer['id'], f"Batch request failed: {e}", err_json)
                     stats['failed'] += 1
+                stats['error_messages'].append(f"Batch {batch_idx + 1}: API request failed: {e}")
                 continue
 
             # Step 3: Parse response and match results to customers
@@ -1215,6 +1258,7 @@ class CatalyticsSyncer:
                 for customer in batch_customers:
                     self.db.mark_customer_sync_failed(customer['id'], error_msg, err_json)
                     stats['failed'] += 1
+                stats['error_messages'].append(f"Batch {batch_idx + 1}: {error_msg}")
                 continue
 
             try:
@@ -1225,6 +1269,7 @@ class CatalyticsSyncer:
                 for customer in batch_customers:
                     self.db.mark_customer_sync_failed(customer['id'], "Invalid JSON response", err_json)
                     stats['failed'] += 1
+                stats['error_messages'].append(f"Batch {batch_idx + 1}: invalid JSON response")
                 continue
 
             data = result.get('data', result)
@@ -1264,6 +1309,7 @@ class CatalyticsSyncer:
                     error_msg = res.get('message', 'Unknown error')
                     error_type = res.get('error_type', '')
                     self.db.mark_customer_sync_failed(cust_id, f"{error_type}: {error_msg}", json.dumps(res))
+                    stats['error_messages'].append(f"'{cust_name}': {error_type + ': ' if error_type else ''}{error_msg}")
                     stats['failed'] += 1
                     logger.error(f"  [FAILED] '{cust_name}': {error_type} {error_msg}")
 
@@ -1478,7 +1524,8 @@ class CatalyticsSyncer:
             'total': len(products),
             'synced': 0,
             'verified': 0,
-            'failed': 0
+            'failed': 0,
+            'error_messages': [],
         }
 
         batch_size = self.PRODUCT_BATCH_SIZE
@@ -1500,6 +1547,7 @@ class CatalyticsSyncer:
                     logger.error(f"[SKIP] '{name}': {error}")
                     err_json = json.dumps({'prepare_error': error, 'product_name': name})
                     self.db.mark_product_sync_failed(product['id'], error, err_json)
+                    stats['error_messages'].append(f"'{name}': {error}")
                     stats['failed'] += 1
                     continue
                 batch_items.append(stock_item)
@@ -1528,6 +1576,7 @@ class CatalyticsSyncer:
                 for product in batch_products:
                     self.db.mark_product_sync_failed(product['id'], f"Batch request failed: {e}", err_json)
                     stats['failed'] += 1
+                stats['error_messages'].append(f"Batch {batch_idx + 1}: API request failed: {e}")
                 continue
 
             # Step 3: Parse response and match results to products
@@ -1544,6 +1593,7 @@ class CatalyticsSyncer:
                 for product in batch_products:
                     self.db.mark_product_sync_failed(product['id'], error_msg, err_json)
                     stats['failed'] += 1
+                stats['error_messages'].append(f"Batch {batch_idx + 1}: {error_msg}")
                 continue
 
             try:
@@ -1554,6 +1604,7 @@ class CatalyticsSyncer:
                 for product in batch_products:
                     self.db.mark_product_sync_failed(product['id'], "Invalid JSON response", err_json)
                     stats['failed'] += 1
+                stats['error_messages'].append(f"Batch {batch_idx + 1}: invalid JSON response")
                 continue
 
             data = result.get('data', result)
@@ -1591,6 +1642,7 @@ class CatalyticsSyncer:
                 else:
                     error_msg = res.get('message', 'Unknown error')
                     self.db.mark_product_sync_failed(prod_id, error_msg, json.dumps(res))
+                    stats['error_messages'].append(f"'{prod_name}': {error_msg}")
                     stats['failed'] += 1
                     logger.error(f"  [FAILED] '{prod_name}': {error_msg}")
 
@@ -2177,6 +2229,7 @@ class CatalyticsSyncer:
             'synced': 0,
             'verified': 0,
             'failed': 0,
+            'error_messages': [],
         }
 
         batch_size = self.INVOICE_BATCH_SIZE
@@ -2239,6 +2292,7 @@ class CatalyticsSyncer:
                 except Exception as exc:
                     logger.error(f"Error preparing invoice #{voucher_no}: {exc}", exc_info=True)
                     self.db.mark_invoice_sync_failed(invoice_id, str(exc))
+                    stats['error_messages'].append(f"Invoice #{voucher_no}: payload prep error: {exc}")
                     stats['failed'] += 1
                     continue
 
@@ -2270,6 +2324,7 @@ class CatalyticsSyncer:
                 for inv in batch_invoices:
                     self.db.mark_invoice_sync_failed(inv['id'], f"Batch request failed: {e}", err_json)
                     stats['failed'] += 1
+                stats['error_messages'].append(f"Batch {batch_idx + 1}: API request failed: {e}")
                 continue
 
             # Step 3: Parse response
@@ -2286,6 +2341,7 @@ class CatalyticsSyncer:
                 for inv in batch_invoices:
                     self.db.mark_invoice_sync_failed(inv['id'], error_msg, err_json)
                     stats['failed'] += 1
+                stats['error_messages'].append(f"Batch {batch_idx + 1}: {error_msg}")
                 continue
 
             try:
@@ -2296,6 +2352,7 @@ class CatalyticsSyncer:
                 for inv in batch_invoices:
                     self.db.mark_invoice_sync_failed(inv['id'], "Invalid JSON response", err_json)
                     stats['failed'] += 1
+                stats['error_messages'].append(f"Batch {batch_idx + 1}: invalid JSON response")
                 continue
 
             data = result.get('data', result)
@@ -2339,6 +2396,7 @@ class CatalyticsSyncer:
                 else:
                     error_msg = res.get('message', 'Unknown error')
                     self.db.mark_invoice_sync_failed(inv_id, error_msg, json.dumps(res))
+                    stats['error_messages'].append(f"Invoice #{voucher_no}: {error_msg}")
                     stats['failed'] += 1
                     logger.error(f"  [FAILED] #{voucher_no}: {error_msg}")
 
@@ -2378,6 +2436,7 @@ class CatalyticsSyncer:
             'synced': 0,
             'verified': 0,
             'failed': 0,
+            'error_messages': [],
         }
 
         for invoice_row in invoices:
@@ -2534,6 +2593,21 @@ class CatalyticsSyncer:
             logger.info(f"  Total: {stats['total']}")
             logger.info(f"  Verified: {stats['verified']}")
             logger.info(f"  Failed: {stats['failed']}")
+            if stats['failed'] > 0:
+                _err_msgs = stats.get('error_messages', [])
+                _err_detail = ('\n\nErrors:\n' + '\n'.join(_err_msgs[:20])) if _err_msgs else ''
+                create_auto_ticket(
+                    api_base_url=config.CATALYTICS_API_BASE,
+                    subject=f'{entity_type.capitalize()} Sync: errors during sync run',
+                    description=(
+                        f'{entity_type.capitalize()} sync had {stats["failed"]} failure(s) '
+                        f'out of {stats["total"]} total.{_err_detail}'
+                    ),
+                    entity_id=config.ENTITY_ID,
+                    priority=2,
+                    category=11,
+                    error_code=f'{entity_type.upper()}_SYNC_ERRORS',
+                )
         logger.info("="*60)
 
         return results
@@ -2547,5 +2621,15 @@ if __name__ == '__main__':
         logger.info("\nSync cycle completed successfully")
 
     except Exception as e:
+        import traceback as _tb_sync
         logger.error(f"\nSync cycle failed: {e}", exc_info=True)
+        create_auto_ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='Sync: unhandled exception during sync cycle',
+            description=_tb_sync.format_exc(),
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='SYNC_CYCLE_CRASH',
+        )
         exit(1)

@@ -163,7 +163,6 @@ def _env_namespace() -> SimpleNamespace:
         log_json=cfg.get_env_bool("LOG_JSON", False),
         log_file=None,
         api_base_url=cfg.get_env("CATALYTICS_API_BASE_URL"),
-        api_key=cfg.get_env("CATALYTICS_API_KEY"),
         batch_size=cfg.get_env_int("SYNC_BATCH_SIZE"),
         limit=cfg.get_env_int("SYNC_LIMIT"),
         max_attempts=cfg.get_env_int("SYNC_MAX_ATTEMPTS", 100),

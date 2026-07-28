@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 if ROOT_DIR not in sys.path:
@@ -13,6 +14,7 @@ from fetch_customers import build_config as build_fetch_customers_config, run_on
 from fetch_products import build_config as build_fetch_products_config, run_once as fetch_products_once
 from sync_customers import build_config as build_sync_customers_config, run_once as sync_customers_once
 from sync_products import build_config as build_sync_products_config, run_once as sync_products_once
+from sync_catalytics import create_auto_ticket
 from logging_utils import setup_logging
 
 DEFAULT_ENV_PATH = cfg.resolve_env_path(os.path.dirname(__file__))
@@ -55,26 +57,52 @@ def main() -> int:
 
     while True:
         if args.mode in ("customers", "both"):
-            fetch_config = build_fetch_customers_config(args)
-            logger.info("Starting customer fetch run")
-            fetch_stats = fetch_customers_once(fetch_config)
-            logger.info("Customer fetch complete: %s", fetch_stats)
+            try:
+                fetch_config = build_fetch_customers_config(args)
+                logger.info("Starting customer fetch run")
+                fetch_stats = fetch_customers_once(fetch_config)
+                logger.info("Customer fetch complete: %s", fetch_stats)
 
-            sync_config = build_sync_customers_config(args)
-            logger.info("Starting customer sync run")
-            sync_stats = sync_customers_once(sync_config)
-            logger.info("Customer sync complete: %s", sync_stats)
+                sync_config = build_sync_customers_config(args)
+                logger.info("Starting customer sync run")
+                sync_stats = sync_customers_once(sync_config)
+                logger.info("Customer sync complete: %s", sync_stats)
+            except Exception as exc:
+                logger.exception("Customer fetch/sync run failed")
+                _sync_cfg = build_sync_customers_config(args)
+                create_auto_ticket(
+                    api_base_url=_sync_cfg.api_base_url,
+                    subject='Customer Sync: unhandled exception in loop run',
+                    description=traceback.format_exc(),
+                    entity_id=_sync_cfg.entity_id,
+                    priority=1,
+                    category=11,
+                    error_code='CUSTOMER_SYNC_CRASH',
+                )
 
         if args.mode in ("products", "both"):
-            fetch_config = build_fetch_products_config(args)
-            logger.info("Starting product fetch run")
-            fetch_stats = fetch_products_once(fetch_config)
-            logger.info("Product fetch complete: %s", fetch_stats)
+            try:
+                fetch_config = build_fetch_products_config(args)
+                logger.info("Starting product fetch run")
+                fetch_stats = fetch_products_once(fetch_config)
+                logger.info("Product fetch complete: %s", fetch_stats)
 
-            sync_config = build_sync_products_config(args)
-            logger.info("Starting product sync run")
-            sync_stats = sync_products_once(sync_config)
-            logger.info("Product sync complete: %s", sync_stats)
+                sync_config = build_sync_products_config(args)
+                logger.info("Starting product sync run")
+                sync_stats = sync_products_once(sync_config)
+                logger.info("Product sync complete: %s", sync_stats)
+            except Exception as exc:
+                logger.exception("Product fetch/sync run failed")
+                _sync_cfg = build_sync_products_config(args)
+                create_auto_ticket(
+                    api_base_url=_sync_cfg.api_base_url,
+                    subject='Product Sync: unhandled exception in loop run',
+                    description=traceback.format_exc(),
+                    entity_id=_sync_cfg.entity_id,
+                    priority=1,
+                    category=11,
+                    error_code='PRODUCT_SYNC_CRASH',
+                )
 
         if args.once:
             break

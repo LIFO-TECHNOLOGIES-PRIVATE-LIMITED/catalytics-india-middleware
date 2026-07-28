@@ -880,6 +880,16 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
 
     if not active_companies:
         logger.error("No active Tally companies configured")
+        from sync_to_catalytics import create_auto_ticket as _ticket
+        _ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='DC Fetch: no active Tally companies configured',
+            description='No active Tally companies are configured. Check TALLY_COMPANIES in .env.',
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='DC_FETCH_NO_COMPANIES',
+        )
         return {'total_fetched': 0, 'new_saved': 0, 'updated_saved': 0, 'already_exists': 0, 'errors': 0}
 
     logger.info(f"Starting batched invoice fetch from {len(active_companies)} companies")
@@ -918,6 +928,17 @@ def fetch_invoices_from_all_companies(from_date=None, to_date=None):
         except Exception as e:
             logger.error(f"Company process failed: {e}")
             overall_stats['errors'] += 1
+            import traceback as _tb_fi_co
+            from sync_to_catalytics import create_auto_ticket as _ticket
+            _ticket(
+                api_base_url=config.CATALYTICS_API_BASE,
+                subject='DC Fetch: company fetch failed',
+                description=f'Company fetch failed.\n\n' + _tb_fi_co.format_exc(),
+                entity_id=config.ENTITY_ID,
+                priority=2,
+                category=11,
+                error_code='DC_FETCH_COMPANY_ERROR',
+            )
 
     logger.info(f"\n{'='*60}")
     logger.info("FINAL FETCH SUMMARY")
@@ -955,4 +976,15 @@ if __name__ == '__main__':
         fetch_invoices_from_all_companies(from_date, to_date)
     except Exception as e:
         logger.error(f"Fetch failed: {e}")
+        import traceback as _tb_fi_cr
+        from sync_to_catalytics import create_auto_ticket as _ticket
+        _ticket(
+            api_base_url=config.CATALYTICS_API_BASE,
+            subject='DC Fetch: unhandled exception during fetch run',
+            description=_tb_fi_cr.format_exc(),
+            entity_id=config.ENTITY_ID,
+            priority=1,
+            category=11,
+            error_code='DC_FETCH_CRASH',
+        )
         exit(1)
