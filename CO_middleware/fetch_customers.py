@@ -84,8 +84,26 @@ def _map_ledger_to_customer(ledger: dict, company_name: str) -> dict:
         else:
             address = (ledger.get('MAILINGNAME') or '').strip()
 
-    # Delivery addresses: list of dicts with name/address/state/pincode/gstin
+    # Delivery addresses: list of dicts with name/address/state/pincode/gstin.
+    # These come from Tally's "multiple mailing details" (LEDMULTIADDRESSLIST).
     delivery_addresses = ledger.get('DELIVERY_ADDRESSES') or []
+
+    # When the customer has NO separate multiple mailing details (i.e. "Set/alter
+    # multiple mailing details: No"), fall back to the primary (billing) address as
+    # the delivery address, so every customer still has at least one delivery address.
+    if not delivery_addresses and address:
+        delivery_addresses = [{
+            'name': name,
+            'address': address,
+            'state': state,
+            'country': (ledger.get('COUNTRY') or ledger.get('COUNTRYOFRESIDENCE') or 'India').strip() or 'India',
+            'pincode': pincode,
+            'gstin': gstin,
+        }]
+
+    # ALTERID: Tally's master alteration counter — increments on ANY edit to the
+    # ledger (name, GST, phone, address, …). Used for reliable change detection.
+    alter_id = str(ledger.get('ALTERID') or '').strip()
 
     return {
         'tally_guid': guid,
@@ -100,6 +118,7 @@ def _map_ledger_to_customer(ledger: dict, company_name: str) -> dict:
         'phone': phone,
         'email': email,
         'delivery_addresses_json': json.dumps(delivery_addresses) if delivery_addresses else None,
+        'alter_id': alter_id,
         'data_json': json.dumps(ledger),
     }
 
@@ -239,6 +258,25 @@ def fetch_customers_from_all_companies():
     logger.info(f"Total Customers in DB: {db_stats['total_customers']}")
     logger.info(f"Synced Customers:      {db_stats['synced_customers']}")
     logger.info(f"Customers by Company:  {db_stats['customers_by_company']}")
+
+    # ALTERID coverage — confirm Tally's ALTERID is flowing into local customer rows.
+    try:
+        _cov = db.query(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN alter_id IS NOT NULL AND alter_id != '' THEN 1 ELSE 0 END) AS with_alter "
+            "FROM customers"
+        )
+        _samp = db.query(
+            "SELECT name, alter_id FROM customers WHERE alter_id IS NOT NULL AND alter_id != '' LIMIT 1"
+        )
+        logger.info(
+            "[ALTERID] customers with alter_id: %s/%s%s",
+            (_cov['with_alter'] or 0) if _cov else 0,
+            (_cov['total'] or 0) if _cov else 0,
+            f" (sample: {_samp['name']}={_samp['alter_id']})" if _samp else "",
+        )
+    except Exception as _e:
+        logger.warning("[ALTERID] customer coverage check failed: %s", _e)
 
     db.close()
     return overall_stats

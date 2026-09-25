@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('templates', 'templates'), ('version.json', '.')]
 binaries = []
-hiddenimports = ['fetch_customers', 'fetch_products', 'fetch_invoices', 'sync_to_catalytics', 'verify_sync', 'automation_manager', 'data_matcher', 'log_capture', 'fetch_master_data']
+hiddenimports = ['fetch_customers', 'fetch_products', 'fetch_invoices', 'sync_to_catalytics', 'verify_sync', 'automation_manager', 'data_matcher']
 tmp_ret = collect_all('psycopg2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -29,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='bol_dashboard',
+    name='arasan_gas_dashboard',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

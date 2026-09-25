@@ -108,7 +108,22 @@ def _normalize_customer_name(raw_name):
 
 
 def _customer_changed(existing_row, customer_data):
-    """Return True only when meaningful customer fields changed."""
+    """Return True only when meaningful customer fields changed.
+
+    ALTERID: Tally bumps a master's ALTERID on ANY edit (including address-only
+    edits that other normalized fields may not capture). A change in ALTERID
+    therefore reliably flags the row for re-sync. The guard below only treats
+    ALTERID as "changed" when a non-empty value was previously stored, so the
+    FIRST fetch after this feature ships (backfilling alter_id from empty) does
+    NOT flip every existing row to unsynced.
+    """
+    stored_alter = str(existing_row['alter_id']) if (
+        existing_row and 'alter_id' in existing_row.keys() and existing_row['alter_id']
+    ) else ''
+    new_alter = str(customer_data.get('alter_id') or '')
+    if stored_alter and stored_alter != new_alter:
+        return True
+
     fields = (
         'name', 'tally_company', 'gstin', 'pan', 'address',
         'state', 'city', 'pincode', 'phone', 'email', 'data_json'
@@ -209,6 +224,7 @@ def fetch_customers_from_all_companies():
                     'pincode': customer.get('pincode', ''),
                     'phone': customer.get('phone', ''),
                     'email': customer.get('email', ''),
+                    'alter_id': customer.get('alter_id', ''),
                     'data_json': json.dumps(customer),
                 }
 
@@ -224,6 +240,9 @@ def fetch_customers_from_all_companies():
                             )
                             overall_stats['updated'] += 1
                         else:
+                            # Backfill alter_id without touching sync state, so the
+                            # next real edit is detected but this row is not re-synced.
+                            db.backfill_customer_alter_id(existing['id'], customer_data.get('alter_id'))
                             logger.debug(f"[UNCHANGED] '{customer_name}'")
                     else:
                         db.insert_customer(customer_data)
@@ -273,6 +292,25 @@ def fetch_customers_from_all_companies():
     logger.info(f"Total Customers: {db_stats['total_customers']}")
     logger.info(f"Customers by Company: {db_stats['customers_by_company']}")
     logger.info(f"Synced Customers: {db_stats['synced_customers']}")
+
+    # ALTERID coverage — confirm Tally's ALTERID is flowing into local customer rows.
+    try:
+        _cov = db.query(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN alter_id IS NOT NULL AND alter_id != '' THEN 1 ELSE 0 END) AS with_alter "
+            "FROM customers"
+        )
+        _samp = db.query(
+            "SELECT name, alter_id FROM customers WHERE alter_id IS NOT NULL AND alter_id != '' LIMIT 1"
+        )
+        logger.info(
+            "[ALTERID] customers with alter_id: %s/%s%s",
+            (_cov['with_alter'] or 0) if _cov else 0,
+            (_cov['total'] or 0) if _cov else 0,
+            f" (sample: {_samp['name']}={_samp['alter_id']})" if _samp else "",
+        )
+    except Exception as _e:
+        logger.warning("[ALTERID] customer coverage check failed: %s", _e)
 
     db.close()
     return overall_stats

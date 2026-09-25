@@ -71,6 +71,7 @@ def build_config(args: argparse.Namespace) -> SyncConfig:
     return SyncConfig(
         db_path=db_path,
         api_base_url=args.api_base_url or cfg.get_env("CATALYTICS_API_BASE_URL") or "",
+        api_key=getattr(args, 'api_key', None) or cfg.get_env("CATALYTICS_API_KEY"),
         entity_id=args.entity_id or cfg.get_env_int("CATALYTICS_ENTITY_ID"),
         company=args.company or cfg.get_env("TALLY_COMPANY"),
         batch_size=args.batch_size or cfg.get_env_int("SYNC_BATCH_SIZE", 10) or 10,

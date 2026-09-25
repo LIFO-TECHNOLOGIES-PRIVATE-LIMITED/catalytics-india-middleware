@@ -621,6 +621,56 @@ def _extract_po_date(voucher: Dict[str, Any]) -> str:
     return ""
 
 
+def _compute_voucher_tax(voucher: Dict[str, Any], items: List[Dict[str, Any]]) -> None:
+    """Extract the DC's GST from its Tally tax ledgers and inject explicit,
+    authoritative tax fields the backend consumes directly.
+
+    Tally records CGST/SGST/IGST once at the voucher level (a common rate that
+    applies to every product). We total those tax-ledger amounts and expose them
+    as INVOICETAX / INVOICETOTAL (plus per-tax amounts) so the backend can
+    distribute the tax across product lines proportionally to each line's taxable
+    amount — without having to re-guess from ledger names.
+    """
+    ledger_entries = voucher.get("LEDGERENTRIES") or []
+    if not ledger_entries:
+        return
+
+    cgst = sgst = igst = 0.0
+    for entry in ledger_entries:
+        name = str(entry.get("LEDGERNAME") or "").upper()
+        amount = abs(db._safe_float(entry.get("AMOUNT")) or 0.0)
+        if not amount:
+            continue
+        if "CGST" in name:
+            cgst += amount
+        elif "IGST" in name:
+            igst += amount
+        elif "SGST" in name or "UTGST" in name:
+            sgst += amount
+        elif "GST" in name:
+            # Bare/combined "GST" ledger — split evenly into CGST + SGST.
+            cgst += amount / 2
+            sgst += amount / 2
+        # Non-GST ledgers (party total, round-off, deposits) are ignored here.
+
+    tax_total = round(cgst + sgst + igst, 2)
+    if tax_total <= 0:
+        return
+
+    taxable_total = 0.0
+    for item in items:
+        taxable_total += db._safe_float(item.get("AMOUNT")) or 0.0
+
+    voucher["INVOICETAX"] = tax_total
+    voucher["INVOICETOTAL"] = round(taxable_total + tax_total, 2)
+    if cgst:
+        voucher["CGSTAMOUNT"] = round(cgst, 2)
+    if sgst:
+        voucher["SGSTAMOUNT"] = round(sgst, 2)
+    if igst:
+        voucher["IGSTAMOUNT"] = round(igst, 2)
+
+
 def _enrich_voucher(
     voucher: Dict[str, Any],
     note: Dict[str, Any],
@@ -753,6 +803,11 @@ def _enrich_voucher(
     # INVENTORY â€" ensure items are attached
     if not voucher.get("INVENTORY"):
         voucher["INVENTORY"] = items
+
+    # Compute explicit GST totals from the DC's tax ledgers (before the fallback
+    # below can replace real LEDGERENTRIES) so the backend applies the common
+    # CGST/SGST to every product line.
+    _compute_voucher_tax(voucher, items)
 
     # LEDGERENTRIES fallback
     if not voucher.get("LEDGERENTRIES"):
@@ -1371,6 +1426,7 @@ def build_config(args: argparse.Namespace) -> SyncConfig:
         db_path=args.db_path or cfg.get_env("TALLY_DB_PATH") or "",
         master_db_path=_master_db,
         api_base_url=args.api_base_url or cfg.get_env("CATALYTICS_API_BASE_URL") or "",
+        api_key=getattr(args, 'api_key', None) or cfg.get_env("CATALYTICS_API_KEY"),
         entity_id=args.entity_id or cfg.get_env_int("CATALYTICS_ENTITY_ID"),
         company=args.company or cfg.get_env("TALLY_COMPANY"),
         batch_size=args.batch_size or cfg.get_env_int("SYNC_BATCH_SIZE", 10) or 10,

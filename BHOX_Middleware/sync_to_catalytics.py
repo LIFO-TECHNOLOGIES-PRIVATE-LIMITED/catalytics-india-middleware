@@ -1711,13 +1711,22 @@ class CatalyticsSyncer:
             'delivery', 'dispatch', 'challan',
         )
 
-        # Try multiple field names for PO number (in priority order)
-        # Priority: actual order numbers > generic references > transport references
+        # The DC/voucher number must never be treated as a PO. Tally auto-fills
+        # REFERENCE / VOUCHERREFERENCE with the voucher number, so guard against it.
+        voucher_no_norm = ''.join(
+            str(invoice.get('tally_voucher_no') or invoice.get('voucher_no')
+                or data.get('VOUCHERNUMBER') or '').split()
+        ).lower()
+
+        # PO number must come ONLY from genuine customer purchase-order fields.
+        # Do NOT fall back to REFERENCE / VOUCHERREFERENCE / PONUMBER / BASICORDERREF:
+        # in Tally those "reference" fields are auto-populated with the voucher/DC
+        # number (and BASICORDERREF holds the delivery-type flag d/c), which would
+        # wrongly surface the DC number as the PO. BHOX invoices carry no PO, so
+        # this correctly yields an empty PO instead of the DC number.
         fields_to_try = [
-            'PARTYORDERNO',          # Customer's PO number (highest priority)
+            'PARTYORDERNO',          # Customer's PO number ("Order No(s)")
             'AGGREMENTORDERNO',      # Agreement/order number
-            'ORDERREF', 'ORDERINGNO', 'REFNO', 'REFERENCE',  # Generic order refs
-            'PONUMBER', 'BASICORDERREF', 'VOUCHERREFERENCE',  # Tally internal (lowest priority)
         ]
 
         for field in fields_to_try:
@@ -1730,6 +1739,9 @@ class CatalyticsSyncer:
             if value_lower in non_po_values:
                 continue
             if any(key in value_lower for key in non_po_keywords):
+                continue
+            # Never treat the DC/voucher number itself as a PO number
+            if voucher_no_norm and ''.join(value.split()).lower() == voucher_no_norm:
                 continue
 
             # Check if it looks like a real PO number (has digits or is reasonably sized)
@@ -2182,13 +2194,22 @@ class CatalyticsSyncer:
         if 'customer pickup' in other_ref or 'pickup' in other_ref or other_ref == 'c':
             voucher.setdefault('TERMSOFDELIVERY', 'Customer Pickup')
 
-        # Extract and clean PO number
+        # Extract and clean PO number.
+        # BHOX invoices have no PO — _extract_po_number returns '' in that case,
+        # so we strip any PO-like fields (incl. the DC/voucher number that Tally
+        # leaves in REFERENCE/PONUMBER) instead of leaking them to the DC.
         po_number = self._extract_po_number(invoice)
         if po_number:
             voucher['PARTYORDERNO'] = po_number
+            po_date = self._extract_po_date(invoice)
+            if po_date:
+                voucher['PARTYORDERDATE'] = po_date
+            else:
+                voucher.pop('PARTYORDERDATE', None)
         else:
             voucher.pop('PARTYORDERNO', None)
             voucher.pop('PONUMBER', None)
+            voucher.pop('PARTYORDERDATE', None)
 
         # Pass the exact Tally invoice total (party ledger amount = goods + GST + all charges)
         # so the backend can store it directly as challan_total_amount without recomputing.

@@ -236,6 +236,7 @@ def fetch_products_from_all_companies():
                     'unit': product.get('unit', ''),
                     'rate': product.get('rate', 0.0),
                     'description': product.get('description', ''),
+                    'alter_id': str(product.get('ALTERID') or product.get('alter_id') or '').strip(),
                     'data_json': json.dumps(product),
                     'product_master_name': parsed['product_master_name'],
                     'variant_name': parsed['variant_name'],
@@ -313,6 +314,25 @@ def fetch_products_from_all_companies():
     logger.info(f"Total Products: {db_stats['total_products']}")
     logger.info(f"Products by Company: {db_stats['products_by_company']}")
     logger.info(f"Synced Products: {db_stats['synced_products']}")
+
+    # ALTERID coverage — confirm Tally's ALTERID is flowing into local product rows.
+    try:
+        _cov = db.query(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN alter_id IS NOT NULL AND alter_id != '' THEN 1 ELSE 0 END) AS with_alter "
+            "FROM products"
+        )
+        _samp = db.query(
+            "SELECT name, alter_id FROM products WHERE alter_id IS NOT NULL AND alter_id != '' LIMIT 1"
+        )
+        logger.info(
+            "[ALTERID] products with alter_id: %s/%s%s",
+            (_cov['with_alter'] or 0) if _cov else 0,
+            (_cov['total'] or 0) if _cov else 0,
+            f" (sample: {_samp['name']}={_samp['alter_id']})" if _samp else "",
+        )
+    except Exception as _e:
+        logger.warning("[ALTERID] product coverage check failed: %s", _e)
 
     db.close()
     return overall_stats

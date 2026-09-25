@@ -97,6 +97,7 @@ class Database:
                 pincode TEXT,
                 phone TEXT,
                 email TEXT,
+                alter_id TEXT,
                 data_json TEXT,
                 sync_request_json TEXT,
                 last_response_json TEXT,
@@ -122,6 +123,7 @@ class Database:
                 unit TEXT,
                 rate REAL,
                 description TEXT,
+                alter_id TEXT,
                 data_json TEXT,
                 product_master_name TEXT,
                 variant_name TEXT,
@@ -304,6 +306,10 @@ class Database:
                 ('location_name', 'TEXT'),
                 ('filling_station', 'TEXT'),
             ],
+            'customers': [
+                # ALTERID-based change detection (Tally master alteration counter)
+                ('alter_id', 'TEXT'),
+            ],
             'products': [
                 ('product_master_name', 'TEXT'),
                 ('variant_name', 'TEXT'),
@@ -315,6 +321,8 @@ class Database:
                 ('igst_rate', 'REAL'),
                 ('cgst_rate', 'REAL'),
                 ('sgst_rate', 'REAL'),
+                # ALTERID-based change detection (Tally master alteration counter)
+                ('alter_id', 'TEXT'),
             ]
         }
 
@@ -371,8 +379,8 @@ class Database:
             INSERT INTO customers (
                 tally_guid, name, tally_company, gstin, pan,
                 address, state, city, pincode, phone, email,
-                data_json, first_fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                alter_id, data_json, first_fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
             customer_data.get('tally_guid'),
             customer_data.get('name'),
@@ -385,6 +393,7 @@ class Database:
             customer_data.get('pincode'),
             customer_data.get('phone'),
             customer_data.get('email'),
+            customer_data.get('alter_id'),
             customer_data.get('data_json')
         ))
 
@@ -394,7 +403,7 @@ class Database:
             UPDATE customers
             SET tally_guid = ?, gstin = ?, pan = ?,
                 address = ?, state = ?, city = ?, pincode = ?,
-                phone = ?, email = ?, data_json = ?,
+                phone = ?, email = ?, alter_id = ?, data_json = ?,
                 is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
                 last_updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
@@ -408,9 +417,23 @@ class Database:
             customer_data.get('pincode'),
             customer_data.get('phone'),
             customer_data.get('email'),
+            customer_data.get('alter_id'),
             customer_data.get('data_json'),
             customer_id,
         ))
+
+    def backfill_customer_alter_id(self, customer_id, alter_id):
+        """Backfill alter_id WITHOUT touching sync state.
+
+        Called for [UNCHANGED] customers so a freshly-added alter_id is stored,
+        letting the NEXT genuine Tally edit be detected — without re-syncing the
+        row now (which would happen if update_customer were used, since it resets
+        is_synced to 0)."""
+        self.execute("""
+            UPDATE customers
+            SET alter_id = ?
+            WHERE id = ? AND COALESCE(alter_id, '') = ''
+        """, (alter_id, customer_id))
 
     def get_unsynced_customers(self, limit=None):
         """Get customers that haven't been synced.
@@ -504,12 +527,12 @@ class Database:
         cursor = self.execute("""
             INSERT INTO products (
                 tally_guid, name, name_canonical, tally_company, hsn_code, unit,
-                rate, description, data_json,
+                rate, description, alter_id, data_json,
                 product_master_name, variant_name, unit_name,
                 product_type_code, product_type_name,
                 gst_applicable, gst_rate, igst_rate, cgst_rate, sgst_rate,
                 first_fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
             product_data.get('tally_guid'),
             product_data.get('name'),
@@ -519,6 +542,7 @@ class Database:
             product_data.get('unit'),
             product_data.get('rate'),
             product_data.get('description'),
+            product_data.get('alter_id'),
             product_data.get('data_json'),
             product_data.get('product_master_name'),
             product_data.get('variant_name'),
@@ -538,7 +562,7 @@ class Database:
         self.execute("""
             UPDATE products
             SET tally_guid = ?, hsn_code = ?, unit = ?,
-                rate = ?, description = ?, data_json = ?,
+                rate = ?, description = ?, alter_id = ?, data_json = ?,
                 product_master_name = ?, variant_name = ?, unit_name = ?,
                 product_type_code = ?, product_type_name = ?,
                 gst_applicable = ?, gst_rate = ?, igst_rate = ?, cgst_rate = ?, sgst_rate = ?,
@@ -551,6 +575,7 @@ class Database:
             product_data.get('unit'),
             product_data.get('rate'),
             product_data.get('description'),
+            product_data.get('alter_id'),
             product_data.get('data_json'),
             product_data.get('product_master_name'),
             product_data.get('variant_name'),
@@ -564,6 +589,19 @@ class Database:
             product_data.get('sgst_rate', 0.0),
             product_id,
         ))
+
+    def backfill_product_alter_id(self, product_id, alter_id):
+        """Backfill alter_id WITHOUT touching sync state.
+
+        Called for [UNCHANGED] products so a freshly-added alter_id is stored,
+        letting the NEXT genuine Tally edit be detected — without re-syncing the
+        row now (which would happen if update_product were used, since it resets
+        is_synced to 0)."""
+        self.execute("""
+            UPDATE products
+            SET alter_id = ?
+            WHERE id = ? AND COALESCE(alter_id, '') = ''
+        """, (alter_id, product_id))
 
     def delete_product(self, product_id):
         """Delete a product row by ID."""
