@@ -642,6 +642,10 @@ def _update_loop(server_url: str, category: int, version: str):
         return
 
     check_count = 0
+    # Version whose download/validation failed. Don't fetch it again (could be a large
+    # file at every site, every few minutes) — keep polling and retry only when the
+    # server offers a different version. Cleared by restarting the middleware.
+    failed_version = None
     while not _stop_event.is_set():
         check_count += 1
         result = None
@@ -657,9 +661,16 @@ def _update_loop(server_url: str, category: int, version: str):
                 logger.info("[auto_updater] Check #%d — UPDATE AVAILABLE: %s → %s",
                             check_count, version, new_ver)
 
-                if getattr(sys, 'frozen', False):
+                if new_ver == failed_version:
+                    logger.warning(
+                        "[auto_updater] Check #%d — v%s failed to install earlier; not downloading it "
+                        "again. Waiting for a different release.", check_count, new_ver,
+                    )
+                elif getattr(sys, 'frozen', False):
+                    # On success this never returns (the process exits for the EXE swap).
                     _perform_update(result, Path(sys.executable), version)
-                    return  # _perform_update calls os._exit; this is just a safety return
+                    failed_version = new_ver
+                    logger.warning("[auto_updater] Update to v%s did not complete — will keep checking", new_ver)
                 else:
                     logger.info(
                         "[auto_updater] Running as plain script (not frozen EXE) — "
