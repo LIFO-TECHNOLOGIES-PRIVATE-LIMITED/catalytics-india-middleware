@@ -1,10 +1,8 @@
 """
 Auto-updater for Catalytics Middleware
 =======================================
-- OFF unless AUTO_UPDATE_ENABLED=true in .env — when off, the update server is
-  never contacted (no polling load on the production API)
-- When on: checks every 10 minutes (UPDATE_CHECK_INTERVAL env, seconds), with
-  random jitter so client sites don't all hit the server at once
+- Checks the update server every 10 minutes (UPDATE_CHECK_INTERVAL env, seconds),
+  with random jitter so client sites don't all hit the server at once
 - Uses category (1-4) + version for update matching
 - Safe update: NEVER touches .env, SQLite DB, logs, automation_state.json
 - Windows only: uses a .bat launcher to swap the EXE while it is not running
@@ -45,11 +43,6 @@ except ImportError:
     _requests = None
 
 logger = logging.getLogger("auto_updater")
-
-def _auto_update_enabled() -> bool:
-    """AUTO_UPDATE_ENABLED in .env (default false). Read at start(); restart to apply a change."""
-    return os.environ.get('AUTO_UPDATE_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
-
 
 def _read_check_interval() -> int:
     """Seconds between update checks: UPDATE_CHECK_INTERVAL env, default 600, floor 60.
@@ -689,13 +682,6 @@ def start(server_url: str = None):
         _setup_log_file(Path(sys.executable).parent)
     else:
         _setup_log_file(Path(__file__).parent)
-
-    if not _auto_update_enabled():
-        logger.info(
-            "[auto_updater] AUTO_UPDATE_ENABLED is not true — auto-update disabled, "
-            "update server will not be contacted"
-        )
-        return
 
     if not effective_url:
         logger.info(
