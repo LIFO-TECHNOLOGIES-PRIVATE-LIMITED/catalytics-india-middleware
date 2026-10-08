@@ -3084,6 +3084,7 @@ if __name__ == '__main__':
   Dashboard URL: http://{config.WEB_UI_HOST}:{config.WEB_UI_PORT}
   Auto Start Automation: {_env_flag('AUTO_START_AUTOMATION', 'true' if getattr(sys, 'frozen', False) else 'false')}
   Auto Register Startup: {_env_flag('AUTO_REGISTER_WINDOWS_STARTUP', 'false')}
+  Auto Update Check: {_env_flag('AUTO_UPDATE_ENABLED', 'false')}
 ============================================================
     """)
 
