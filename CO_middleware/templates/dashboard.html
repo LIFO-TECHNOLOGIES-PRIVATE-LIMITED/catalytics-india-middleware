@@ -1860,7 +1860,7 @@
                                     <th class="sortable" onclick="sortTable('invoices', 'company')">Company <span
                                             class="sort-indicator"></span></th>
                                     <th class="sortable" onclick="sortTable('invoices', 'voucher_date')">Date <span
-                                            class="sort-indicator">v</span></th>
+                                            class="sort-indicator">^</span></th>
                                     <th class="sortable" onclick="sortTable('invoices', 'customer_name')">Customer <span
                                             class="sort-indicator"></span></th>
                                     <th class="sortable" onclick="sortTable('invoices', 'total_amount')">Amount <span
@@ -1940,7 +1940,7 @@
                                 disabled>Retry Failed</button>
 
                             <button class="bulk-btn unsynced" id="customers-unsynced-btn"
-                                onclick="bulkMarkUnsynced('customers')" disabled>Mark as Unsynced</button>
+                                onclick="bulkMarkUnsynced('customers')" disabled>Mark as Unsynceds</button>
                         </div>
                     </div>
                     <div class="table-wrapper">
@@ -3097,7 +3097,7 @@
         let sorting = {
             customers: { column: 'name', direction: 'asc' },
             products: { column: 'name', direction: 'asc' },
-            invoices: { column: 'voucher_date', direction: 'desc' }
+            invoices: { column: 'voucher_date', direction: 'asc' }
         };
 
         function switchDataTab(tab) {
@@ -3547,6 +3547,16 @@
                         .map(([l, v]) => `<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px"><div style="font-size:11px;color:#64748b;margin-bottom:4px">${l}</div><div style="font-size:13px;font-weight:600;color:#1e293b;word-break:break-all">${v}</div></div>`).join('')}
                 </div>`;
 
+                // Billing + delivery (ship-to) addresses stored from Tally.
+                const _esc = (s) => String(s == null ? '' : s).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const _das = Array.isArray(c.delivery_addresses) ? c.delivery_addresses : [];
+                const addressesHtml = `<div style="margin-top:16px">
+                    <div style="font-size:12px;font-weight:700;color:#0f172a;margin-bottom:6px">Billing Address</div>
+                    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;font-size:13px;color:#1e293b;word-break:break-word">${_esc(c.address) || '-'}</div>
+                    <div style="font-size:12px;font-weight:700;color:#0f172a;margin:14px 0 6px">Delivery Addresses (${_das.length})</div>
+                    ${_das.length ? _das.map((d, i) => `<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-bottom:8px"><div style="font-size:11px;color:#64748b;margin-bottom:4px">${_esc(d.name) || ('Address ' + (i + 1))}${d.pincode ? ' &middot; ' + _esc(d.pincode) : ''}${d.state ? ' &middot; ' + _esc(d.state) : ''}</div><div style="font-size:13px;color:#1e293b;word-break:break-word">${_esc(d.address) || '-'}</div></div>`).join('') : `<div style="color:#94a3b8;font-size:13px">No delivery addresses stored.</div>`}
+                </div>`;
+
                 const fetchHtml = fetchDataText
                     ? `<div style="background:#0f172a;border-radius:8px;padding:16px;overflow:auto;max-height:420px"><pre style="margin:0;color:#a5f3fc;font-size:12px;line-height:1.6;white-space:pre-wrap">${fetchDataText}</pre></div>`
                     : `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:14px"> No fetch data stored yet.<br><small>Run "Refetch" to pull latest data from Tally.</small></div>`;
@@ -3570,7 +3580,7 @@
                         <button class="pd-tab" onclick="pdSwitchTab(event,'pd-logs')">- Logs</button>
                         <button class="pd-tab error-tab ${hasError ? 'has-error' : ''}" onclick="pdSwitchTab(event,'pd-error')">Error Log ${hasError ? `<span style="background:#dc2626;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px">${c.sync_attempts}</span>` : ''}</button>
                     </div>
-                    <div id="pd-overview" class="pd-panel active">${overviewHtml}</div>
+                    <div id="pd-overview" class="pd-panel active">${overviewHtml}${addressesHtml}</div>
                     <div id="pd-fetch" class="pd-panel">${fetchHtml}</div>
                     <div id="pd-sync" class="pd-panel">${syncHtml}</div>
                     <div id="pd-logs" class="pd-panel">${logHtml}</div>

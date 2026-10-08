@@ -194,6 +194,7 @@ def _save_ledger_product_variants(db, company_name: str, ledger: dict) -> int:
             'unit':                 unit,
             'rate':                 0.0,
             'description':          f"Ledger: {ledger_name}",
+            'alter_id':             str(ledger.get('alter_id') or '').strip(),
             'data_json':            json.dumps(ledger),
             'product_master_name':  base_name,
             'variant_name':         variant_label,
@@ -332,6 +333,7 @@ def fetch_customers_from_all_companies():
                     'pincode': customer.get('pincode', ''),
                     'phone': customer.get('phone', ''),
                     'email': customer.get('email', ''),
+                    'alter_id': str(customer.get('alter_id') or '').strip(),
                     'data_json': json.dumps(customer),
                 }
 
@@ -400,6 +402,25 @@ def fetch_customers_from_all_companies():
     logger.info(f"Total Customers: {db_stats['total_customers']}")
     logger.info(f"Customers by Company: {db_stats['customers_by_company']}")
     logger.info(f"Synced Customers: {db_stats['synced_customers']}")
+
+    # ALTERID coverage — confirm Tally's ALTERID is flowing into local customer rows.
+    try:
+        _cov = db.query(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN alter_id IS NOT NULL AND alter_id != '' THEN 1 ELSE 0 END) AS with_alter "
+            "FROM customers"
+        )
+        _samp = db.query(
+            "SELECT name, alter_id FROM customers WHERE alter_id IS NOT NULL AND alter_id != '' LIMIT 1"
+        )
+        logger.info(
+            "[ALTERID] customers with alter_id: %s/%s%s",
+            (_cov['with_alter'] or 0) if _cov else 0,
+            (_cov['total'] or 0) if _cov else 0,
+            f" (sample: {_samp['name']}={_samp['alter_id']})" if _samp else "",
+        )
+    except Exception as _e:
+        logger.warning("[ALTERID] customer coverage check failed: %s", _e)
 
     db.close()
     return overall_stats

@@ -261,6 +261,9 @@ def _map_stock_item_to_product(item: dict, company_name: str, parsed: dict) -> d
         'unit': (item.get('BASEUNITS') or item.get('UOM') or '').strip(),
         'rate': _safe_float(item.get('STDCOST') or item.get('LASTPURCHASEPRICE') or 0),
         'description': (item.get('DESCRIPTION') or '').strip(),
+        # ALTERID: Tally's master alteration counter — bumped on ANY edit to the
+        # stock item. Used for reliable change detection.
+        'alter_id': str(item.get('ALTERID') or '').strip(),
         'data_json': json.dumps(item),
         # Parsed name fields
         'product_master_name': parsed['product_master_name'],
@@ -479,6 +482,25 @@ def fetch_products_from_all_companies():
     logger.info(f"Total Products in DB: {db_stats['total_products']}")
     logger.info(f"Synced Products:      {db_stats['synced_products']}")
     logger.info(f"Products by Company:  {db_stats['products_by_company']}")
+
+    # ALTERID coverage — confirm Tally's ALTERID is flowing into local product rows.
+    try:
+        _cov = db.query(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN alter_id IS NOT NULL AND alter_id != '' THEN 1 ELSE 0 END) AS with_alter "
+            "FROM products"
+        )
+        _samp = db.query(
+            "SELECT name, alter_id FROM products WHERE alter_id IS NOT NULL AND alter_id != '' LIMIT 1"
+        )
+        logger.info(
+            "[ALTERID] products with alter_id: %s/%s%s",
+            (_cov['with_alter'] or 0) if _cov else 0,
+            (_cov['total'] or 0) if _cov else 0,
+            f" (sample: {_samp['name']}={_samp['alter_id']})" if _samp else "",
+        )
+    except Exception as _e:
+        logger.warning("[ALTERID] product coverage check failed: %s", _e)
 
     db.close()
     return overall_stats

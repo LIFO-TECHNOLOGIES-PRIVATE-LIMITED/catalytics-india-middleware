@@ -97,6 +97,7 @@ class Database:
                 pincode TEXT,
                 phone TEXT,
                 email TEXT,
+                alter_id TEXT,
                 data_json TEXT,
                 sync_request_json TEXT,
                 last_response_json TEXT,
@@ -122,6 +123,7 @@ class Database:
                 unit TEXT,
                 rate REAL,
                 description TEXT,
+                alter_id TEXT,
                 data_json TEXT,
                 product_master_name TEXT,
                 variant_name TEXT,
@@ -319,6 +321,10 @@ class Database:
                 ('dc_synced', 'INTEGER DEFAULT 0'),
                 ('dc_name', 'TEXT'),
             ],
+            'customers': [
+                # ALTERID: Tally's master alteration counter for reliable change detection
+                ('alter_id', 'TEXT'),
+            ],
             'products': [
                 ('product_master_name', 'TEXT'),
                 ('variant_name', 'TEXT'),
@@ -330,21 +336,10 @@ class Database:
                 ('igst_rate', 'REAL'),
                 ('cgst_rate', 'REAL'),
                 ('sgst_rate', 'REAL'),
+                # ALTERID: Tally's master alteration counter for reliable change detection
+                ('alter_id', 'TEXT'),
             ]
         }
-
-        for table, columns in new_columns.items():
-            try:
-                # Get existing columns
-                existing = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
-
-                # Add missing columns
-                for col_name, col_type in columns:
-                    if col_name not in existing:
-                        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
-                        logger.info(f"Added column {col_name} to {table}")
-            except Exception as e:
-                logger.debug(f"Migration skipped for {table}: {e}")
 
         # Migrate customers: drop old UNIQUE on name, add UNIQUE on tally_guid
         try:
@@ -418,6 +413,21 @@ class Database:
         except Exception as e:
             logger.debug(f"Products GUID migration skipped: {e}")
 
+        # Add any missing columns (runs AFTER the GUID-uniqueness table rebuilds above,
+        # so the rebuilds' `INSERT ... SELECT *` never hits a column-count mismatch).
+        for table, columns in new_columns.items():
+            try:
+                # Get existing columns
+                existing = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
+
+                # Add missing columns
+                for col_name, col_type in columns:
+                    if col_name not in existing:
+                        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+                        logger.info(f"Added column {col_name} to {table}")
+            except Exception as e:
+                logger.debug(f"Migration skipped for {table}: {e}")
+
         self.conn.commit()
 
     def close(self):
@@ -449,8 +459,8 @@ class Database:
             INSERT INTO customers (
                 tally_guid, name, tally_company, gstin, pan,
                 address, state, city, pincode, phone, email,
-                data_json, first_fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                alter_id, data_json, first_fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
             customer_data.get('tally_guid'),
             customer_data.get('name'),
@@ -463,35 +473,63 @@ class Database:
             customer_data.get('pincode'),
             customer_data.get('phone'),
             customer_data.get('email'),
+            customer_data.get('alter_id'),
             customer_data.get('data_json')
         ))
         return cursor.lastrowid if cursor else None
 
     def update_customer(self, customer_id, customer_data):
-        """Update existing customer by id with fresh data and mark for re-sync."""
-        self.execute("""
-            UPDATE customers
-            SET name = ?, tally_company = ?,
-                gstin = ?, pan = ?,
-                address = ?, state = ?, city = ?, pincode = ?,
-                phone = ?, email = ?, data_json = ?,
-                is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
-                last_updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (
-            customer_data.get('name'),
-            customer_data.get('tally_company'),
-            customer_data.get('gstin'),
-            customer_data.get('pan'),
-            customer_data.get('address'),
-            customer_data.get('state'),
-            customer_data.get('city'),
-            customer_data.get('pincode'),
-            customer_data.get('phone'),
-            customer_data.get('email'),
-            customer_data.get('data_json'),
-            customer_id,
-        ))
+        """Update existing customer by id with fresh Tally data.
+        Resets is_synced=0 when the customer changed in Tally — detected primarily via
+        Tally's ALTERID (bumped on ANY edit to the ledger master, incl. address changes),
+        with data_json as a safety net."""
+        existing = self.query(
+            "SELECT data_json, alter_id FROM customers WHERE id = ?",
+            (customer_id,),
+        )
+        stored_alter = str(existing['alter_id']) if (existing and existing['alter_id']) else ''
+        new_alter = str(customer_data.get('alter_id') or '')
+        # Only treat an ALTERID mismatch as a change once we already have a stored value,
+        # so backfilling this column for pre-existing rows doesn't force a mass re-sync.
+        alter_changed = bool(stored_alter) and stored_alter != new_alter
+        data_changed = (
+            not existing
+            or alter_changed
+            or (existing['data_json'] or '') != (customer_data.get('data_json') or '')
+        )
+
+        if data_changed:
+            self.execute("""
+                UPDATE customers
+                SET name = ?, tally_company = ?,
+                    gstin = ?, pan = ?,
+                    address = ?, state = ?, city = ?, pincode = ?,
+                    phone = ?, email = ?, alter_id = ?, data_json = ?,
+                    is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
+                    last_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (
+                customer_data.get('name'),
+                customer_data.get('tally_company'),
+                customer_data.get('gstin'),
+                customer_data.get('pan'),
+                customer_data.get('address'),
+                customer_data.get('state'),
+                customer_data.get('city'),
+                customer_data.get('pincode'),
+                customer_data.get('phone'),
+                customer_data.get('email'),
+                new_alter,
+                customer_data.get('data_json'),
+                customer_id,
+            ))
+        else:
+            # Data unchanged — backfill alter_id + refresh timestamp, keep is_synced as-is
+            self.execute("""
+                UPDATE customers
+                SET alter_id = ?, last_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (new_alter, customer_id))
 
     def get_unsynced_customers(self):
         """Get all customers that haven't been synced."""
@@ -549,12 +587,12 @@ class Database:
         cursor = self.execute("""
             INSERT INTO products (
                 tally_guid, name, name_canonical, tally_company, hsn_code, unit,
-                rate, description, data_json,
+                rate, description, alter_id, data_json,
                 product_master_name, variant_name, unit_name,
                 product_type_code, product_type_name,
                 gst_applicable, gst_rate, igst_rate, cgst_rate, sgst_rate,
                 first_fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
             product_data.get('tally_guid'),
             product_data.get('name'),
@@ -564,6 +602,7 @@ class Database:
             product_data.get('unit'),
             product_data.get('rate'),
             product_data.get('description'),
+            product_data.get('alter_id'),
             product_data.get('data_json'),
             product_data.get('product_master_name'),
             product_data.get('variant_name'),
@@ -579,38 +618,64 @@ class Database:
         return cursor.lastrowid if cursor else None
 
     def update_product(self, product_id, product_data):
-        """Update existing product by id with fresh data and mark for re-sync."""
-        self.execute("""
-            UPDATE products
-            SET name = ?, name_canonical = ?, tally_company = ?,
-                hsn_code = ?, unit = ?, rate = ?, description = ?, data_json = ?,
-                product_master_name = ?, variant_name = ?, unit_name = ?,
-                product_type_code = ?, product_type_name = ?,
-                gst_applicable = ?, gst_rate = ?, igst_rate = ?, cgst_rate = ?, sgst_rate = ?,
-                is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
-                last_updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (
-            product_data.get('name'),
-            product_data.get('name_canonical'),
-            product_data.get('tally_company'),
-            product_data.get('hsn_code'),
-            product_data.get('unit'),
-            product_data.get('rate'),
-            product_data.get('description'),
-            product_data.get('data_json'),
-            product_data.get('product_master_name'),
-            product_data.get('variant_name'),
-            product_data.get('unit_name'),
-            product_data.get('product_type_code'),
-            product_data.get('product_type_name'),
-            product_data.get('gst_applicable'),
-            product_data.get('gst_rate', 0.0),
-            product_data.get('igst_rate', 0.0),
-            product_data.get('cgst_rate', 0.0),
-            product_data.get('sgst_rate', 0.0),
-            product_id,
-        ))
+        """Update existing product by id with fresh Tally data.
+        Resets is_synced=0 when the product changed in Tally — detected primarily via
+        Tally's ALTERID (bumped on ANY edit to the stock item), with data_json as a
+        safety net."""
+        existing = self.query(
+            "SELECT data_json, alter_id FROM products WHERE id = ?", (product_id,)
+        )
+        stored_alter = str(existing['alter_id']) if (existing and existing['alter_id']) else ''
+        new_alter = str(product_data.get('alter_id') or '')
+        # Only treat an ALTERID mismatch as a change once we already have a stored value,
+        # so backfilling this column for pre-existing rows doesn't force a mass re-sync.
+        alter_changed = bool(stored_alter) and stored_alter != new_alter
+        data_changed = (
+            not existing
+            or alter_changed
+            or (existing['data_json'] or '') != (product_data.get('data_json') or '')
+        )
+
+        if data_changed:
+            self.execute("""
+                UPDATE products
+                SET name = ?, name_canonical = ?, tally_company = ?,
+                    hsn_code = ?, unit = ?, rate = ?, description = ?, alter_id = ?, data_json = ?,
+                    product_master_name = ?, variant_name = ?, unit_name = ?,
+                    product_type_code = ?, product_type_name = ?,
+                    gst_applicable = ?, gst_rate = ?, igst_rate = ?, cgst_rate = ?, sgst_rate = ?,
+                    is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
+                    last_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (
+                product_data.get('name'),
+                product_data.get('name_canonical'),
+                product_data.get('tally_company'),
+                product_data.get('hsn_code'),
+                product_data.get('unit'),
+                product_data.get('rate'),
+                product_data.get('description'),
+                new_alter,
+                product_data.get('data_json'),
+                product_data.get('product_master_name'),
+                product_data.get('variant_name'),
+                product_data.get('unit_name'),
+                product_data.get('product_type_code'),
+                product_data.get('product_type_name'),
+                product_data.get('gst_applicable'),
+                product_data.get('gst_rate', 0.0),
+                product_data.get('igst_rate', 0.0),
+                product_data.get('cgst_rate', 0.0),
+                product_data.get('sgst_rate', 0.0),
+                product_id,
+            ))
+        else:
+            # Data unchanged — backfill alter_id + refresh timestamp, keep is_synced as-is
+            self.execute("""
+                UPDATE products
+                SET alter_id = ?, last_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (new_alter, product_id))
 
     def get_unsynced_products(self):
         """Get all products that haven't been synced"""

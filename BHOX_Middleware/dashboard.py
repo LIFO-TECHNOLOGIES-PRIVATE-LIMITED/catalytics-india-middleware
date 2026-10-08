@@ -2569,7 +2569,18 @@ def maybe_start_automation():
 
 
 def maybe_register_windows_startup():
-    """Register packaged EXE in HKCU Run for auto-start on Windows login."""
+    """Auto-start the dashboard at Windows logon — on ANY PC or laptop, AC or battery.
+
+    The packaged EXE requires Administrator (uac_admin=True). Windows ignores the
+    HKCU\\...\\Run key for elevated EXEs, so we use a Scheduled Task with HIGHEST
+    privileges + an at-logon trigger (launches elevated, no UAC prompt).
+
+    Crucially we register from a task XML, NOT `schtasks /Create /SC ONLOGON`,
+    because that CLI defaults DisallowStartIfOnBatteries=true — which is exactly
+    why auto-start worked while charging but FAILED on battery. The XML below sets
+    DisallowStartIfOnBatteries=false / StopIfGoingOnBatteries=false and an
+    unlimited ExecutionTimeLimit so it starts and stays running everywhere.
+    """
     if os.name != 'nt':
         return
 
@@ -2580,23 +2591,129 @@ def maybe_register_windows_startup():
         logger.info("Skipping Windows startup registration (not running as EXE)")
         return
 
+    import subprocess
+    import tempfile
+    CREATE_NO_WINDOW = 0x08000000
+
+    app_name = os.getenv('WINDOWS_STARTUP_APP_NAME', 'BHOXMiddlewareDashboard').strip() or 'BHOXMiddlewareDashboard'
+    exe_path = sys.executable
+
+    # Persist TALLY_ENV_PATH so the task-launched process finds the right .env.
     try:
         import winreg
+        exe_env_path = Path(sys.executable).with_name('.env')
+        env_path = str(exe_env_path if exe_env_path.exists() else (Path(BASE_DIR) / '.env'))
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r'Environment') as env_key:
+            winreg.SetValueEx(env_key, 'TALLY_ENV_PATH', 0, winreg.REG_SZ, env_path)
+        logger.info(f"Windows env path ensured for startup: {env_path}")
+    except Exception as exc:
+        logger.warning(f"Could not set TALLY_ENV_PATH for startup: {exc}")
 
-        app_name = os.getenv('WINDOWS_STARTUP_APP_NAME', 'BHOXMiddlewareDashboard').strip() or 'BHOXMiddlewareDashboard'
-        exe_path = f'"{sys.executable}"'
+    user = os.environ.get('USERNAME', '').strip()
+    domain = os.environ.get('USERDOMAIN', '').strip()
+    account = f'{domain}\\{user}' if (domain and user) else user
 
+    def _xml_escape(value: str) -> str:
+        return (value.replace('&', '&amp;').replace('<', '&lt;')
+                .replace('>', '&gt;').replace('"', '&quot;'))
+
+    user_id_xml = f'<UserId>{_xml_escape(account)}</UserId>' if account else ''
+    task_xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo>\n'
+        f'    <Description>Auto-start {_xml_escape(app_name)} at logon (elevated)</Description>\n'
+        '  </RegistrationInfo>\n'
+        '  <Triggers>\n'
+        '    <LogonTrigger>\n'
+        '      <Enabled>true</Enabled>\n'
+        f'      {user_id_xml}\n'
+        '    </LogonTrigger>\n'
+        '  </Triggers>\n'
+        '  <Principals>\n'
+        '    <Principal id="Author">\n'
+        f'      {user_id_xml}\n'
+        '      <LogonType>InteractiveToken</LogonType>\n'
+        '      <RunLevel>HighestAvailable</RunLevel>\n'
+        '    </Principal>\n'
+        '  </Principals>\n'
+        '  <Settings>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <AllowHardTerminate>true</AllowHardTerminate>\n'
+        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
+        '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n'
+        '    <IdleSettings>\n'
+        '      <StopOnIdleEnd>false</StopOnIdleEnd>\n'
+        '      <RestartOnIdle>false</RestartOnIdle>\n'
+        '    </IdleSettings>\n'
+        '    <AllowStartOnDemand>true</AllowStartOnDemand>\n'
+        '    <Enabled>true</Enabled>\n'
+        '    <Hidden>false</Hidden>\n'
+        '    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n'
+        '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n'
+        '  </Settings>\n'
+        '  <Actions Context="Author">\n'
+        '    <Exec>\n'
+        f'      <Command>"{_xml_escape(exe_path)}"</Command>\n'
+        '    </Exec>\n'
+        '  </Actions>\n'
+        '</Task>\n'
+    )
+
+    created = False
+    try:
+        tmp_xml = Path(tempfile.gettempdir()) / f'_{app_name}_startup_task.xml'
+        tmp_xml.write_text(task_xml, encoding='utf-16')
+        result = subprocess.run(
+            ['schtasks', '/Create', '/TN', app_name, '/XML', str(tmp_xml), '/F'],
+            creationflags=CREATE_NO_WINDOW,
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            created = True
+            logger.info(f"Startup task ensured (works on battery too): {app_name} -> {exe_path}")
+        else:
+            logger.warning(
+                "schtasks /XML create failed (exit=%s): %s %s",
+                result.returncode, (result.stdout or '').strip(), (result.stderr or '').strip(),
+            )
+        try:
+            tmp_xml.unlink()
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning(f"Could not create startup scheduled task from XML: {exc}")
+
+    if not created:
+        try:
+            subprocess.run(
+                ['schtasks', '/Create', '/TN', app_name,
+                 '/TR', f'"{exe_path}"',
+                 '/SC', 'ONLOGON', '/RL', 'HIGHEST', '/F'],
+                creationflags=CREATE_NO_WINDOW,
+                capture_output=True, text=True,
+            )
+            logger.info(f"Startup task ensured (CLI fallback): {app_name}")
+        except Exception as exc:
+            logger.warning(f"Could not create startup scheduled task (fallback): {exc}")
+
+    # Remove the stale HKCU Run entry for this app (ignored for elevated EXEs).
+    try:
+        import winreg
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
             r'Software\Microsoft\Windows\CurrentVersion\Run',
             0,
-            winreg.KEY_SET_VALUE
+            winreg.KEY_SET_VALUE,
         ) as run_key:
-            winreg.SetValueEx(run_key, app_name, 0, winreg.REG_SZ, exe_path)
-
-        logger.info(f"Windows startup registration ensured for: {app_name}")
-    except Exception as exc:
-        logger.warning(f"Could not register Windows startup: {exc}")
+            winreg.DeleteValue(run_key, app_name)
+            logger.info(f"Removed stale HKCU Run entry: {app_name}")
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 # ==================== OFFLINE DC PRINT ====================

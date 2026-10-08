@@ -51,7 +51,21 @@ _attach_product_fetch_file_handler()
 
 
 def _product_changed(existing_row, product_data):
-    """Return True only when meaningful product fields changed."""
+    """Return True only when meaningful product fields changed.
+
+    ALTERID: Tally bumps a stock item's ALTERID on ANY edit. A change in ALTERID
+    therefore reliably flags the row for re-sync. The guard below only treats
+    ALTERID as "changed" when a non-empty value was previously stored, so the
+    FIRST fetch after this feature ships (backfilling alter_id from empty) does
+    NOT flip every existing row to unsynced.
+    """
+    stored_alter = str(existing_row['alter_id']) if (
+        existing_row and 'alter_id' in existing_row.keys() and existing_row['alter_id']
+    ) else ''
+    new_alter = str(product_data.get('alter_id') or '')
+    if stored_alter and stored_alter != new_alter:
+        return True
+
     fields = (
         'tally_guid', 'name', 'name_canonical', 'tally_company', 'hsn_code',
         'unit', 'rate', 'description', 'data_json', 'product_master_name',
@@ -333,6 +347,9 @@ def fetch_products_from_all_companies():
                         'unit':                unit,
                         'rate':                product.get('rate', 0.0),
                         'description':         product.get('description', ''),
+                        # ALTERID from the source stock item — shared by every variant
+                        # row derived from it (any edit to the item bumps them all).
+                        'alter_id':            product.get('alter_id', ''),
                         'data_json':           json.dumps(product),
                         'product_master_name': base_name,
                         'variant_name':        variant_label,
@@ -364,6 +381,9 @@ def fetch_products_from_all_companies():
                                 )
                                 overall_stats['duplicates_skipped'] += 1
                             else:
+                                # Backfill alter_id without touching sync state, so the
+                                # next real edit is detected but this row is not re-synced.
+                                db.backfill_product_alter_id(existing['id'], product_data.get('alter_id'))
                                 logger.info(
                                     f"  [UNCHANGED] '{display_name}' (SQLite ID: {existing['id']})"
                                 )
@@ -423,6 +443,25 @@ def fetch_products_from_all_companies():
     logger.info(f"Total Products: {db_stats['total_products']}")
     logger.info(f"Products by Company: {db_stats['products_by_company']}")
     logger.info(f"Synced Products: {db_stats['synced_products']}")
+
+    # ALTERID coverage — confirm Tally's ALTERID is flowing into local product rows.
+    try:
+        _cov = db.query(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN alter_id IS NOT NULL AND alter_id != '' THEN 1 ELSE 0 END) AS with_alter "
+            "FROM products"
+        )
+        _samp = db.query(
+            "SELECT name, alter_id FROM products WHERE alter_id IS NOT NULL AND alter_id != '' LIMIT 1"
+        )
+        logger.info(
+            "[ALTERID] products with alter_id: %s/%s%s",
+            (_cov['with_alter'] or 0) if _cov else 0,
+            (_cov['total'] or 0) if _cov else 0,
+            f" (sample: {_samp['name']}={_samp['alter_id']})" if _samp else "",
+        )
+    except Exception as _e:
+        logger.warning("[ALTERID] product coverage check failed: %s", _e)
 
     db.close()
     return overall_stats

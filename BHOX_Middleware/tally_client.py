@@ -406,6 +406,7 @@ def get_all_customer_ledgers(company_name: str, url: Optional[str] = None):
             <NATIVEMETHOD>Name</NATIVEMETHOD>
             <NATIVEMETHOD>GUID</NATIVEMETHOD>
             <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>AlterID</NATIVEMETHOD>
             <NATIVEMETHOD>Parent</NATIVEMETHOD>
             <NATIVEMETHOD>Mobile</NATIVEMETHOD>
             <NATIVEMETHOD>Email</NATIVEMETHOD>
@@ -719,6 +720,7 @@ def get_stock_items(company_name: str, url: Optional[str] = None):
             <NATIVEMETHOD>Name</NATIVEMETHOD>
             <NATIVEMETHOD>GUID</NATIVEMETHOD>
             <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>AlterID</NATIVEMETHOD>
             <NATIVEMETHOD>Parent</NATIVEMETHOD>
             <NATIVEMETHOD>BaseUnits</NATIVEMETHOD>
           </COLLECTION>
@@ -928,14 +930,13 @@ def parse_delivery_notes(response_xml: str):
         if terms_of_delivery:
             data["TERMSOFDELIVERY"] = terms_of_delivery
 
-        # "PO Number" / "Reference" field - Purchase Order reference
+        # "PO Number" field - genuine Purchase Order reference only.
+        # NOTE: do NOT source this from REFERENCE / VOUCHERREFERENCE (Tally auto-fills
+        # these with the voucher/DC number) or BASICORDERREF / ORDERREF (delivery-type
+        # flag d/c). Using them made the DC number show up as the PO number.
         po_number = (
-            voucher.findtext(".//REFERENCE") or
             voucher.findtext(".//BASICPURCHASEORDERNO") or
             voucher.findtext(".//PURCHASEORDERNO") or
-            voucher.findtext(".//BASICORDERREF") or
-            voucher.findtext(".//ORDERREF") or
-            voucher.findtext(".//VOUCHERREFERENCE") or
             voucher.findtext(".//BASICBUYERORDERNO") or
             ""
         ).strip()
@@ -984,6 +985,24 @@ def parse_delivery_notes(response_xml: str):
             data["PARTYORDERNO"] = order_no
         if order_date:
             data["PARTYORDERDATE"] = order_date
+
+        # "Delivery Note No(s)" — when the invoice has a delivery note number it is
+        # used as the Catalytics DC number (the backend falls back to the voucher/
+        # invoice number when this is empty).  Tally usually stores it under
+        # INVOICEDELNOTES.LIST/BASICSHIPDELIVERYNOTE, but the exact tag varies by
+        # build, so scan any descendant whose tag names a delivery-note number.
+        delivery_note_no = ''
+        for _el in voucher.iter():
+            _tag = _el.tag.upper()
+            if _tag.endswith('.LIST') or 'DATE' in _tag:
+                continue
+            if ('DELIVERYNOTE' in _tag) or ('DELNOTE' in _tag) or ('SHIPDELIVERYNOTE' in _tag):
+                _val = (_el.text or '').strip()
+                if _val and _val.lower() not in _skip_order_vals:
+                    delivery_note_no = _val
+                    break
+        if delivery_note_no:
+            data["DELIVERYNOTENO"] = delivery_note_no
 
         # "Other References" field â€" free text reference (e.g. "Delivery")
         other_ref = (
@@ -1733,7 +1752,10 @@ class TallyClient:
                 'city': "",
                 'pincode': ledger.get("PINCODE", ""),
                 'phone': ledger.get("MOBILE", "") or ledger.get("LEDGERMOBILE", ""),
-                'email': ledger.get("EMAIL", "") or ledger.get("LEDGEREMAIL", "")
+                'email': ledger.get("EMAIL", "") or ledger.get("LEDGEREMAIL", ""),
+                # ALTERID: Tally's master alteration counter — increments on ANY edit to
+                # the ledger (name, GST, phone, address, …). Used for reliable change detection.
+                'alter_id': str(ledger.get('ALTERID') or '').strip(),
             }
             customers.append(customer)
 
@@ -1767,7 +1789,10 @@ class TallyClient:
                 'igst_rate': item.get("IGST_RATE", 0.0),
                 'cgst_rate': item.get("CGST_RATE", 0.0),
                 'sgst_rate': item.get("SGST_RATE", 0.0),
-                'description': item.get("PARENT", "")  # Use parent as description
+                'description': item.get("PARENT", ""),  # Use parent as description
+                # ALTERID: Tally's master alteration counter — bumped on ANY edit to the
+                # stock item. Used for reliable change detection.
+                'alter_id': str(item.get('ALTERID') or '').strip(),
             }
             products.append(product)
 

@@ -228,50 +228,67 @@ def _compute_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _download_file(url: str, dest: Path) -> bool:
-    """Stream-download url → dest.  Returns True on success."""
+def _download_file(url: str, dest: Path, attempts: int = 4) -> bool:
+    """Stream-download url → dest with retries.  Returns True on success.
+
+    Retries transient network/server failures with exponential backoff and
+    rejects truncated downloads, so the update still applies on flaky
+    connections (worst-case robustness)."""
     if _requests is None:
         logger.error("[auto_updater] 'requests' package not available — download impossible")
         return False
-    try:
-        logger.info("[auto_updater] Download starting: %s", url)
-        logger.info("[auto_updater] Download destination: %s", dest)
-        with _requests.get(url, stream=True, timeout=180) as resp:
-            resp.raise_for_status()
-            total_bytes = int(resp.headers.get('Content-Length', 0))
-            if total_bytes:
-                logger.info("[auto_updater] Expected file size: %.2f MB", total_bytes / 1024 / 1024)
-            else:
-                logger.info("[auto_updater] Content-Length not provided by server")
-            downloaded = 0
-            last_log_mb = 0
-            with open(dest, 'wb') as fh:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if chunk:
-                        fh.write(chunk)
-                        downloaded += len(chunk)
-                        mb = downloaded / 1024 / 1024
-                        if int(mb) > last_log_mb:
-                            last_log_mb = int(mb)
-                            if total_bytes:
-                                pct = downloaded * 100 // total_bytes
-                                logger.info("[auto_updater] Downloaded %.1f MB / %.1f MB (%d%%)",
-                                            mb, total_bytes / 1024 / 1024, pct)
-                            else:
-                                logger.info("[auto_updater] Downloaded %.1f MB", mb)
-        final_size = dest.stat().st_size if dest.exists() else 0
-        logger.info("[auto_updater] Download complete → %s  (%.2f MB)", dest, final_size / 1024 / 1024)
-        return True
-    except Exception as exc:
-        logger.error("[auto_updater] Download failed: %s", exc)
+    for attempt in range(1, attempts + 1):
         try:
-            dest.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return False
+            logger.info("[auto_updater] Download attempt %d/%d: %s", attempt, attempts, url)
+            logger.info("[auto_updater] Download destination: %s", dest)
+            total_bytes = 0
+            with _requests.get(url, stream=True, timeout=180) as resp:
+                resp.raise_for_status()
+                total_bytes = int(resp.headers.get('Content-Length', 0))
+                if total_bytes:
+                    logger.info("[auto_updater] Expected file size: %.2f MB", total_bytes / 1024 / 1024)
+                else:
+                    logger.info("[auto_updater] Content-Length not provided by server")
+                downloaded = 0
+                last_log_mb = 0
+                with open(dest, 'wb') as fh:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            fh.write(chunk)
+                            downloaded += len(chunk)
+                            mb = downloaded / 1024 / 1024
+                            if int(mb) > last_log_mb:
+                                last_log_mb = int(mb)
+                                if total_bytes:
+                                    pct = downloaded * 100 // total_bytes
+                                    logger.info("[auto_updater] Downloaded %.1f MB / %.1f MB (%d%%)",
+                                                mb, total_bytes / 1024 / 1024, pct)
+                                else:
+                                    logger.info("[auto_updater] Downloaded %.1f MB", mb)
+            final_size = dest.stat().st_size if dest.exists() else 0
+            # Reject a truncated download (e.g. dropped connection mid-stream).
+            if total_bytes and final_size < total_bytes:
+                raise IOError(f"incomplete download: {final_size}/{total_bytes} bytes")
+            logger.info("[auto_updater] Download complete → %s  (%.2f MB)", dest, final_size / 1024 / 1024)
+            return True
+        except Exception as exc:
+            logger.error("[auto_updater] Download attempt %d/%d failed: %s", attempt, attempts, exc)
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
+            if attempt < attempts:
+                backoff = min(30, 2 ** attempt)
+                logger.info("[auto_updater] Retrying download in %ds...", backoff)
+                _stop_event.wait(backoff)
+                if _stop_event.is_set():
+                    logger.info("[auto_updater] Stop requested — aborting download retries")
+                    return False
+    logger.error("[auto_updater] Download failed after %d attempts", attempts)
+    return False
 
 
-def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: Path, new_version: str):
+def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: Path, new_version: str, current_version: str = "unknown"):
     """
     Write a self-deleting PowerShell script that:
       1. Waits for this process (by PID) to exit
@@ -287,7 +304,11 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: P
     backup_dir = canonical_exe.parent / "old_builds"
     backup_dir.mkdir(exist_ok=True)
 
-    current_version = _get_version_info().get("version", "unknown")
+    # Use the OLD version passed in by _perform_update. Do NOT call
+    # _get_version_info() here — version.json has already been overwritten
+    # with the NEW version, which would mis-name the backup.
+    if not current_version:
+        current_version = "unknown"
 
     old_exe = backup_dir / (
         f"{canonical_exe.stem}_v{current_version}{canonical_exe.suffix}"
@@ -388,7 +409,17 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: P
         '$sched_out  = (& schtasks.exe /Create /TN $task_name /TR $tr_arg /SC ONCE /ST $run_time /F /RL HIGHEST 2>&1) -join " "',
         f'{ps_log("PS_UPDATER schtasks /Create  exit=$LASTEXITCODE  out=$sched_out")}',
         'if ($LASTEXITCODE -eq 0) {',
-        f'    {ps_log("PS_UPDATER schtasks /Create OK — running task now")}',
+        f'    {ps_log("PS_UPDATER schtasks /Create OK — applying battery-safe settings")}',
+        '    # CLI /Create defaults DisallowStartIfOnBatteries=true, so /Run is blocked',
+        '    # when unplugged. Flip the power flags off so the relaunch works on battery too.',
+        '    try {',
+        '        $batt = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
+        '        Set-ScheduledTask -TaskName $task_name -Settings $batt | Out-Null',
+        f'        {ps_log("PS_UPDATER battery-safe settings applied to $task_name")}',
+        '    } catch {',
+        f'        {ps_log("PS_UPDATER WARN — could not apply battery-safe settings: $($_.Exception.Message)")}',
+        '    }',
+        f'    {ps_log("PS_UPDATER running task now")}',
         '    $run_out = (& schtasks.exe /Run /TN $task_name 2>&1) -join " "',
         f'    {ps_log("PS_UPDATER schtasks /Run  exit=$LASTEXITCODE  out=$run_out")}',
         '} else {',
@@ -430,14 +461,22 @@ def _apply_update_windows(pending_exe: Path, current_exe: Path, canonical_exe: P
     logger.info("STEP B - PS script written")
     logger.info("[auto_updater] PS updater script written: %s", ps_path)
 
-    logger.info("STEP C - Launching PowerShell")
+    logger.info("STEP C - Launching PowerShell (hidden, background)")
+    # CREATE_NO_WINDOW hides the console window while STILL running the script,
+    # and the child survives this process calling os._exit() below.
+    # NOTE: do NOT use DETACHED_PROCESS here — without an inherited console
+    # powershell.exe can fail to initialise and the swap never runs.
+    CREATE_NO_WINDOW = 0x08000000
     subprocess.Popen(
         [
             'powershell',
-            '-NoExit',
+            '-NoProfile',
+            '-NonInteractive',
+            '-WindowStyle', 'Hidden',
             '-ExecutionPolicy', 'Bypass',
             '-File', str(ps_path),
         ],
+        creationflags=CREATE_NO_WINDOW,
         close_fds=True,
     )
 
@@ -545,7 +584,7 @@ def _perform_update(update_info: dict, current_exe: Path, current_version: str =
     _write_version_override(current_exe.parent, new_version)
 
     logger.info("[auto_updater] STEP 4/4 — Launching PowerShell updater script")
-    _apply_update_windows(pending_exe, current_exe, canonical_exe, new_version)
+    _apply_update_windows(pending_exe, current_exe, canonical_exe, new_version, current_version)
 
 
 # ---------------------------------------------------------------------------

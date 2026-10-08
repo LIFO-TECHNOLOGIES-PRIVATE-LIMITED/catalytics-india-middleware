@@ -2324,7 +2324,8 @@ def api_customer_detail(customer_id):
                    state, city, pincode, phone, email,
                    is_synced, catalytics_id, sync_attempts, last_sync_error,
                    first_fetched_at, last_updated_at, last_sync_at,
-                   data_json, sync_request_json, last_response_json
+                   data_json, sync_request_json, last_response_json,
+                   delivery_addresses_json
             FROM customers
             WHERE id = ?
         ''', (customer_id,))
@@ -2333,6 +2334,13 @@ def api_customer_detail(customer_id):
         if not row:
             return jsonify({'error': 'Customer not found'}), 404
         name = row['name']
+        # Parse the stored delivery (ship-to) addresses so the UI can show them.
+        try:
+            _delivery_addresses = json.loads(row['delivery_addresses_json']) if row['delivery_addresses_json'] else []
+            if not isinstance(_delivery_addresses, list):
+                _delivery_addresses = []
+        except Exception:
+            _delivery_addresses = []
         return jsonify({
             'customer': {
                 'id': row['id'],
@@ -2342,6 +2350,7 @@ def api_customer_detail(customer_id):
                 'gstin': row['gstin'] or '',
                 'pan': row['pan'] or '',
                 'address': row['address'] or '',
+                'delivery_addresses': _delivery_addresses,
                 'state': row['state'] or '',
                 'city': row['city'] or '',
                 'pincode': row['pincode'] or '',

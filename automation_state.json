@@ -1,0 +1,23 @@
+{
+  "status": "running",
+  "intervals": {
+    "fetch_master": 86400,
+    "fetch_invoices": 10,
+    "sync": 10,
+    "sync_master": 86400
+  },
+  "last_runs": {
+    "fetch_master": "2026-06-22T21:08:22.515485",
+    "fetch_invoices": "2026-06-22T21:08:32.561322",
+    "sync": "2026-06-22T21:08:32.561322",
+    "sync_master": "2026-06-22T21:08:22.515485"
+  },
+  "next_runs": {
+    "fetch_master": "2026-06-23T02:00:00",
+    "fetch_invoices": "2026-06-22T21:08:42.520048",
+    "sync": "2026-06-22T21:08:42.520048",
+    "sync_master": null
+  },
+  "started_at": "2026-06-22T21:08:22.450204",
+  "stopped_at": null
+}

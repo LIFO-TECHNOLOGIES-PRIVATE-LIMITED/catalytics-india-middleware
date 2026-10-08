@@ -355,6 +355,7 @@ def get_sundry_debtors(company_name: str, url: Optional[str] = None, group_name:
             <NATIVEMETHOD>Name</NATIVEMETHOD>
             <NATIVEMETHOD>GUID</NATIVEMETHOD>
             <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>AlterID</NATIVEMETHOD>
             <NATIVEMETHOD>Parent</NATIVEMETHOD>
             <NATIVEMETHOD>Mobile</NATIVEMETHOD>
             <NATIVEMETHOD>Email</NATIVEMETHOD>
@@ -404,6 +405,7 @@ def get_all_customer_ledgers(company_name: str, url: Optional[str] = None):
             <NATIVEMETHOD>Name</NATIVEMETHOD>
             <NATIVEMETHOD>GUID</NATIVEMETHOD>
             <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>AlterID</NATIVEMETHOD>
             <NATIVEMETHOD>Parent</NATIVEMETHOD>
             <NATIVEMETHOD>Mobile</NATIVEMETHOD>
             <NATIVEMETHOD>Email</NATIVEMETHOD>
@@ -457,6 +459,7 @@ def get_ledgers(company_name: str, url: Optional[str] = None):
             <NATIVEMETHOD>Name</NATIVEMETHOD>
             <NATIVEMETHOD>GUID</NATIVEMETHOD>
             <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>AlterID</NATIVEMETHOD>
             <NATIVEMETHOD>Parent</NATIVEMETHOD>
             <NATIVEMETHOD>Mobile</NATIVEMETHOD>
             <NATIVEMETHOD>Email</NATIVEMETHOD>
@@ -717,6 +720,7 @@ def get_stock_items(company_name: str, url: Optional[str] = None):
             <NATIVEMETHOD>Name</NATIVEMETHOD>
             <NATIVEMETHOD>GUID</NATIVEMETHOD>
             <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>AlterID</NATIVEMETHOD>
             <NATIVEMETHOD>Parent</NATIVEMETHOD>
             <NATIVEMETHOD>BaseUnits</NATIVEMETHOD>
           </COLLECTION>
@@ -1035,6 +1039,7 @@ def get_ledger_by_name(company_name: str, ledger_name: str, url: Optional[str] =
             <NATIVEMETHOD>Name</NATIVEMETHOD>
             <NATIVEMETHOD>GUID</NATIVEMETHOD>
             <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>AlterID</NATIVEMETHOD>
             <NATIVEMETHOD>Parent</NATIVEMETHOD>
             <NATIVEMETHOD>Mobile</NATIVEMETHOD>
             <NATIVEMETHOD>Email</NATIVEMETHOD>
@@ -1382,6 +1387,7 @@ def get_stock_item_by_name(company_name: str, item_name: str, url: Optional[str]
             <NATIVEMETHOD>Name</NATIVEMETHOD>
             <NATIVEMETHOD>GUID</NATIVEMETHOD>
             <NATIVEMETHOD>MasterID</NATIVEMETHOD>
+            <NATIVEMETHOD>AlterID</NATIVEMETHOD>
             <NATIVEMETHOD>Parent</NATIVEMETHOD>
             <NATIVEMETHOD>BaseUnits</NATIVEMETHOD>
           </COLLECTION>
@@ -1744,7 +1750,11 @@ class TallyClient:
                 'city': "",
                 'pincode': ledger.get("PINCODE", ""),
                 'phone': ledger.get("MOBILE", "") or ledger.get("LEDGERMOBILE", ""),
-                'email': ledger.get("EMAIL", "") or ledger.get("LEDGEREMAIL", "")
+                'email': ledger.get("EMAIL", "") or ledger.get("LEDGEREMAIL", ""),
+                # ALTERID: Tally's master alteration counter — increments on ANY edit
+                # to the ledger (name, GST, phone, address, …). Used for reliable
+                # change detection.
+                'alter_id': str(ledger.get("ALTERID") or "").strip(),
             }
             customers.append(customer)
 
@@ -1778,7 +1788,10 @@ class TallyClient:
                 'igst_rate': item.get("IGST_RATE", 0.0),
                 'cgst_rate': item.get("CGST_RATE", 0.0),
                 'sgst_rate': item.get("SGST_RATE", 0.0),
-                'description': item.get("PARENT", "")  # Use parent as description
+                'description': item.get("PARENT", ""),  # Use parent as description
+                # ALTERID: Tally's master alteration counter — bumped on ANY edit to
+                # the stock item. Used for reliable change detection.
+                'alter_id': str(item.get("ALTERID") or "").strip(),
             }
             products.append(product)
 

@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('templates', 'templates'), ('version.json', '.')]
+datas = [('templates', 'templates'), ('.env.example', '.'), ('version.json', '.')]
 binaries = []
-hiddenimports = ['fetch_customers', 'fetch_products', 'fetch_invoices', 'sync_to_catalytics', 'verify_sync', 'automation_manager', 'data_matcher', 'log_capture', 'fetch_master_data']
+hiddenimports = ['config', 'db', 'tally_api', 'tally_client', 'fetch_invoices', 'fetch_customers', 'fetch_products', 'sync_catalytics', 'sync_customers', 'sync_products', 'automation_manager', 'log_capture', 'logging_utils', 'mapping_lookup']
 tmp_ret = collect_all('psycopg2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -29,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='bol_dashboard',
+    name='co_middleware_dashboard',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -786,22 +786,31 @@ def parse_delivery_notes(response_xml: str):
                 if item:
                     data["INVENTORY"].append(item)
 
-        # Collect billing address lines if present (ADDRESS.LIST / BASICBUYERADDRESS.LIST)
-        addresses = []
-        for addr_list in voucher.findall(".//ADDRESS.LIST"):
-            for addr in addr_list.findall("ADDRESS"):
-                if addr.text:
-                    addresses.append(addr.text.strip())
-        if not addresses:
-            for addr_list in voucher.findall(".//BASICBUYERADDRESS.LIST"):
-                for addr in addr_list.findall("BASICBUYERADDRESS"):
-                    if addr.text:
-                        addresses.append(addr.text.strip())
-        if addresses:
-            data["ADDRESSES"] = addresses  # This is the billing address
+        # Helper: collect address lines from a given list tag, skipping email/phone lines.
+        def _collect_addr(list_tag, child_tag):
+            out = []
+            for addr_list in voucher.findall(f".//{list_tag}"):
+                for addr in addr_list.findall(child_tag):
+                    t = (addr.text or "").strip()
+                    if not t:
+                        continue
+                    low = t.lower()
+                    if low.startswith(('email:', 'phone:', 'mobile:')) or '@' in t:
+                        continue
+                    out.append(t)
+            return out
 
-        # Extract consignee (delivery) address from separate fields
-        # These fields are used for "Ship To" / "Consignee" in Tally DC
+        # --- Billing (Bill-to) address ---
+        # For a Tally Delivery Note the BUYER address (BASICBUYERADDRESS) is the
+        # bill-to / party address; ADDRESS.LIST holds the ship-to (see below), so
+        # prefer BASICBUYERADDRESS for billing and only fall back to ADDRESS.LIST.
+        addresses = _collect_addr("BASICBUYERADDRESS.LIST", "BASICBUYERADDRESS")
+        if not addresses:
+            addresses = _collect_addr("ADDRESS.LIST", "ADDRESS")
+        if addresses:
+            data["ADDRESSES"] = addresses  # billing / bill-to address
+
+        # --- Consignee (Ship-to / delivery) address ---
         consignee_data = {}
 
         # Consignee name
@@ -814,28 +823,19 @@ def parse_delivery_notes(response_xml: str):
         if consignee_name:
             consignee_data["NAME"] = consignee_name
 
-        # Consignee address lines - try multiple sources
-        consignee_address = []
-
-        # Try CONSIGNEEADDRESS.LIST first
-        for addr_list in voucher.findall(".//CONSIGNEEADDRESS.LIST"):
-            for addr in addr_list.findall("CONSIGNEEADDRESS"):
-                if addr.text:
-                    consignee_address.append(addr.text.strip())
-
-        # Fallback to BASICSHIPTOADDRESS.LIST
+        # Delivery address source priority:
+        #   1. CONSIGNEEADDRESS.LIST   (explicit consignee address, if Tally exports it)
+        #   2. BASICSHIPTOADDRESS.LIST (explicit ship-to address)
+        #   3. ADDRESS.LIST            (Delivery Note dispatch/ship-to address — the
+        #      per-DC delivery address the user edits; varies per voucher)
+        #   4. BASICBUYERADDRESS       (last resort; may be the static party master)
+        consignee_address = _collect_addr("CONSIGNEEADDRESS.LIST", "CONSIGNEEADDRESS")
         if not consignee_address:
-            for addr_list in voucher.findall(".//BASICSHIPTOADDRESS.LIST"):
-                for addr in addr_list.findall("BASICSHIPTOADDRESS"):
-                    if addr.text:
-                        consignee_address.append(addr.text.strip())
-
-        # Fallback to BASICBUYERADDRESS (billing address) if no separate delivery address
+            consignee_address = _collect_addr("BASICSHIPTOADDRESS.LIST", "BASICSHIPTOADDRESS")
         if not consignee_address:
-            for addr_list in voucher.findall(".//BASICBUYERADDRESS.LIST"):
-                for addr in addr_list.findall("BASICBUYERADDRESS"):
-                    if addr.text and not addr.text.lower().startswith(('email:', 'phone:', 'mobile:')):
-                        consignee_address.append(addr.text.strip())
+            consignee_address = _collect_addr("ADDRESS.LIST", "ADDRESS")
+        if not consignee_address:
+            consignee_address = _collect_addr("BASICBUYERADDRESS.LIST", "BASICBUYERADDRESS")
 
         if consignee_address:
             consignee_data["ADDRESS"] = ", ".join(consignee_address)

@@ -97,6 +97,7 @@ class Database:
                 pincode TEXT,
                 phone TEXT,
                 email TEXT,
+                alter_id TEXT,
                 data_json TEXT,
                 sync_request_json TEXT,
                 last_response_json TEXT,
@@ -133,6 +134,7 @@ class Database:
                 igst_rate REAL,
                 cgst_rate REAL,
                 sgst_rate REAL,
+                alter_id TEXT,
                 sync_request_json TEXT,
                 last_response_json TEXT,
                 first_fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -306,6 +308,9 @@ class Database:
         """Add new columns if they don't exist (for backwards compatibility)"""
         cursor = self.conn.cursor()
         new_columns = {
+            'customers': [
+                ('alter_id', 'TEXT'),
+            ],
             'invoices': [
                 ('ledger_data_json', 'TEXT'),
                 ('stock_items_json', 'TEXT'),
@@ -330,6 +335,7 @@ class Database:
                 ('igst_rate', 'REAL'),
                 ('cgst_rate', 'REAL'),
                 ('sgst_rate', 'REAL'),
+                ('alter_id', 'TEXT'),
             ]
         }
 
@@ -449,8 +455,8 @@ class Database:
             INSERT INTO customers (
                 tally_guid, name, tally_company, gstin, pan,
                 address, state, city, pincode, phone, email,
-                data_json, first_fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                alter_id, data_json, first_fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
             customer_data.get('tally_guid'),
             customer_data.get('name'),
@@ -463,14 +469,24 @@ class Database:
             customer_data.get('pincode'),
             customer_data.get('phone'),
             customer_data.get('email'),
+            customer_data.get('alter_id'),
             customer_data.get('data_json')
         ))
 
     def update_customer(self, customer_id, customer_data):
         """Update existing customer. Only resets is_synced=0 if data actually changed."""
-        row = self.query("SELECT name, gstin, pan, address, phone, email FROM customers WHERE id = ?", (customer_id,))
+        row = self.query("SELECT name, gstin, pan, address, phone, email, alter_id FROM customers WHERE id = ?", (customer_id,))
         existing = dict(row) if row else None
-        data_changed = not existing or any([
+
+        # ALTERID change detection: Tally bumps ALTERID on ANY edit to the ledger
+        # (including address changes not covered by the field comparisons below).
+        # Guard with bool(stored_alter) so the FIRST fetch after this change (when
+        # stored alter_id is still NULL/'') does NOT flip every row to unsynced.
+        stored_alter = str(existing['alter_id']) if (existing and existing['alter_id']) else ''
+        new_alter = str(customer_data.get('alter_id') or '')
+        alter_changed = bool(stored_alter) and stored_alter != new_alter
+
+        data_changed = not existing or alter_changed or any([
             (existing.get('name') or '') != (customer_data.get('name') or ''),
             (existing.get('gstin') or '') != (customer_data.get('gstin') or ''),
             (existing.get('pan') or '') != (customer_data.get('pan') or ''),
@@ -485,7 +501,7 @@ class Database:
                 SET name = ?, tally_company = ?,
                     gstin = ?, pan = ?,
                     address = ?, state = ?, city = ?, pincode = ?,
-                    phone = ?, email = ?, data_json = ?,
+                    phone = ?, email = ?, alter_id = ?, data_json = ?,
                     is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
                     last_updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
@@ -500,14 +516,16 @@ class Database:
                 customer_data.get('pincode'),
                 customer_data.get('phone'),
                 customer_data.get('email'),
+                new_alter,
                 customer_data.get('data_json'),
                 customer_id,
             ))
         else:
-            # Data unchanged — just update timestamp, keep is_synced as-is
+            # Data unchanged — just update timestamp, keep is_synced as-is.
+            # Backfill alter_id so future edits are detected (first-fetch guard above).
             self.execute("""
-                UPDATE customers SET last_updated_at = CURRENT_TIMESTAMP WHERE id = ?
-            """, (customer_id,))
+                UPDATE customers SET alter_id = ?, last_updated_at = CURRENT_TIMESTAMP WHERE id = ?
+            """, (new_alter, customer_id,))
 
     def get_unsynced_customers(self, max_attempts=10):
         """Get all customers that haven't been synced.
@@ -563,8 +581,8 @@ class Database:
                 product_master_name, variant_name, unit_name,
                 product_type_code, product_type_name,
                 gst_applicable, gst_rate, igst_rate, cgst_rate, sgst_rate,
-                first_fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                alter_id, first_fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
             product_data.get('tally_guid'),
             product_data.get('name'),
@@ -585,13 +603,22 @@ class Database:
             product_data.get('igst_rate', 0.0),
             product_data.get('cgst_rate', 0.0),
             product_data.get('sgst_rate', 0.0),
+            product_data.get('alter_id'),
         ))
 
     def update_product(self, product_id, product_data):
         """Update existing product. Only resets is_synced=0 if data actually changed."""
-        row = self.query("SELECT name, hsn_code, gst_rate, igst_rate, cgst_rate, sgst_rate FROM products WHERE id = ?", (product_id,))
+        row = self.query("SELECT name, hsn_code, gst_rate, igst_rate, cgst_rate, sgst_rate, alter_id FROM products WHERE id = ?", (product_id,))
         existing = dict(row) if row else None
-        data_changed = not existing or any([
+
+        # ALTERID change detection: Tally bumps ALTERID on ANY edit to the stock item.
+        # Guard with bool(stored_alter) so the FIRST fetch after this change (when
+        # stored alter_id is still NULL/'') does NOT flip every row to unsynced.
+        stored_alter = str(existing['alter_id']) if (existing and existing['alter_id']) else ''
+        new_alter = str(product_data.get('alter_id') or '')
+        alter_changed = bool(stored_alter) and stored_alter != new_alter
+
+        data_changed = not existing or alter_changed or any([
             (existing.get('name') or '') != (product_data.get('name') or ''),
             (existing.get('hsn_code') or '') != (product_data.get('hsn_code') or ''),
             float(existing.get('gst_rate') or 0) != float(product_data.get('gst_rate') or 0),
@@ -601,7 +628,8 @@ class Database:
         ])
 
         if not data_changed:
-            self.execute("UPDATE products SET last_updated_at = CURRENT_TIMESTAMP WHERE id = ?", (product_id,))
+            # Data unchanged — backfill alter_id so future edits are detected.
+            self.execute("UPDATE products SET alter_id = ?, last_updated_at = CURRENT_TIMESTAMP WHERE id = ?", (new_alter, product_id,))
             return
 
         self.execute("""
@@ -611,6 +639,7 @@ class Database:
                 product_master_name = ?, variant_name = ?, unit_name = ?,
                 product_type_code = ?, product_type_name = ?,
                 gst_applicable = ?, gst_rate = ?, igst_rate = ?, cgst_rate = ?, sgst_rate = ?,
+                alter_id = ?,
                 is_synced = 0, sync_attempts = 0, last_sync_error = NULL,
                 last_updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
@@ -633,6 +662,7 @@ class Database:
             product_data.get('igst_rate', 0.0),
             product_data.get('cgst_rate', 0.0),
             product_data.get('sgst_rate', 0.0),
+            new_alter,
             product_id,
         ))
 
