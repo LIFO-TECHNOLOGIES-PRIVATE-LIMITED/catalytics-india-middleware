@@ -1,7 +1,8 @@
 """
 Auto-updater for Catalytics Middleware
 =======================================
-- Checks the update server every 5 minutes
+- Checks the update server every 10 minutes (UPDATE_CHECK_INTERVAL env, seconds),
+  with random jitter so client sites don't all hit the server at once
 - Uses category (1-4) + version for update matching
 - Safe update: NEVER touches .env, SQLite DB, logs, automation_state.json
 - Windows only: uses a .bat launcher to swap the EXE while it is not running
@@ -23,6 +24,7 @@ import hashlib
 import logging
 import logging.handlers
 import os
+import random
 import re
 import subprocess
 import sys
@@ -42,7 +44,22 @@ except ImportError:
 
 logger = logging.getLogger("auto_updater")
 
-_UPDATE_CHECK_INTERVAL = 60  # seconds (1 minute)
+def _read_check_interval() -> int:
+    """Seconds between update checks: UPDATE_CHECK_INTERVAL env, default 600, floor 60.
+    Every client site polls the shared production API, so keep this coarse —
+    releases are rare and a 10-minute delay in picking one up is harmless."""
+    try:
+        return max(60, int(os.environ.get('UPDATE_CHECK_INTERVAL', '600')))
+    except ValueError:
+        return 600
+
+
+_UPDATE_CHECK_INTERVAL = _read_check_interval()
+
+
+def _jittered(interval: int) -> float:
+    """interval ±10%, so sites restarted together drift apart instead of polling in lockstep."""
+    return interval * random.uniform(0.9, 1.1)
 
 
 def _setup_log_file(exe_dir: Path):
@@ -602,6 +619,11 @@ def _update_loop(server_url: str, category: int, version: str):
     logger.info("[auto_updater]   exe path : %s", sys.executable)
     logger.info("[auto_updater] ============================================================")
 
+    # Random initial delay: after a server outage / mass restart, sites don't all
+    # check in the same second.
+    if _stop_event.wait(random.uniform(0, 60)):
+        return
+
     check_count = 0
     while not _stop_event.is_set():
         check_count += 1
@@ -631,8 +653,9 @@ def _update_loop(server_url: str, category: int, version: str):
         except Exception as exc:
             logger.error("[auto_updater] Check #%d — unexpected error: %s", check_count, exc, exc_info=True)
 
-        logger.info("[auto_updater] Next check in %ds", _UPDATE_CHECK_INTERVAL)
-        _stop_event.wait(_UPDATE_CHECK_INTERVAL)
+        wait_s = _jittered(_UPDATE_CHECK_INTERVAL)
+        logger.info("[auto_updater] Next check in %ds", wait_s)
+        _stop_event.wait(wait_s)
 
 
 # ---------------------------------------------------------------------------
